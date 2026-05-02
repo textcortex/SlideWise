@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { Plus, X } from "lucide-react";
-import { useEditor } from "@/lib/store";
+import { useEditor } from "@/lib/StoreProvider";
 import { SlideView } from "./SlideView";
 import { SLIDE_W } from "@/lib/types";
 

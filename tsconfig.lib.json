@@ -1,0 +1,29 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "dist/types",
+    "rootDir": "src",
+    "allowImportingTsExtensions": false,
+    "composite": false
+  },
+  "include": [
+    "src/index.ts",
+    "src/CaracasEditor.tsx",
+    "src/CaracasFileEditor.tsx",
+    "src/vite-env.d.ts",
+    "src/lib/**/*.ts",
+    "src/lib/**/*.tsx",
+    "src/components/**/*.ts",
+    "src/components/**/*.tsx"
+  ],
+  "exclude": [
+    "src/main.tsx",
+    "src/App.tsx",
+    "src/lib/pptx/__tests__/**",
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ]
+}

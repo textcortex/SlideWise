@@ -11,7 +11,8 @@ import {
   Maximize2,
   ChevronDown,
 } from "lucide-react";
-import { useEditor, type Tool } from "@/lib/store";
+import { useEditor } from "@/lib/StoreProvider";
+import type { Tool } from "@/lib/store";
 
 export function BottomToolbar() {
   const tool = useEditor((s) => s.tool);
