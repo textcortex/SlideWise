@@ -1,11 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useEditor } from "@/lib/store";
+import { useEditor, useEditorStore } from "@/lib/StoreProvider";
+import type { Tool } from "@/lib/store";
 import { SLIDE_W, SLIDE_H, type SlideElement, type ElementDraft } from "@/lib/types";
 import { ElementView } from "./ElementView";
 import { SelectionFrame } from "./SelectionFrame";
 import { FloatingToolbar } from "./FloatingToolbar";
 
 export function Canvas() {
+  const store = useEditorStore();
   const slide = useEditor((s) => s.currentSlide());
   const tool = useEditor((s) => s.tool);
   const setTool = useEditor((s) => s.setTool);
@@ -28,10 +30,13 @@ export function Canvas() {
     if (fitMode !== "fit" || !wrapRef.current) return;
     const recompute = () => {
       const r = wrapRef.current!.getBoundingClientRect();
-      const pad = 96;
+      // Generous fill: small breathing room horizontally, plus enough vertical
+      // headroom for the floating toolbar (~56) and the bottom toolbar (~76).
+      const padX = 32;
+      const padY = 56 + 76 + 16;
       const fit = Math.min(
-        (r.width - pad) / SLIDE_W,
-        (r.height - pad) / SLIDE_H
+        (r.width - padX) / SLIDE_W,
+        (r.height - padY) / SLIDE_H
       );
       setAutoScale(Math.max(0.05, fit));
     };
@@ -64,14 +69,14 @@ export function Canvas() {
       }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
         e.preventDefault();
-        useEditor.getState().undo();
+        store.getState().undo();
       }
       if (
         ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && e.shiftKey) ||
         ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y")
       ) {
         e.preventDefault();
-        useEditor.getState().redo();
+        store.getState().redo();
       }
       if (selectedIds.length) {
         const step = e.shiftKey ? 16 : 2;
@@ -96,6 +101,7 @@ export function Canvas() {
     clearSelection,
     slide.elements,
     updateElement,
+    store,
   ]);
 
   // wheel zoom (cmd/ctrl)
@@ -171,10 +177,11 @@ export function Canvas() {
     }
 
     const start = { x: e.clientX, y: e.clientY };
-    const orig = useEditor.getState().currentSlide().elements.filter((x) =>
-      useEditor.getState().selectedIds.concat(el.id).includes(x.id)
+    const snapshot = store.getState();
+    const orig = snapshot.currentSlide().elements.filter((x) =>
+      snapshot.selectedIds.concat(el.id).includes(x.id)
     );
-    const ids = Array.from(new Set([el.id, ...useEditor.getState().selectedIds]));
+    const ids = Array.from(new Set([el.id, ...snapshot.selectedIds]));
 
     let dragStarted = false;
     const DRAG_THRESHOLD = 4;
@@ -330,7 +337,7 @@ export function Canvas() {
   );
 }
 
-function defaultSize(t: ReturnType<typeof useEditor.getState>["tool"]) {
+function defaultSize(t: Tool) {
   switch (t) {
     case "text":
       return { w: 600, h: 100 };
@@ -350,7 +357,7 @@ function defaultSize(t: ReturnType<typeof useEditor.getState>["tool"]) {
 }
 
 function createDefault(
-  tool: ReturnType<typeof useEditor.getState>["tool"],
+  tool: Tool,
   x: number,
   y: number,
   w: number,

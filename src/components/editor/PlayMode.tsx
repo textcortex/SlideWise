@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
-import { useEditor } from "@/lib/store";
+import { useEditor } from "@/lib/StoreProvider";
 import { SLIDE_W, SLIDE_H, type SlideElement, type EnterAnim } from "@/lib/types";
 import { ElementView } from "./ElementView";
 

@@ -15,7 +15,7 @@ import {
   AlignVerticalJustifyCenter,
 } from "lucide-react";
 import type { SlideElement } from "@/lib/types";
-import { useEditor } from "@/lib/store";
+import { useEditor } from "@/lib/StoreProvider";
 
 const FONTS = [
   "Inter",

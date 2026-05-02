@@ -8,6 +8,7 @@ import type {
   TableElement,
   IconElement,
   EmbedElement,
+  UnknownElement,
 } from "@/lib/types";
 
 export function ElementView({
@@ -34,6 +35,8 @@ export function ElementView({
       return <IconView el={el} />;
     case "embed":
       return <EmbedView el={el} />;
+    case "unknown":
+      return <UnknownView el={el} />;
   }
 }
 
@@ -298,6 +301,34 @@ function IconView({ el }: { el: IconElement }) {
       }}
     >
       {el.icon}
+    </div>
+  );
+}
+
+function UnknownView({ el }: { el: UnknownElement }) {
+  return (
+    <div
+      style={{
+        width: "100%",
+        height: "100%",
+        background:
+          "repeating-linear-gradient(45deg, rgba(15,19,48,0.04) 0 8px, transparent 8px 16px)",
+        border: "1px dashed var(--border-strong)",
+        borderRadius: 8,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexDirection: "column",
+        gap: 4,
+        color: "var(--ink-muted)",
+        fontFamily: "Inter, system-ui, sans-serif",
+        fontSize: 12,
+        padding: 12,
+        textAlign: "center",
+      }}
+    >
+      <div style={{ fontWeight: 600 }}>{el.label ?? "Imported content"}</div>
+      <div style={{ opacity: 0.7 }}>{el.ooxmlTag}</div>
     </div>
   );
 }

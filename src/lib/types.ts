@@ -8,7 +8,8 @@ export type ElementType =
   | "line"
   | "table"
   | "icon"
-  | "embed";
+  | "embed"
+  | "unknown";
 
 export type EnterAnim =
   | "none"
@@ -104,6 +105,22 @@ export interface EmbedElement extends BaseElement {
   label: string;
 }
 
+/**
+ * Opaque OOXML element preserved for round-trip when reading a PPTX
+ * containing constructs Caracas does not yet model (charts, SmartArt,
+ * embedded media, etc.). Position/size is editable; the inner XML is
+ * re-emitted on write so the user does not lose data.
+ */
+export interface UnknownElement extends BaseElement {
+  type: "unknown";
+  /** Tag name of the wrapped OOXML node, e.g. "p:graphicFrame". */
+  ooxmlTag: string;
+  /** Raw OOXML serialized as a string, re-emitted verbatim on save. */
+  ooxmlXml: string;
+  /** Human-readable label for the editor UI, e.g. "Chart" or "SmartArt". */
+  label?: string;
+}
+
 export type SlideElement =
   | TextElement
   | ShapeElement
@@ -111,7 +128,8 @@ export type SlideElement =
   | LineElement
   | TableElement
   | IconElement
-  | EmbedElement;
+  | EmbedElement
+  | UnknownElement;
 
 export interface Slide {
   id: string;

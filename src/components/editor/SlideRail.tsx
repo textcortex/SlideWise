@@ -1,8 +1,8 @@
 import { Plus, LayoutGrid, Trash2 } from "lucide-react";
 import { useState } from "react";
-import { useEditor } from "@/lib/store";
+import { useEditor } from "@/lib/StoreProvider";
 import { SlideView } from "./SlideView";
-import { SLIDE_W } from "@/lib/types";
+import { SLIDE_W, type Slide } from "@/lib/types";
 
 const RAIL_W = 168;
 const THUMB_W = 132;
@@ -138,7 +138,7 @@ function ThumbRow({
 }: {
   index: number;
   isCurrent: boolean;
-  slide: ReturnType<typeof useEditor.getState>["deck"]["slides"][number];
+  slide: Slide;
   onSelect: () => void;
   onInsertAfter: () => void;
   onDelete: () => void;

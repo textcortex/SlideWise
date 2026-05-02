@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { useEditor } from "@/lib/store";
+import { useEditor } from "@/lib/StoreProvider";
+import type { Deck } from "@/lib/types";
 import { TopBar } from "./TopBar";
 import { SlideRail } from "./SlideRail";
 import { Canvas } from "./Canvas";
@@ -7,32 +7,23 @@ import { BottomToolbar } from "./BottomToolbar";
 import { PlayMode } from "./PlayMode";
 import { GridView } from "./GridView";
 
-export function Editor() {
+interface EditorProps {
+  showTopBar?: boolean;
+  onSave?: (deck: Deck) => void | Promise<void>;
+  onExport?: (deck: Deck) => void;
+}
+
+export function Editor({ showTopBar = true, onSave, onExport }: EditorProps = {}) {
   const playing = useEditor((s) => s.playing);
   const view = useEditor((s) => s.view);
   const theme = useEditor((s) => s.theme);
-  const setTheme = useEditor((s) => s.setTheme);
-
-  useEffect(() => {
-    let initial: "light" | "dark" = "light";
-    try {
-      const saved = localStorage.getItem("caracas-theme");
-      if (saved === "dark" || saved === "light") initial = saved;
-      else if (
-        window.matchMedia &&
-        window.matchMedia("(prefers-color-scheme: dark)").matches
-      ) {
-        initial = "dark";
-      }
-    } catch {}
-    setTheme(initial);
-  }, [setTheme]);
 
   return (
     <div
-      className={`theme-${theme}`}
+      className={`caracas-editor theme-${theme}`}
       style={{
-        height: "100vh",
+        width: "100%",
+        height: "100%",
         display: "flex",
         flexDirection: "column",
         background: "var(--app-bg)",
@@ -40,7 +31,7 @@ export function Editor() {
         overflow: "hidden",
       }}
     >
-      <TopBar />
+      {showTopBar && <TopBar onSave={onSave} onExport={onExport} />}
       <div
         style={{
           flex: 1,

@@ -8,10 +8,17 @@ import {
   Sun,
   Moon,
 } from "lucide-react";
-import { useEditor } from "@/lib/store";
+import { useEditor, useEditorStore } from "@/lib/StoreProvider";
 import { useState } from "react";
+import type { Deck } from "@/lib/types";
 
-export function TopBar() {
+interface TopBarProps {
+  onSave?: (deck: Deck) => void | Promise<void>;
+  onExport?: (deck: Deck) => void;
+}
+
+export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarProps = {}) {
+  const store = useEditorStore();
   const title = useEditor((s) => s.deck.title);
   const setTitle = useEditor((s) => s.setTitle);
   const undo = useEditor((s) => s.undo);
@@ -21,11 +28,17 @@ export function TopBar() {
   const toggleTheme = useEditor((s) => s.toggleTheme);
   const [saved, setSaved] = useState<"idle" | "saving" | "saved">("idle");
 
-  const onSave = () => {
+  const onSave = async () => {
     setSaved("saving");
+    const deck = store.getState().deck;
     try {
-      const deck = useEditor.getState().deck;
-      localStorage.setItem("caracas-deck", JSON.stringify(deck));
+      if (onSaveProp) {
+        await onSaveProp(deck);
+      } else {
+        try {
+          localStorage.setItem("caracas-deck", JSON.stringify(deck));
+        } catch {}
+      }
       setTimeout(() => setSaved("saved"), 320);
       setTimeout(() => setSaved("idle"), 1600);
     } catch {
@@ -34,7 +47,11 @@ export function TopBar() {
   };
 
   const onExport = () => {
-    const deck = useEditor.getState().deck;
+    const deck = store.getState().deck;
+    if (onExportProp) {
+      onExportProp(deck);
+      return;
+    }
     const blob = new Blob([JSON.stringify(deck, null, 2)], {
       type: "application/json",
     });
