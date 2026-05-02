@@ -87,6 +87,36 @@ function TextView({
     );
   }
 
+  // Multi-run: render each run as its own span with override styles. Newlines
+  // inside a run survive via white-space: pre-wrap (already on the parent).
+  if (el.runs && el.runs.length) {
+    return (
+      <div style={style}>
+        {el.runs.map((r, i) => {
+          const runStyle: React.CSSProperties = {};
+          if (r.fontFamily) runStyle.fontFamily = r.fontFamily;
+          if (r.fontSize) runStyle.fontSize = r.fontSize;
+          if (r.fontWeight) runStyle.fontWeight = r.fontWeight;
+          if (r.color) runStyle.color = r.color;
+          if (r.italic) runStyle.fontStyle = "italic";
+          if (r.letterSpacing != null) runStyle.letterSpacing = r.letterSpacing;
+          const decoration = [
+            r.underline && "underline",
+            r.strike && "line-through",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          if (decoration) runStyle.textDecoration = decoration;
+          return (
+            <span key={i} style={runStyle}>
+              {r.text}
+            </span>
+          );
+        })}
+      </div>
+    );
+  }
+
   return <div style={style}>{el.text}</div>;
 }
 

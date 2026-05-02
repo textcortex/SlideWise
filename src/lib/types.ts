@@ -35,6 +35,23 @@ export interface BaseElement {
   delay?: number;
 }
 
+/**
+ * One styled fragment within a text element. Any field left undefined falls
+ * back to the parent TextElement's flat default. Run text may contain "\n" —
+ * which becomes a paragraph break in both renderer and PPTX writer.
+ */
+export interface TextRun {
+  text: string;
+  fontFamily?: string;
+  fontSize?: number;
+  fontWeight?: number;
+  italic?: boolean;
+  underline?: boolean;
+  strike?: boolean;
+  color?: string;
+  letterSpacing?: number;
+}
+
 export interface TextElement extends BaseElement {
   type: "text";
   text: string;
@@ -49,6 +66,13 @@ export interface TextElement extends BaseElement {
   vAlign: "top" | "middle" | "bottom";
   lineHeight: number;
   letterSpacing: number;
+  /**
+   * Optional rich-text breakdown. When present, the renderer and PPTX writer
+   * use these per-run styles; the flat fields above act as defaults for any
+   * field a run leaves unset. Editing the text via the contentEditable surface
+   * collapses runs back to the flat representation.
+   */
+  runs?: TextRun[];
 }
 
 export type ShapeKind =

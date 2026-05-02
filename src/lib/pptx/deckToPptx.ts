@@ -100,15 +100,15 @@ function geometry(el: SlideElement): {
 }
 
 function addText(s: pptxgen.Slide, el: TextElement): void {
-  s.addText(el.text, {
+  const baseOpts = {
     ...geometry(el),
     fontFace: el.fontFamily,
     fontSize: pxToPoints(el.fontSize),
     color: hexNoHash(el.color),
     bold: el.fontWeight >= 600,
     italic: el.italic,
-    underline: el.underline ? { style: "sng" } : undefined,
-    strike: el.strike ? "sngStrike" : undefined,
+    underline: el.underline ? ({ style: "sng" } as const) : undefined,
+    strike: el.strike ? ("sngStrike" as const) : undefined,
     align: el.align,
     valign: el.vAlign,
     charSpacing: el.letterSpacing
@@ -116,7 +116,43 @@ function addText(s: pptxgen.Slide, el: TextElement): void {
       : undefined,
     paraSpaceBefore: 0,
     paraSpaceAfter: 0,
-  });
+  };
+
+  if (!el.runs || !el.runs.length) {
+    s.addText(el.text, baseOpts);
+    return;
+  }
+
+  // Multi-run: pptxgenjs accepts an array of {text, options} objects and emits
+  // them as separate <a:r> within the same <a:p>. A run whose text contains
+  // "\n" is split so each piece becomes its own paragraph (we use a per-run
+  // `breakLine` flag on the trailing pieces).
+  const items: pptxgen.TextProps[] = [];
+  for (const r of el.runs) {
+    const pieces = r.text.split("\n");
+    for (let i = 0; i < pieces.length; i++) {
+      const isLast = i === pieces.length - 1;
+      items.push({
+        text: pieces[i],
+        options: {
+          fontFace: r.fontFamily ?? el.fontFamily,
+          fontSize: pxToPoints(r.fontSize ?? el.fontSize),
+          color: hexNoHash(r.color ?? el.color),
+          bold: (r.fontWeight ?? el.fontWeight) >= 600,
+          italic: r.italic ?? el.italic,
+          underline: (r.underline ?? el.underline)
+            ? ({ style: "sng" } as const)
+            : undefined,
+          strike: (r.strike ?? el.strike) ? ("sngStrike" as const) : undefined,
+          charSpacing: r.letterSpacing ?? el.letterSpacing
+            ? Math.round((r.letterSpacing ?? el.letterSpacing) * 100)
+            : undefined,
+          breakLine: !isLast,
+        },
+      });
+    }
+  }
+  s.addText(items, baseOpts);
 }
 
 const SHAPE_MAP: Record<ShapeKind, string> = {

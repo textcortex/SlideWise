@@ -285,7 +285,11 @@ export function Canvas() {
                     editing={editingId === el.id && el.type === "text"}
                     onTextCommit={(text) => {
                       if (el.type === "text") {
-                        updateElement(el.id, { text });
+                        // Editing collapses any rich-text runs into the flat
+                        // representation — once the user changes the text, we
+                        // can no longer associate the new characters with the
+                        // original per-run styles.
+                        updateElement(el.id, { text, runs: undefined });
                       }
                       setEditingId(null);
                     }}

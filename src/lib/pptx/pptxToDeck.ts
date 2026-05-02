@@ -6,6 +6,7 @@ import type {
   Slide,
   SlideElement,
   TextElement,
+  TextRun,
   ShapeElement,
   ShapeKind,
   ImageElement,
@@ -203,28 +204,63 @@ async function parseSpOrText(
     // Source font sizes are in absolute points; when we letterbox a larger
     // source slide into Caracas's 1920×1080 frame, the typography must scale
     // with the geometry so it doesn't overflow its own text box.
+    const scale = ctx.fit.scale;
     const fontSize = first?.fontSize
-      ? Math.max(6, Math.round(first.fontSize * ctx.fit.scale))
+      ? Math.max(6, Math.round(first.fontSize * scale))
       : 24;
+    const fontFamily = first?.fontFamily ?? "Inter";
+    const fontWeight = first?.bold ? 700 : 400;
+    const color = first?.color ?? "#0E1330";
+
+    // Promote multi-run text to runs[] when more than one run exists OR when
+    // the single run carries explicit overrides we'd otherwise drop.
+    const runs: TextRun[] = text.runs.map((r) => ({
+      text: r.text,
+      fontFamily: r.fontFamily,
+      fontSize: r.fontSize ? Math.max(6, Math.round(r.fontSize * scale)) : undefined,
+      fontWeight: r.bold ? 700 : r.bold === false ? 400 : undefined,
+      italic: r.italic,
+      underline: r.underline,
+      strike: r.strike,
+      color: r.color,
+      letterSpacing: r.letterSpacing
+        ? Math.round(r.letterSpacing * scale)
+        : undefined,
+    }));
+    const hasMixedFormatting = runs.length > 1 && runs.some((r, i) => {
+      if (i === 0) return false;
+      const a = runs[0];
+      return (
+        a.color !== r.color ||
+        a.fontFamily !== r.fontFamily ||
+        a.fontSize !== r.fontSize ||
+        a.fontWeight !== r.fontWeight ||
+        a.italic !== r.italic ||
+        a.underline !== r.underline ||
+        a.strike !== r.strike
+      );
+    });
+
     const el: TextElement = {
       id: nanoid(8),
       type: "text",
       ...geom,
       z: 0,
       text: text.plain,
-      fontFamily: first?.fontFamily ?? "Inter",
+      fontFamily,
       fontSize,
-      fontWeight: first?.bold ? 700 : 400,
+      fontWeight,
       italic: !!first?.italic,
       underline: !!first?.underline,
       strike: !!first?.strike,
-      color: first?.color ?? "#0E1330",
+      color,
       align,
       vAlign: valign,
       lineHeight: text.lineHeightPct ?? 1.2,
       letterSpacing: first?.letterSpacing
-        ? Math.round(first.letterSpacing * ctx.fit.scale)
+        ? Math.round(first.letterSpacing * scale)
         : 0,
+      ...(hasMixedFormatting ? { runs } : {}),
     };
     return el;
   }
