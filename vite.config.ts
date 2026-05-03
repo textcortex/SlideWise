@@ -32,7 +32,7 @@ export default defineConfig(({ mode }) => {
             external: ["react", "react-dom", "react/jsx-runtime"],
             output: {
               assetFileNames: (asset) =>
-                asset.name?.endsWith(".css") ? "caracas.css" : "assets/[name][extname]",
+                asset.name?.endsWith(".css") ? "slidewise.css" : "assets/[name][extname]",
             },
           },
         }

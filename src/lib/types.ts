@@ -101,7 +101,7 @@ export interface ImageElement extends BaseElement {
   /**
    * PPTX <a:srcRect> source crop, expressed as fractions (0..1) of the source
    * image to chop from each edge before placing into the bounding box.
-   * Caracas applies it via background-image / background-position so the
+   * Slidewise applies it via background-image / background-position so the
    * final paint matches PowerPoint's "crop + stretch" behaviour.
    */
   crop?: { l: number; r: number; t: number; b: number };
@@ -138,7 +138,7 @@ export interface EmbedElement extends BaseElement {
 
 /**
  * Opaque OOXML element preserved for round-trip when reading a PPTX
- * containing constructs Caracas does not yet model (charts, SmartArt,
+ * containing constructs Slidewise does not yet model (charts, SmartArt,
  * embedded media, etc.). Position/size is editable; the inner XML is
  * re-emitted on write so the user does not lose data.
  */

@@ -1,6 +1,6 @@
 @import "./fonts.css";
 
-.caracas-editor {
+.slidewise-editor {
   --app-bg: #ffffff;
   --rail-bg: #fafafb;
   --canvas-bg-from: #f4f6fb;
@@ -49,7 +49,7 @@
   color: var(--ink);
 }
 
-.caracas-editor.theme-dark {
+.slidewise-editor.theme-dark {
   --app-bg: #0a0d1c;
   --rail-bg: #0d1124;
   --canvas-bg-from: #181c38;
@@ -95,45 +95,45 @@
   color-scheme: dark;
 }
 
-.caracas-editor,
-.caracas-editor *,
-.caracas-editor *::before,
-.caracas-editor *::after {
+.slidewise-editor,
+.slidewise-editor *,
+.slidewise-editor *::before,
+.slidewise-editor *::after {
   box-sizing: border-box;
 }
 
-.caracas-editor ::-webkit-scrollbar {
+.slidewise-editor ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
-.caracas-editor ::-webkit-scrollbar-track {
+.slidewise-editor ::-webkit-scrollbar-track {
   background: transparent;
 }
-.caracas-editor ::-webkit-scrollbar-thumb {
+.slidewise-editor ::-webkit-scrollbar-thumb {
   background: var(--scroll-thumb);
   border-radius: 999px;
 }
-.caracas-editor ::-webkit-scrollbar-thumb:hover {
+.slidewise-editor ::-webkit-scrollbar-thumb:hover {
   background: var(--scroll-thumb-hover);
 }
 
-.caracas-editor input[type="number"]::-webkit-inner-spin-button,
-.caracas-editor input[type="number"]::-webkit-outer-spin-button {
+.slidewise-editor input[type="number"]::-webkit-inner-spin-button,
+.slidewise-editor input[type="number"]::-webkit-outer-spin-button {
   -webkit-appearance: none;
   margin: 0;
 }
 
-.caracas-editor button:focus-visible,
-.caracas-editor [role="button"]:focus-visible,
-.caracas-editor input:focus-visible,
-.caracas-editor select:focus-visible,
-.caracas-editor summary:focus-visible,
-.caracas-editor [contenteditable]:focus-visible {
+.slidewise-editor button:focus-visible,
+.slidewise-editor [role="button"]:focus-visible,
+.slidewise-editor input:focus-visible,
+.slidewise-editor select:focus-visible,
+.slidewise-editor summary:focus-visible,
+.slidewise-editor [contenteditable]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: 6px;
 }
 
-.caracas-editor button {
+.slidewise-editor button {
   font-family: inherit;
 }

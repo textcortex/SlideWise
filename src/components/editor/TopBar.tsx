@@ -36,7 +36,7 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
         await onSaveProp(deck);
       } else {
         try {
-          localStorage.setItem("caracas-deck", JSON.stringify(deck));
+          localStorage.setItem("slidewise-deck", JSON.stringify(deck));
         } catch {}
       }
       setTimeout(() => setSaved("saved"), 320);
@@ -58,7 +58,7 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${(deck.title || "deck").replace(/[^a-z0-9-_]+/gi, "-")}.caracas.json`;
+    a.download = `${(deck.title || "deck").replace(/[^a-z0-9-_]+/gi, "-")}.slidewise.json`;
     a.click();
     URL.revokeObjectURL(url);
   };

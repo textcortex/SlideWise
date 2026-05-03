@@ -42,7 +42,7 @@ const SYSTEM_FAMILIES = new Set(
 );
 
 /** Element IDs we manage in <head> — one per editor host. */
-const STYLESHEET_ID_PREFIX = "caracas-google-fonts-";
+const STYLESHEET_ID_PREFIX = "slidewise-google-fonts-";
 
 export function collectFontFamilies(deck: Deck): string[] {
   const families = new Set<string>();

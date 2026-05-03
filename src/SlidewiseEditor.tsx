@@ -14,9 +14,9 @@ import {
 } from "@/lib/StoreProvider";
 import { collectFontFamilies, ensureGoogleFontsLoaded } from "@/lib/fonts";
 import type { Deck } from "@/lib/types";
-import "./CaracasEditor.css";
+import "./SlidewiseEditor.css";
 
-export interface CaracasEditorProps {
+export interface SlidewiseEditorProps {
   /**
    * The deck to edit. Loaded into the editor on mount. If a different
    * Deck reference is later passed, the editor's internal state is reset
@@ -30,7 +30,7 @@ export interface CaracasEditorProps {
   onChange?: (deck: Deck) => void;
   /** Fires when the user clicks "Save" in the top bar. */
   onSave?: (deck: Deck) => void | Promise<void>;
-  /** Optional override for the default `.caracas.json` export. */
+  /** Optional override for the default `.slidewise.json` export. */
   onExport?: (deck: Deck) => void;
   /** Fires when the dirty flag flips. Useful for "unsaved changes" banners. */
   onDirtyChange?: (dirty: boolean) => void;
@@ -50,7 +50,7 @@ export interface CaracasEditorProps {
   style?: CSSProperties;
 }
 
-export interface CaracasEditorHandle {
+export interface SlidewiseEditorHandle {
   play(): void;
   stop(): void;
   undo(): void;
@@ -60,18 +60,18 @@ export interface CaracasEditorHandle {
   resetDirty(): void;
 }
 
-export const CaracasEditor = forwardRef<
-  CaracasEditorHandle,
-  CaracasEditorProps
->(function CaracasEditor(props, ref) {
+export const SlidewiseEditor = forwardRef<
+  SlidewiseEditorHandle,
+  SlidewiseEditorProps
+>(function SlidewiseEditor(props, ref) {
   return (
     <EditorStoreProvider initialDeck={props.deck}>
-      <CaracasEditorInner {...props} forwardedRef={ref} />
+      <SlidewiseEditorInner {...props} forwardedRef={ref} />
     </EditorStoreProvider>
   );
 });
 
-function CaracasEditorInner({
+function SlidewiseEditorInner({
   deck,
   onChange,
   onSave,
@@ -84,7 +84,7 @@ function CaracasEditorInner({
   className,
   style,
   forwardedRef,
-}: CaracasEditorProps & { forwardedRef: Ref<CaracasEditorHandle> }) {
+}: SlidewiseEditorProps & { forwardedRef: Ref<SlidewiseEditorHandle> }) {
   const store = useEditorStore();
   const savedDeckRef = useRef<Deck>(deck);
   const dirtyRef = useRef(false);
@@ -199,7 +199,7 @@ function CaracasEditorInner({
 
   return (
     <div
-      className={className ? `caracas-editor-host ${className}` : "caracas-editor-host"}
+      className={className ? `slidewise-editor-host ${className}` : "slidewise-editor-host"}
       style={rootStyle}
     >
       <Editor
@@ -211,4 +211,4 @@ function CaracasEditorInner({
   );
 }
 
-export default CaracasEditor;
+export default SlidewiseEditor;

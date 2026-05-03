@@ -1,5 +1,5 @@
 {
-  "name": "caracas",
+  "name": "slidewise",
   "version": "0.2.0",
   "type": "module",
   "main": "./dist/index.mjs",
@@ -11,7 +11,7 @@
       "types": "./dist/types/index.d.ts",
       "import": "./dist/index.mjs"
     },
-    "./style.css": "./dist/caracas.css",
+    "./style.css": "./dist/slidewise.css",
     "./fonts.css": "./src/fonts.css"
   },
   "sideEffects": ["**/*.css"],

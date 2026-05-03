@@ -227,7 +227,7 @@ function runsToHtml(runs: TextRun[]): string {
       if (decoration) props.push(`text-decoration: ${decoration}`);
       const styleAttr = props.join("; ");
       const html = escapeHtml(r.text).replace(/\n/g, "<br>");
-      return `<span data-caracas-run="1" style="${styleAttr}">${html}</span>`;
+      return `<span data-slidewise-run="1" style="${styleAttr}">${html}</span>`;
     })
     .join("");
 }
