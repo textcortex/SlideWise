@@ -667,7 +667,14 @@ function makeLineFromGeometry(
   const strokeWidth = lineProps?.["@_w"]
     ? Math.max(1, Math.round(emuToPx(Number(lineProps["@_w"])) * ctx.fit.scale))
     : 4;
-  const dashed = !!lineProps?.["a:prstDash"];
+  const dashVal = lineProps?.["a:prstDash"]?.["@_val"];
+  // <a:prstDash val="solid"/> is a valid explicit solid declaration. Only the
+  // patterned values are actually dashed; everything else (including absent
+  // and "solid") renders as a normal line.
+  const dashed =
+    typeof dashVal === "string" &&
+    dashVal !== "solid" &&
+    dashVal.length > 0;
   const arrow = !!lineProps?.["a:headEnd"] || !!lineProps?.["a:tailEnd"];
   const rawH = flipV ? -geom.h : geom.h;
   const w = geom.w === 0 ? 1 : geom.w;
