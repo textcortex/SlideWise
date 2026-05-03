@@ -280,22 +280,39 @@ async function parseSpOrText(
     return el;
   }
 
-  const fillColor = extractFillColor(sp?.["p:spPr"]?.["a:solidFill"]) ?? "#4F5BD5";
+  // Fill: solid colour, transparent (noFill), or gradient (CSS linear-grad).
+  // Falls back to transparent so we don't paint our placeholder purple over
+  // shapes whose intent was an outline-only frame.
+  const fillColor = extractShapeFill(sp?.["p:spPr"]) ?? "transparent";
   const lineProps = sp?.["p:spPr"]?.["a:ln"];
-  const stroke = extractFillColor(lineProps?.["a:solidFill"]);
-  const strokeWidthEmu = lineProps?.["@_w"]
-    ? Number(lineProps["@_w"])
-    : undefined;
+  const lineHasNoFill = lineProps?.["a:noFill"] !== undefined;
+  const stroke = lineHasNoFill
+    ? undefined
+    : extractFillColor(lineProps?.["a:solidFill"]);
+  const strokeWidthEmu =
+    !lineHasNoFill && lineProps?.["@_w"]
+      ? Number(lineProps["@_w"])
+      : undefined;
 
   const kind = mapPrstToKind(presetName);
   if (!kind) {
     return toUnknown(sp, "p:sp", ctx);
   }
 
-  const radius =
-    presetName === "roundRect"
-      ? Math.round(Math.min(geom.w, geom.h) * 0.18)
-      : undefined;
+  // PPTX `roundRect` carries the corner radius via <a:avLst><a:gd name="adj"
+  // fmla="val N"/></a:avLst>; N is in 1/100000ths of the shorter side.
+  // Default is 16667 (≈16.7%). We were hardcoding 18% before, which over-
+  // rounded subtle 5% cards.
+  let radius: number | undefined;
+  if (presetName === "roundRect") {
+    const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+      (g: any) => g?.["@_name"] === "adj"
+    );
+    const fmla: string | undefined = adj?.["@_fmla"];
+    const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
+    const frac = m ? Number(m[1]) / 100000 : 0.16667;
+    radius = Math.round(Math.min(geom.w, geom.h) * frac);
+  }
 
   const shape: ShapeElement = {
     id: nanoid(8),
@@ -569,14 +586,64 @@ function computeFit(presentationXml: any): Fit {
 function extractFillColor(solidFill: any): string | undefined {
   if (!solidFill) return undefined;
   const srgb = solidFill["a:srgbClr"]?.["@_val"];
-  if (srgb) return `#${srgb.toUpperCase()}`;
+  if (srgb) return colorWithAlpha(`#${srgb.toUpperCase()}`, solidFill["a:srgbClr"]);
   const sys = solidFill["a:sysClr"]?.["@_lastClr"];
-  if (sys) return `#${sys.toUpperCase()}`;
+  if (sys) return colorWithAlpha(`#${sys.toUpperCase()}`, solidFill["a:sysClr"]);
+  return undefined;
+}
+
+function colorWithAlpha(hex: string, colorNode: any): string {
+  const a = Number(colorNode?.["a:alpha"]?.["@_val"]);
+  if (!Number.isFinite(a) || a >= 100000) return hex;
+  // a:alpha val is 0..100000. Convert to 0..1 then to #RRGGBBAA.
+  const aa = Math.round((a / 100000) * 255)
+    .toString(16)
+    .padStart(2, "0")
+    .toUpperCase();
+  return `${hex}${aa}`;
+}
+
+/**
+ * Extract a CSS background string from a shape's fill spec. Handles solid
+ * colors, gradient fills (returns a CSS linear-gradient), no-fill (returns
+ * "transparent"), and unknowns (returns undefined so the caller can decide).
+ */
+function extractShapeFill(spPr: any): string | undefined {
+  if (!spPr) return undefined;
+  if (spPr["a:noFill"] !== undefined) return "transparent";
+  if (spPr["a:solidFill"]) {
+    return extractFillColor(spPr["a:solidFill"]);
+  }
+  const gf = spPr["a:gradFill"];
+  if (gf) {
+    const stops = asArray(gf["a:gsLst"]?.["a:gs"])
+      .map((g: any) => {
+        const pos = Number(g?.["@_pos"] ?? 0) / 1000; // 0..100
+        // a:gs's color is one of srgbClr/sysClr/schemeClr — synthesise a
+        // throw-away solidFill envelope to reuse the helper.
+        const color = extractFillColor(g) ?? "#000000";
+        return { pos, color };
+      })
+      .sort((a, b) => a.pos - b.pos);
+    if (!stops.length) return undefined;
+    const allTransparent = stops.every((s) => s.color.length === 9 && s.color.endsWith("00"));
+    if (allTransparent) return "transparent";
+    const angDeg = gf["a:lin"]?.["@_ang"]
+      ? (Number(gf["a:lin"]["@_ang"]) / 60000 + 90) % 360
+      : 90;
+    const stopsCss = stops
+      .map((s) => `${s.color} ${s.pos.toFixed(2)}%`)
+      .join(", ");
+    return `linear-gradient(${angDeg}deg, ${stopsCss})`;
+  }
   return undefined;
 }
 
 function extractBackgroundColor(bg: any): string | undefined {
-  return extractFillColor(bg?.["p:bgPr"]?.["a:solidFill"]);
+  return (
+    extractFillColor(bg?.["p:bgPr"]?.["a:solidFill"]) ??
+    (bg?.["p:bgPr"]?.["a:noFill"] !== undefined ? "transparent" : undefined)
+  );
 }
 
 function readBodyVAlign(bodyPr: any): "top" | "middle" | "bottom" | undefined {
