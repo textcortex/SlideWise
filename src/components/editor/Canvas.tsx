@@ -283,13 +283,13 @@ export function Canvas() {
                   <ElementView
                     el={el}
                     editing={editingId === el.id && el.type === "text"}
-                    onTextCommit={(text) => {
+                    onTextCommit={(text, runs) => {
                       if (el.type === "text") {
-                        // Editing collapses any rich-text runs into the flat
-                        // representation — once the user changes the text, we
-                        // can no longer associate the new characters with the
-                        // original per-run styles.
-                        updateElement(el.id, { text, runs: undefined });
+                        // The contentEditable surface preserves run styles
+                        // when the user only edits text within them. If the
+                        // editor returned undefined runs (homogeneous style),
+                        // fall back to the flat representation.
+                        updateElement(el.id, { text, runs });
                       }
                       setEditingId(null);
                     }}

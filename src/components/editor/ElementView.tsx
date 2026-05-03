@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import type {
   SlideElement,
   TextElement,
+  TextRun,
   ShapeElement,
   ImageElement,
   LineElement,
@@ -18,7 +19,7 @@ export function ElementView({
 }: {
   el: SlideElement;
   editing?: boolean;
-  onTextCommit?: (text: string) => void;
+  onTextCommit?: (text: string, runs?: TextRun[]) => void;
 }) {
   switch (el.type) {
     case "text":
@@ -47,11 +48,27 @@ function TextView({
 }: {
   el: TextElement;
   editing?: boolean;
-  onCommit?: (text: string) => void;
+  onCommit?: (text: string, runs?: TextRun[]) => void;
 }) {
-  const style: React.CSSProperties = {
+  // Outer wrapper handles vertical alignment via flex; the inner block carries
+  // the typographic flow so inline <span> runs lay out correctly. Putting flex
+  // on the same node as the spans turns each span into a block-level flex
+  // item — that broke multi-color text layout in v1.
+  const outer: React.CSSProperties = {
     width: "100%",
     height: "100%",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent:
+      el.vAlign === "top"
+        ? "flex-start"
+        : el.vAlign === "middle"
+          ? "center"
+          : "flex-end",
+    cursor: editing ? "text" : "inherit",
+  };
+  const inner: React.CSSProperties = {
+    width: "100%",
     color: el.color,
     fontFamily: el.fontFamily,
     fontSize: el.fontSize,
@@ -63,78 +80,82 @@ function TextView({
     textAlign: el.align,
     lineHeight: el.lineHeight,
     letterSpacing: el.letterSpacing,
-    display: "flex",
-    flexDirection: "column",
-    justifyContent:
-      el.vAlign === "top"
-        ? "flex-start"
-        : el.vAlign === "middle"
-          ? "center"
-          : "flex-end",
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
     outline: "none",
-    cursor: editing ? "text" : "inherit",
   };
 
   if (editing) {
     return (
-      <EditableText
-        style={style}
-        initial={el.text}
-        onCommit={(t) => onCommit?.(t)}
-      />
-    );
-  }
-
-  // Multi-run: render each run as its own span with override styles. Newlines
-  // inside a run survive via white-space: pre-wrap (already on the parent).
-  if (el.runs && el.runs.length) {
-    return (
-      <div style={style}>
-        {el.runs.map((r, i) => {
-          const runStyle: React.CSSProperties = {};
-          if (r.fontFamily) runStyle.fontFamily = r.fontFamily;
-          if (r.fontSize) runStyle.fontSize = r.fontSize;
-          if (r.fontWeight) runStyle.fontWeight = r.fontWeight;
-          if (r.color) runStyle.color = r.color;
-          if (r.italic) runStyle.fontStyle = "italic";
-          if (r.letterSpacing != null) runStyle.letterSpacing = r.letterSpacing;
-          const decoration = [
-            r.underline && "underline",
-            r.strike && "line-through",
-          ]
-            .filter(Boolean)
-            .join(" ");
-          if (decoration) runStyle.textDecoration = decoration;
-          return (
-            <span key={i} style={runStyle}>
-              {r.text}
-            </span>
-          );
-        })}
+      <div style={outer}>
+        <EditableText
+          style={inner}
+          initialText={el.text}
+          initialRuns={el.runs}
+          onCommit={(t, r) => onCommit?.(t, r)}
+        />
       </div>
     );
   }
 
-  return <div style={style}>{el.text}</div>;
+  if (el.runs && el.runs.length) {
+    return (
+      <div style={outer}>
+        <div style={inner}>
+          {el.runs.map((r, i) => (
+            <span key={i} style={runCssStyle(r)}>
+              {r.text}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={outer}>
+      <div style={inner}>{el.text}</div>
+    </div>
+  );
+}
+
+function runCssStyle(r: TextRun): React.CSSProperties {
+  const s: React.CSSProperties = {};
+  if (r.fontFamily) s.fontFamily = r.fontFamily;
+  if (r.fontSize) s.fontSize = r.fontSize;
+  if (r.fontWeight) s.fontWeight = r.fontWeight;
+  if (r.color) s.color = r.color;
+  if (r.italic) s.fontStyle = "italic";
+  if (r.letterSpacing != null) s.letterSpacing = r.letterSpacing;
+  const decoration = [r.underline && "underline", r.strike && "line-through"]
+    .filter(Boolean)
+    .join(" ");
+  if (decoration) s.textDecoration = decoration;
+  return s;
 }
 
 function EditableText({
   style,
-  initial,
+  initialText,
+  initialRuns,
   onCommit,
 }: {
   style: React.CSSProperties;
-  initial: string;
-  onCommit: (t: string) => void;
+  initialText: string;
+  initialRuns?: TextRun[];
+  onCommit: (text: string, runs?: TextRun[]) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const initialRunsRef = useRef(initialRuns);
 
   useEffect(() => {
     const node = ref.current;
     if (!node) return;
-    node.innerText = initial;
+    if (initialRunsRef.current && initialRunsRef.current.length) {
+      node.innerHTML = runsToHtml(initialRunsRef.current);
+    } else {
+      node.innerText = initialText;
+    }
     node.focus();
     const range = document.createRange();
     range.selectNodeContents(node);
@@ -145,6 +166,23 @@ function EditableText({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const commit = () => {
+    const node = ref.current;
+    if (!node) return;
+    const hadRuns = !!initialRunsRef.current?.length;
+    if (!hadRuns) {
+      onCommit(node.innerText, undefined);
+      return;
+    }
+    const { text, runs } = extractRunsFromDom(node);
+    // If extraction collapsed everything to one style, drop runs to keep the
+    // store representation clean.
+    const isHomogeneous =
+      runs.length <= 1 ||
+      runs.every((r) => sameStyle(r, runs[0]));
+    onCommit(text, isHomogeneous ? undefined : runs);
+  };
+
   return (
     <div
       ref={ref}
@@ -154,7 +192,7 @@ function EditableText({
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
-      onBlur={(e) => onCommit(e.currentTarget.innerText)}
+      onBlur={commit}
       onKeyDown={(e) => {
         if (e.key === "Escape") {
           (e.target as HTMLDivElement).blur();
@@ -162,6 +200,115 @@ function EditableText({
         e.stopPropagation();
       }}
     />
+  );
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function runsToHtml(runs: TextRun[]): string {
+  return runs
+    .map((r) => {
+      const props: string[] = [];
+      if (r.color) props.push(`color: ${r.color}`);
+      if (r.fontFamily) props.push(`font-family: ${r.fontFamily}`);
+      if (r.fontSize) props.push(`font-size: ${r.fontSize}px`);
+      if (r.fontWeight) props.push(`font-weight: ${r.fontWeight}`);
+      if (r.italic) props.push(`font-style: italic`);
+      if (r.letterSpacing != null) props.push(`letter-spacing: ${r.letterSpacing}px`);
+      const decoration = [r.underline && "underline", r.strike && "line-through"]
+        .filter(Boolean)
+        .join(" ");
+      if (decoration) props.push(`text-decoration: ${decoration}`);
+      const styleAttr = props.join("; ");
+      const html = escapeHtml(r.text).replace(/\n/g, "<br>");
+      return `<span data-caracas-run="1" style="${styleAttr}">${html}</span>`;
+    })
+    .join("");
+}
+
+function styleToRun(el: HTMLElement, text: string): TextRun {
+  // Read explicit inline style only (not computed) so we don't capture
+  // inherited defaults like the body color.
+  const s = el.style;
+  const r: TextRun = { text };
+  if (s.color) r.color = s.color;
+  if (s.fontFamily) r.fontFamily = s.fontFamily.replace(/^["']|["']$/g, "");
+  if (s.fontSize) {
+    const px = parseFloat(s.fontSize);
+    if (Number.isFinite(px)) r.fontSize = px;
+  }
+  if (s.fontWeight) {
+    const w = parseInt(s.fontWeight, 10);
+    if (Number.isFinite(w)) r.fontWeight = w;
+  }
+  if (s.fontStyle === "italic") r.italic = true;
+  if (s.letterSpacing) {
+    const ls = parseFloat(s.letterSpacing);
+    if (Number.isFinite(ls)) r.letterSpacing = ls;
+  }
+  const td = s.textDecoration || s.textDecorationLine;
+  if (td?.includes("underline")) r.underline = true;
+  if (td?.includes("line-through")) r.strike = true;
+  return r;
+}
+
+function extractRunsFromDom(root: HTMLElement): { text: string; runs: TextRun[] } {
+  const runs: TextRun[] = [];
+  const text: string[] = [];
+
+  const walk = (node: Node, parentStyle: HTMLElement | null) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const t = node.textContent ?? "";
+      if (!t) return;
+      runs.push(parentStyle ? styleToRun(parentStyle, t) : { text: t });
+      text.push(t);
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node as HTMLElement;
+    if (el.tagName === "BR") {
+      // Append "\n" to the most recent run so it stays in-style.
+      if (runs.length) runs[runs.length - 1].text += "\n";
+      else runs.push({ text: "\n" });
+      text.push("\n");
+      return;
+    }
+    if (el.tagName === "DIV" || el.tagName === "P") {
+      // Browser may wrap new lines in <div>/<p>. Treat as line breaks between
+      // children: insert a "\n" before the children of every block past the
+      // first one.
+      if (runs.length || text.length) {
+        if (runs.length) runs[runs.length - 1].text += "\n";
+        else runs.push({ text: "\n" });
+        text.push("\n");
+      }
+      el.childNodes.forEach((c) => walk(c, el));
+      return;
+    }
+    // SPAN or any other inline wrapper: pass its style to children.
+    el.childNodes.forEach((c) => walk(c, el));
+  };
+
+  root.childNodes.forEach((c) => walk(c, null));
+  return { text: text.join(""), runs };
+}
+
+function sameStyle(a: TextRun, b: TextRun): boolean {
+  return (
+    a.color === b.color &&
+    a.fontFamily === b.fontFamily &&
+    a.fontSize === b.fontSize &&
+    a.fontWeight === b.fontWeight &&
+    a.italic === b.italic &&
+    a.underline === b.underline &&
+    a.strike === b.strike &&
+    a.letterSpacing === b.letterSpacing
   );
 }
 

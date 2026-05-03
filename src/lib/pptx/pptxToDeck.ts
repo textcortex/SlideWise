@@ -11,6 +11,7 @@ import type {
   ShapeKind,
   ImageElement,
   LineElement,
+  TableElement,
   UnknownElement,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
@@ -161,7 +162,7 @@ async function parseSlide(
       append(parseCxn(cxn, ctx.fit));
     }
     for (const gf of asArray(spTree["p:graphicFrame"])) {
-      append(toUnknown(gf, "p:graphicFrame", ctx));
+      append(parseGraphicFrame(gf, ctx));
     }
     for (const grp of asArray(spTree["p:grpSp"])) {
       append(toUnknown(grp, "p:grpSp", ctx));
@@ -191,6 +192,20 @@ async function parseSpOrText(
   const txBody = sp["p:txBody"];
   const prstGeom = sp?.["p:spPr"]?.["a:prstGeom"];
   const presetName = prstGeom?.["@_prst"];
+
+  // Lines are routinely authored as <p:sp prst="line"> rather than the
+  // <p:cxnSp> connector form. Detect them up front so they don't leak into
+  // shape parsing (which would map them to UnknownElement).
+  if (presetName === "line" || presetName === "straightConnector1") {
+    const flipV = xfrm?.["@_flipV"] === "1";
+    return makeLineFromGeometry(
+      geom,
+      sp?.["p:spPr"]?.["a:ln"],
+      ctx.fit.scale,
+      flipV
+    );
+  }
+
   const isText = !!txBody && (!presetName || presetName === "rect");
 
   if (isText) {
@@ -334,19 +349,36 @@ function parseCxn(cxn: any, fit: Fit): SlideElement | null {
   const xfrm = cxn?.["p:spPr"]?.["a:xfrm"];
   const geom = readGeometry(xfrm, fit);
   if (!geom) return null;
-  const lineProps = cxn?.["p:spPr"]?.["a:ln"];
+  const flipV = xfrm?.["@_flipV"] === "1";
+  return makeLineFromGeometry(geom, cxn?.["p:spPr"]?.["a:ln"], fit.scale, flipV);
+}
+
+function makeLineFromGeometry(
+  geom: { x: number; y: number; w: number; h: number; rotation: number },
+  lineProps: any,
+  scale: number,
+  flipV: boolean
+): LineElement {
   const stroke = extractFillColor(lineProps?.["a:solidFill"]) ?? "#0E1330";
   const strokeWidth = lineProps?.["@_w"]
-    ? Math.max(1, Math.round(emuToPx(Number(lineProps["@_w"])) * fit.scale))
+    ? Math.max(1, Math.round(emuToPx(Number(lineProps["@_w"])) * scale))
     : 4;
   const dashed = !!lineProps?.["a:prstDash"];
   const arrow =
     !!lineProps?.["a:headEnd"] || !!lineProps?.["a:tailEnd"];
-
+  // Caracas LineElement renders a line from (x, y) to (x+w, y+h). PPTX
+  // straight lines use cy=0 for horizontal and cx=0 for vertical; ensure a
+  // minimum extent so the line is visible, and handle flipV by inverting h.
+  const w = geom.w === 0 ? 1 : geom.w;
+  const h = flipV ? -geom.h : geom.h;
   const line: LineElement = {
     id: nanoid(8),
     type: "line",
-    ...geom,
+    x: geom.x,
+    y: geom.y,
+    w,
+    h,
+    rotation: geom.rotation,
     z: 0,
     stroke,
     strokeWidth,
@@ -354,6 +386,78 @@ function parseCxn(cxn: any, fit: Fit): SlideElement | null {
     arrow,
   };
   return line;
+}
+
+function parseGraphicFrame(gf: any, ctx: ParseContext): SlideElement | null {
+  const tbl = gf?.["a:graphic"]?.["a:graphicData"]?.["a:tbl"];
+  if (tbl) {
+    const parsed = parseTable(gf, tbl, ctx);
+    if (parsed) return parsed;
+  }
+  return toUnknown(gf, "p:graphicFrame", ctx);
+}
+
+function parseTable(gf: any, tbl: any, ctx: ParseContext): TableElement | null {
+  // graphicFrame uses p:xfrm directly (not nested under p:spPr).
+  const xfrm = gf?.["p:xfrm"] || gf?.["p:spPr"]?.["a:xfrm"];
+  const geom = readGeometry(xfrm, ctx.fit);
+  if (!geom) return null;
+
+  const trs = asArray(tbl["a:tr"]);
+  if (!trs.length) return null;
+
+  const rows: string[][] = [];
+  let firstFontSizePx: number | undefined;
+  let firstColor: string | undefined;
+  let headerFill = "#0E1330";
+  let bodyFill = "#FFFFFF";
+
+  for (let ri = 0; ri < trs.length; ri++) {
+    const tr = trs[ri];
+    const tcs = asArray(tr["a:tc"]);
+    const cells: string[] = [];
+    for (const tc of tcs) {
+      // Skip merged-cell continuation markers.
+      if (tc?.["@_hMerge"] === "1" || tc?.["@_vMerge"] === "1") {
+        cells.push("");
+        continue;
+      }
+      const txBody = tc["a:txBody"];
+      const text = txBody ? extractRuns(txBody) : { plain: "", runs: [] };
+      cells.push(text.plain);
+
+      const r0 = text.runs[0];
+      if (firstFontSizePx === undefined && r0?.fontSize) {
+        firstFontSizePx = Math.max(
+          8,
+          Math.round(r0.fontSize * ctx.fit.scale)
+        );
+      }
+      if (!firstColor && r0?.color) firstColor = r0.color;
+
+      const cellFill = extractFillColor(
+        tc?.["a:tcPr"]?.["a:solidFill"]
+      );
+      if (cellFill) {
+        if (ri === 0) headerFill = cellFill;
+        else bodyFill = cellFill;
+      }
+    }
+    rows.push(cells);
+  }
+
+  const table: TableElement = {
+    id: nanoid(8),
+    type: "table",
+    ...geom,
+    z: 0,
+    rows,
+    headerFill,
+    rowFill: bodyFill,
+    textColor: firstColor ?? "#0E1330",
+    fontSize: firstFontSizePx ?? 18,
+  };
+  return table;
 }
 
 function toUnknown(node: any, tag: string, ctx: ParseContext): UnknownElement {
