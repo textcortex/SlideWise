@@ -675,7 +675,13 @@ function makeLineFromGeometry(
     typeof dashVal === "string" &&
     dashVal !== "solid" &&
     dashVal.length > 0;
-  const arrow = !!lineProps?.["a:headEnd"] || !!lineProps?.["a:tailEnd"];
+  // <a:headEnd type="none"/> is valid PPTX for an explicit "no arrowhead".
+  // Only mark as arrow when the type is one of the actual arrowhead presets.
+  const headType = lineProps?.["a:headEnd"]?.["@_type"];
+  const tailType = lineProps?.["a:tailEnd"]?.["@_type"];
+  const isArrowType = (t: unknown) =>
+    typeof t === "string" && t.length > 0 && t !== "none";
+  const arrow = isArrowType(headType) || isArrowType(tailType);
   const rawH = flipV ? -geom.h : geom.h;
   const w = geom.w === 0 ? 1 : geom.w;
   const h = Math.abs(rawH) === 0 ? 1 : rawH;
