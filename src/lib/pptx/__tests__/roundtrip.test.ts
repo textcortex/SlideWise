@@ -188,4 +188,49 @@ describe("pptx round-trip", () => {
     const out = await roundtrip(deck);
     expect(out.title).toBe("My Wonderful Deck");
   });
+
+  it("round-trips multi-color text via runs[]", async () => {
+    const deck = makeDeck([
+      {
+        ...baseElement,
+        id: "t1",
+        type: "text",
+        x: 100,
+        y: 100,
+        w: 1500,
+        h: 220,
+        text: "ELDORAUI",
+        fontFamily: "Inter",
+        fontSize: 120,
+        fontWeight: 700,
+        italic: false,
+        underline: false,
+        strike: false,
+        color: "#FFFFFF",
+        align: "left",
+        vAlign: "top",
+        lineHeight: 1,
+        letterSpacing: 0,
+        runs: [
+          { text: "ELDORA", color: "#FFFFFF" },
+          { text: "UI", color: "#0F1B3D" },
+        ],
+      },
+    ]);
+
+    const out = await roundtrip(deck);
+    const text = out.slides[0].elements.find((e) => e.type === "text");
+    expect(text?.type).toBe("text");
+    if (text?.type !== "text") return;
+    // Concatenated text survives
+    expect(text.text.replace(/\s+/g, "")).toBe("ELDORAUI");
+    // The two distinct colors come back as separate runs
+    expect(text.runs).toBeTruthy();
+    expect(text.runs!.length).toBeGreaterThanOrEqual(2);
+    const colors = (text.runs ?? [])
+      .map((r) => (r.color ?? "").toUpperCase())
+      .filter(Boolean);
+    expect(colors).toContain("#FFFFFF");
+    expect(colors).toContain("#0F1B3D");
+  });
 });

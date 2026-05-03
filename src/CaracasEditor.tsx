@@ -1,6 +1,7 @@
 import {
   forwardRef,
   useEffect,
+  useId,
   useImperativeHandle,
   useRef,
   type CSSProperties,
@@ -11,6 +12,7 @@ import {
   EditorStoreProvider,
   useEditorStore,
 } from "@/lib/StoreProvider";
+import { collectFontFamilies, ensureGoogleFontsLoaded } from "@/lib/fonts";
 import type { Deck } from "@/lib/types";
 import "./CaracasEditor.css";
 
@@ -129,8 +131,14 @@ function CaracasEditorInner({
     }
   }, [deck, store]);
 
-  // Subscribe once: emit onChange and recompute dirty whenever the deck changes.
+  // Subscribe once: emit onChange, recompute dirty, and refresh the Google
+  // Fonts <link> whenever the deck changes.
+  const instanceId = useId().replace(/[^a-z0-9]/gi, "");
   useEffect(() => {
+    ensureGoogleFontsLoaded(
+      instanceId,
+      collectFontFamilies(store.getState().deck)
+    );
     return store.subscribe((state, prev) => {
       if (state.deck === prev.deck) return;
       onChangeRef.current?.(state.deck);
@@ -139,8 +147,16 @@ function CaracasEditorInner({
         dirtyRef.current = nextDirty;
         onDirtyChangeRef.current?.(nextDirty);
       }
+      ensureGoogleFontsLoaded(instanceId, collectFontFamilies(state.deck));
     });
-  }, [store]);
+  }, [store, instanceId]);
+
+  // Remove our font <link> when the editor unmounts.
+  useEffect(() => {
+    return () => {
+      ensureGoogleFontsLoaded(instanceId, []);
+    };
+  }, [instanceId]);
 
   useImperativeHandle(
     forwardedRef,

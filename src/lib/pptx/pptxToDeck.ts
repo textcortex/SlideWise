@@ -6,10 +6,12 @@ import type {
   Slide,
   SlideElement,
   TextElement,
+  TextRun,
   ShapeElement,
   ShapeKind,
   ImageElement,
   LineElement,
+  TableElement,
   UnknownElement,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
@@ -160,7 +162,7 @@ async function parseSlide(
       append(parseCxn(cxn, ctx.fit));
     }
     for (const gf of asArray(spTree["p:graphicFrame"])) {
-      append(toUnknown(gf, "p:graphicFrame", ctx));
+      append(parseGraphicFrame(gf, ctx));
     }
     for (const grp of asArray(spTree["p:grpSp"])) {
       append(toUnknown(grp, "p:grpSp", ctx));
@@ -190,6 +192,20 @@ async function parseSpOrText(
   const txBody = sp["p:txBody"];
   const prstGeom = sp?.["p:spPr"]?.["a:prstGeom"];
   const presetName = prstGeom?.["@_prst"];
+
+  // Lines are routinely authored as <p:sp prst="line"> rather than the
+  // <p:cxnSp> connector form. Detect them up front so they don't leak into
+  // shape parsing (which would map them to UnknownElement).
+  if (presetName === "line" || presetName === "straightConnector1") {
+    const flipV = xfrm?.["@_flipV"] === "1";
+    return makeLineFromGeometry(
+      geom,
+      sp?.["p:spPr"]?.["a:ln"],
+      ctx.fit.scale,
+      flipV
+    );
+  }
+
   const isText = !!txBody && (!presetName || presetName === "rect");
 
   if (isText) {
@@ -203,48 +219,100 @@ async function parseSpOrText(
     // Source font sizes are in absolute points; when we letterbox a larger
     // source slide into Caracas's 1920×1080 frame, the typography must scale
     // with the geometry so it doesn't overflow its own text box.
+    const scale = ctx.fit.scale;
     const fontSize = first?.fontSize
-      ? Math.max(6, Math.round(first.fontSize * ctx.fit.scale))
+      ? Math.max(6, Math.round(first.fontSize * scale))
       : 24;
+    const fontFamily = first?.fontFamily ?? "Inter";
+    const fontWeight = first?.bold ? 700 : 400;
+    const color = first?.color ?? "#0E1330";
+
+    // Promote multi-run text to runs[] when more than one run exists OR when
+    // the single run carries explicit overrides we'd otherwise drop.
+    const runs: TextRun[] = text.runs.map((r) => ({
+      text: r.text,
+      fontFamily: r.fontFamily,
+      fontSize: r.fontSize ? Math.max(6, Math.round(r.fontSize * scale)) : undefined,
+      fontWeight: r.bold ? 700 : r.bold === false ? 400 : undefined,
+      italic: r.italic,
+      underline: r.underline,
+      strike: r.strike,
+      color: r.color,
+      letterSpacing: r.letterSpacing
+        ? Math.round(r.letterSpacing * scale)
+        : undefined,
+    }));
+    const hasMixedFormatting = runs.length > 1 && runs.some((r, i) => {
+      if (i === 0) return false;
+      const a = runs[0];
+      return (
+        a.color !== r.color ||
+        a.fontFamily !== r.fontFamily ||
+        a.fontSize !== r.fontSize ||
+        a.fontWeight !== r.fontWeight ||
+        a.italic !== r.italic ||
+        a.underline !== r.underline ||
+        a.strike !== r.strike
+      );
+    });
+
     const el: TextElement = {
       id: nanoid(8),
       type: "text",
       ...geom,
       z: 0,
       text: text.plain,
-      fontFamily: first?.fontFamily ?? "Inter",
+      fontFamily,
       fontSize,
-      fontWeight: first?.bold ? 700 : 400,
+      fontWeight,
       italic: !!first?.italic,
       underline: !!first?.underline,
       strike: !!first?.strike,
-      color: first?.color ?? "#0E1330",
+      color,
       align,
       vAlign: valign,
       lineHeight: text.lineHeightPct ?? 1.2,
       letterSpacing: first?.letterSpacing
-        ? Math.round(first.letterSpacing * ctx.fit.scale)
+        ? Math.round(first.letterSpacing * scale)
         : 0,
+      ...(hasMixedFormatting ? { runs } : {}),
     };
     return el;
   }
 
-  const fillColor = extractFillColor(sp?.["p:spPr"]?.["a:solidFill"]) ?? "#4F5BD5";
+  // Fill: solid colour, transparent (noFill), or gradient (CSS linear-grad).
+  // Falls back to transparent so we don't paint our placeholder purple over
+  // shapes whose intent was an outline-only frame.
+  const fillColor = extractShapeFill(sp?.["p:spPr"]) ?? "transparent";
   const lineProps = sp?.["p:spPr"]?.["a:ln"];
-  const stroke = extractFillColor(lineProps?.["a:solidFill"]);
-  const strokeWidthEmu = lineProps?.["@_w"]
-    ? Number(lineProps["@_w"])
-    : undefined;
+  const lineHasNoFill = lineProps?.["a:noFill"] !== undefined;
+  const stroke = lineHasNoFill
+    ? undefined
+    : extractFillColor(lineProps?.["a:solidFill"]);
+  const strokeWidthEmu =
+    !lineHasNoFill && lineProps?.["@_w"]
+      ? Number(lineProps["@_w"])
+      : undefined;
 
   const kind = mapPrstToKind(presetName);
   if (!kind) {
     return toUnknown(sp, "p:sp", ctx);
   }
 
-  const radius =
-    presetName === "roundRect"
-      ? Math.round(Math.min(geom.w, geom.h) * 0.18)
-      : undefined;
+  // PPTX `roundRect` carries the corner radius via <a:avLst><a:gd name="adj"
+  // fmla="val N"/></a:avLst>; N is in 1/100000ths of the shorter side.
+  // Default is 16667 (≈16.7%). We were hardcoding 18% before, which over-
+  // rounded subtle 5% cards.
+  let radius: number | undefined;
+  if (presetName === "roundRect") {
+    const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+      (g: any) => g?.["@_name"] === "adj"
+    );
+    const fmla: string | undefined = adj?.["@_fmla"];
+    const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
+    const frac = m ? Number(m[1]) / 100000 : 0.16667;
+    radius = Math.round(Math.min(geom.w, geom.h) * frac);
+  }
 
   const shape: ShapeElement = {
     id: nanoid(8),
@@ -281,7 +349,25 @@ async function parsePic(pic: any, ctx: ParseContext): Promise<SlideElement | nul
   const ext = (fullPath.split(".").pop() || "png").toLowerCase();
   const mime = mimeForExt(ext);
 
-  const fitMode = pic?.["p:blipFill"]?.["a:stretch"] ? "cover" : "contain";
+  // PPTX semantics:
+  //   <a:stretch/>      stretch source to bounding box (CSS object-fit: fill)
+  //   <a:tile .../>     tile (rare; we approximate as cover)
+  //   <a:srcRect l/r/t/b="<percent×1000>"/> crop the source first
+  const blipFill = pic?.["p:blipFill"];
+  const hasStretch = !!blipFill?.["a:stretch"];
+  const fitMode: ImageElement["fit"] = hasStretch ? "fill" : "cover";
+
+  const sr = blipFill?.["a:srcRect"];
+  const crop = sr
+    ? {
+        l: Number(sr["@_l"] ?? 0) / 100000,
+        r: Number(sr["@_r"] ?? 0) / 100000,
+        t: Number(sr["@_t"] ?? 0) / 100000,
+        b: Number(sr["@_b"] ?? 0) / 100000,
+      }
+    : undefined;
+  const hasCrop =
+    crop && (crop.l > 0 || crop.r > 0 || crop.t > 0 || crop.b > 0);
 
   const image: ImageElement = {
     id: nanoid(8),
@@ -290,6 +376,7 @@ async function parsePic(pic: any, ctx: ParseContext): Promise<SlideElement | nul
     z: 0,
     src: `data:${mime};base64,${base64}`,
     fit: fitMode,
+    ...(hasCrop ? { crop } : {}),
   };
   return image;
 }
@@ -298,19 +385,38 @@ function parseCxn(cxn: any, fit: Fit): SlideElement | null {
   const xfrm = cxn?.["p:spPr"]?.["a:xfrm"];
   const geom = readGeometry(xfrm, fit);
   if (!geom) return null;
-  const lineProps = cxn?.["p:spPr"]?.["a:ln"];
+  const flipV = xfrm?.["@_flipV"] === "1";
+  return makeLineFromGeometry(geom, cxn?.["p:spPr"]?.["a:ln"], fit.scale, flipV);
+}
+
+function makeLineFromGeometry(
+  geom: { x: number; y: number; w: number; h: number; rotation: number },
+  lineProps: any,
+  scale: number,
+  flipV: boolean
+): LineElement {
   const stroke = extractFillColor(lineProps?.["a:solidFill"]) ?? "#0E1330";
   const strokeWidth = lineProps?.["@_w"]
-    ? Math.max(1, Math.round(emuToPx(Number(lineProps["@_w"])) * fit.scale))
+    ? Math.max(1, Math.round(emuToPx(Number(lineProps["@_w"])) * scale))
     : 4;
   const dashed = !!lineProps?.["a:prstDash"];
   const arrow =
     !!lineProps?.["a:headEnd"] || !!lineProps?.["a:tailEnd"];
-
+  // Caracas LineElement renders a line from (x, y) to (x+w, y+h). PPTX
+  // straight lines use cy=0 for horizontal and cx=0 for vertical; ensure a
+  // minimum extent so the bounding box is renderable, and handle flipV by
+  // inverting the y-axis sign.
+  const rawH = flipV ? -geom.h : geom.h;
+  const w = geom.w === 0 ? 1 : geom.w;
+  const h = Math.abs(rawH) === 0 ? 1 : rawH;
   const line: LineElement = {
     id: nanoid(8),
     type: "line",
-    ...geom,
+    x: geom.x,
+    y: geom.y,
+    w,
+    h,
+    rotation: geom.rotation,
     z: 0,
     stroke,
     strokeWidth,
@@ -318,6 +424,78 @@ function parseCxn(cxn: any, fit: Fit): SlideElement | null {
     arrow,
   };
   return line;
+}
+
+function parseGraphicFrame(gf: any, ctx: ParseContext): SlideElement | null {
+  const tbl = gf?.["a:graphic"]?.["a:graphicData"]?.["a:tbl"];
+  if (tbl) {
+    const parsed = parseTable(gf, tbl, ctx);
+    if (parsed) return parsed;
+  }
+  return toUnknown(gf, "p:graphicFrame", ctx);
+}
+
+function parseTable(gf: any, tbl: any, ctx: ParseContext): TableElement | null {
+  // graphicFrame uses p:xfrm directly (not nested under p:spPr).
+  const xfrm = gf?.["p:xfrm"] || gf?.["p:spPr"]?.["a:xfrm"];
+  const geom = readGeometry(xfrm, ctx.fit);
+  if (!geom) return null;
+
+  const trs = asArray(tbl["a:tr"]);
+  if (!trs.length) return null;
+
+  const rows: string[][] = [];
+  let firstFontSizePx: number | undefined;
+  let firstColor: string | undefined;
+  let headerFill = "#0E1330";
+  let bodyFill = "#FFFFFF";
+
+  for (let ri = 0; ri < trs.length; ri++) {
+    const tr = trs[ri];
+    const tcs = asArray(tr["a:tc"]);
+    const cells: string[] = [];
+    for (const tc of tcs) {
+      // Skip merged-cell continuation markers.
+      if (tc?.["@_hMerge"] === "1" || tc?.["@_vMerge"] === "1") {
+        cells.push("");
+        continue;
+      }
+      const txBody = tc["a:txBody"];
+      const text = txBody ? extractRuns(txBody) : { plain: "", runs: [] };
+      cells.push(text.plain);
+
+      const r0 = text.runs[0];
+      if (firstFontSizePx === undefined && r0?.fontSize) {
+        firstFontSizePx = Math.max(
+          8,
+          Math.round(r0.fontSize * ctx.fit.scale)
+        );
+      }
+      if (!firstColor && r0?.color) firstColor = r0.color;
+
+      const cellFill = extractFillColor(
+        tc?.["a:tcPr"]?.["a:solidFill"]
+      );
+      if (cellFill) {
+        if (ri === 0) headerFill = cellFill;
+        else bodyFill = cellFill;
+      }
+    }
+    rows.push(cells);
+  }
+
+  const table: TableElement = {
+    id: nanoid(8),
+    type: "table",
+    ...geom,
+    z: 0,
+    rows,
+    headerFill,
+    rowFill: bodyFill,
+    textColor: firstColor ?? "#0E1330",
+    fontSize: firstFontSizePx ?? 18,
+  };
+  return table;
 }
 
 function toUnknown(node: any, tag: string, ctx: ParseContext): UnknownElement {
@@ -408,14 +586,64 @@ function computeFit(presentationXml: any): Fit {
 function extractFillColor(solidFill: any): string | undefined {
   if (!solidFill) return undefined;
   const srgb = solidFill["a:srgbClr"]?.["@_val"];
-  if (srgb) return `#${srgb.toUpperCase()}`;
+  if (srgb) return colorWithAlpha(`#${srgb.toUpperCase()}`, solidFill["a:srgbClr"]);
   const sys = solidFill["a:sysClr"]?.["@_lastClr"];
-  if (sys) return `#${sys.toUpperCase()}`;
+  if (sys) return colorWithAlpha(`#${sys.toUpperCase()}`, solidFill["a:sysClr"]);
+  return undefined;
+}
+
+function colorWithAlpha(hex: string, colorNode: any): string {
+  const a = Number(colorNode?.["a:alpha"]?.["@_val"]);
+  if (!Number.isFinite(a) || a >= 100000) return hex;
+  // a:alpha val is 0..100000. Convert to 0..1 then to #RRGGBBAA.
+  const aa = Math.round((a / 100000) * 255)
+    .toString(16)
+    .padStart(2, "0")
+    .toUpperCase();
+  return `${hex}${aa}`;
+}
+
+/**
+ * Extract a CSS background string from a shape's fill spec. Handles solid
+ * colors, gradient fills (returns a CSS linear-gradient), no-fill (returns
+ * "transparent"), and unknowns (returns undefined so the caller can decide).
+ */
+function extractShapeFill(spPr: any): string | undefined {
+  if (!spPr) return undefined;
+  if (spPr["a:noFill"] !== undefined) return "transparent";
+  if (spPr["a:solidFill"]) {
+    return extractFillColor(spPr["a:solidFill"]);
+  }
+  const gf = spPr["a:gradFill"];
+  if (gf) {
+    const stops = asArray(gf["a:gsLst"]?.["a:gs"])
+      .map((g: any) => {
+        const pos = Number(g?.["@_pos"] ?? 0) / 1000; // 0..100
+        // a:gs's color is one of srgbClr/sysClr/schemeClr — synthesise a
+        // throw-away solidFill envelope to reuse the helper.
+        const color = extractFillColor(g) ?? "#000000";
+        return { pos, color };
+      })
+      .sort((a, b) => a.pos - b.pos);
+    if (!stops.length) return undefined;
+    const allTransparent = stops.every((s) => s.color.length === 9 && s.color.endsWith("00"));
+    if (allTransparent) return "transparent";
+    const angDeg = gf["a:lin"]?.["@_ang"]
+      ? (Number(gf["a:lin"]["@_ang"]) / 60000 + 90) % 360
+      : 90;
+    const stopsCss = stops
+      .map((s) => `${s.color} ${s.pos.toFixed(2)}%`)
+      .join(", ");
+    return `linear-gradient(${angDeg}deg, ${stopsCss})`;
+  }
   return undefined;
 }
 
 function extractBackgroundColor(bg: any): string | undefined {
-  return extractFillColor(bg?.["p:bgPr"]?.["a:solidFill"]);
+  return (
+    extractFillColor(bg?.["p:bgPr"]?.["a:solidFill"]) ??
+    (bg?.["p:bgPr"]?.["a:noFill"] !== undefined ? "transparent" : undefined)
+  );
 }
 
 function readBodyVAlign(bodyPr: any): "top" | "middle" | "bottom" | undefined {
