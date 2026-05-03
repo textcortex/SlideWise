@@ -15,8 +15,8 @@ import type {
 import { pxToInches, pxToPoints } from "./units";
 
 /**
- * Serialize a Caracas Deck to a real PPTX blob. Round-trips well for the
- * element types Caracas natively supports (text, shape, image, line,
+ * Serialize a Slidewise Deck to a real PPTX blob. Round-trips well for the
+ * element types Slidewise natively supports (text, shape, image, line,
  * table, icon, embed). UnknownElement and entrance animations are dropped
  * with a warning — proper preservation requires bypassing pptxgenjs and
  * is out of scope for v1.
@@ -45,7 +45,7 @@ function addSlide(pptx: pptxgen, slide: Slide): void {
       addElement(s, el);
     } catch (err) {
       console.warn(
-        `[caracas/pptx] failed to write element ${el.id} (${el.type}):`,
+        `[slidewise/pptx] failed to write element ${el.id} (${el.type}):`,
         err
       );
     }

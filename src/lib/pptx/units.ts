@@ -1,7 +1,7 @@
 /**
- * Unit conversions between Caracas pixels and PPTX EMU/inches/points.
+ * Unit conversions between Slidewise pixels and PPTX EMU/inches/points.
  *
- * Caracas authors at a fixed 1920×1080 px canvas. PPTX widescreen layout is
+ * Slidewise authors at a fixed 1920×1080 px canvas. PPTX widescreen layout is
  * 13.333 × 7.5 inches (12,192,000 × 6,858,000 EMU). The mapping is linear:
  *   1920 px ↔ 12,192,000 EMU ↔ 13.333 in
  *   1080 px ↔  6,858,000 EMU ↔  7.5 in

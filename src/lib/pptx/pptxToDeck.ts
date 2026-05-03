@@ -20,7 +20,7 @@ import type { ParseDiagnostics } from "./types";
 
 /**
  * Linear transform from raw source-PPTX pixels (EMU/EMU_PER_PX) into
- * Caracas's fixed 1920×1080 canvas. We pick a uniform scale that fits the
+ * Slidewise's fixed 1920×1080 canvas. We pick a uniform scale that fits the
  * source slide entirely, then center it — preserves aspect, letterboxes when
  * source is 4:3 and target is 16:9.
  */
@@ -71,7 +71,7 @@ const ARRAY_TAGS = new Set([
 ]);
 
 /**
- * Parse a PPTX blob into a Caracas Deck. Coverage:
+ * Parse a PPTX blob into a Slidewise Deck. Coverage:
  *  - Slide background colour
  *  - Text boxes (basic run formatting: font, size, colour, bold, italic, alignment)
  *  - Preset shapes (rect, roundRect, ellipse, triangle, diamond, star5)
@@ -117,7 +117,7 @@ export async function parsePptx(blob: Blob | ArrayBuffer): Promise<Deck> {
 
   const deck: Deck = { title, slides };
   if (diagnostics.warnings.length) {
-    console.info("[caracas/pptx] parse diagnostics:", diagnostics);
+    console.info("[slidewise/pptx] parse diagnostics:", diagnostics);
   }
   return deck;
 }
@@ -217,7 +217,7 @@ async function parseSpOrText(
     const align = text.align ?? "left";
     const valign = readBodyVAlign(txBody?.["a:bodyPr"]) ?? "top";
     // Source font sizes are in absolute points; when we letterbox a larger
-    // source slide into Caracas's 1920×1080 frame, the typography must scale
+    // source slide into Slidewise's 1920×1080 frame, the typography must scale
     // with the geometry so it doesn't overflow its own text box.
     const scale = ctx.fit.scale;
     const fontSize = first?.fontSize
@@ -402,7 +402,7 @@ function makeLineFromGeometry(
   const dashed = !!lineProps?.["a:prstDash"];
   const arrow =
     !!lineProps?.["a:headEnd"] || !!lineProps?.["a:tailEnd"];
-  // Caracas LineElement renders a line from (x, y) to (x+w, y+h). PPTX
+  // Slidewise LineElement renders a line from (x, y) to (x+w, y+h). PPTX
   // straight lines use cy=0 for horizontal and cx=0 for vertical; ensure a
   // minimum extent so the bounding box is renderable, and handle flipV by
   // inverting the y-axis sign.
@@ -575,7 +575,7 @@ function computeFit(presentationXml: any): Fit {
   const cyEmu = Number(sldSz?.["@_cy"]) || 6858000;
   const sourceW = emuToPx(cxEmu);
   const sourceH = emuToPx(cyEmu);
-  // Pick uniform scale to fit the source slide entirely inside Caracas's
+  // Pick uniform scale to fit the source slide entirely inside Slidewise's
   // fixed canvas, then center (letterbox).
   const scale = Math.min(SLIDE_W / sourceW, SLIDE_H / sourceH);
   const offsetX = Math.round((SLIDE_W - sourceW * scale) / 2);

@@ -37,7 +37,7 @@ describe("pptx round-trip", () => {
         y: 240,
         w: 1200,
         h: 200,
-        text: "Hello, Caracas",
+        text: "Hello, Slidewise",
         fontFamily: "Inter",
         fontSize: 64,
         fontWeight: 700,
@@ -58,7 +58,7 @@ describe("pptx round-trip", () => {
     const text = out.slides[0].elements.find((e) => e.type === "text");
     expect(text).toBeTruthy();
     if (text && text.type === "text") {
-      expect(text.text).toBe("Hello, Caracas");
+      expect(text.text).toBe("Hello, Slidewise");
       expect(text.fontWeight).toBeGreaterThanOrEqual(600);
       expect(text.color.toUpperCase()).toBe("#0E1330");
       // Position survives within rounding tolerance (1 px).
