@@ -375,6 +375,37 @@ function ShapeView({ el }: { el: ShapeElement }) {
 }
 
 function ImageView({ el }: { el: ImageElement }) {
+  // When the source PPTX defined a crop (<a:srcRect>), render via
+  // background-image so we can apply background-size/position to mimic
+  // PowerPoint's "crop then fill" behaviour. Otherwise fall back to <img>
+  // with object-fit, which keeps a:alt text usable.
+  if (el.crop) {
+    const { l, r, t, b } = el.crop;
+    const remW = Math.max(0.0001, 1 - l - r);
+    const remH = Math.max(0.0001, 1 - t - b);
+    // Scale the source so its visible (post-crop) area exactly fills the box,
+    // then offset so the cropped corner sits at (0,0).
+    const sizeX = 100 / remW;
+    const sizeY = 100 / remH;
+    const posX = remW > 0 ? (l / (l + r || 1)) * 100 : 0;
+    const posY = remH > 0 ? (t / (t + b || 1)) * 100 : 0;
+    return (
+      <div
+        role="img"
+        aria-label={el.alt ?? ""}
+        style={{
+          width: "100%",
+          height: "100%",
+          overflow: "hidden",
+          borderRadius: el.radius ?? 0,
+          backgroundImage: `url(${el.src})`,
+          backgroundSize: `${sizeX}% ${sizeY}%`,
+          backgroundPosition: `${posX}% ${posY}%`,
+          backgroundRepeat: "no-repeat",
+        }}
+      />
+    );
+  }
   return (
     <div
       style={{
@@ -382,10 +413,8 @@ function ImageView({ el }: { el: ImageElement }) {
         height: "100%",
         overflow: "hidden",
         borderRadius: el.radius ?? 0,
-        background: "#0001",
       }}
     >
-      {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         src={el.src}
         alt={el.alt ?? ""}
@@ -403,15 +432,29 @@ function ImageView({ el }: { el: ImageElement }) {
 }
 
 function LineView({ el }: { el: LineElement }) {
-  const w = Math.max(el.w, 1);
-  const h = Math.max(el.h, 1);
+  // A LineElement renders a segment from one corner of its bounding box to
+  // the opposite corner — supports horizontal, vertical, and diagonal lines.
+  // Negative w/h come from PPTX flipH/flipV: invert the start/end so the
+  // visual direction matches the source.
+  const aw = Math.abs(el.w) || 1;
+  const ah = Math.abs(el.h) || 1;
+  const x1 = el.w < 0 ? aw : 0;
+  const y1 = el.h < 0 ? ah : 0;
+  const x2 = el.w < 0 ? 0 : aw;
+  const y2 = el.h < 0 ? 0 : ah;
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" width="100%" height="100%">
+    <svg
+      viewBox={`0 0 ${aw} ${ah}`}
+      preserveAspectRatio="none"
+      width="100%"
+      height="100%"
+      style={{ overflow: "visible" }}
+    >
       <line
-        x1={0}
-        y1={h / 2}
-        x2={w - (el.arrow ? 16 : 0)}
-        y2={h / 2}
+        x1={x1}
+        y1={y1}
+        x2={x2}
+        y2={y2}
         stroke={el.stroke}
         strokeWidth={el.strokeWidth}
         strokeDasharray={el.dashed ? "12 8" : undefined}
@@ -420,7 +463,7 @@ function LineView({ el }: { el: LineElement }) {
       />
       {el.arrow && (
         <polygon
-          points={`${w},${h / 2} ${w - 18},${h / 2 - 9} ${w - 18},${h / 2 + 9}`}
+          points={`${x2},${y2} ${x2 - 18},${y2 - 9} ${x2 - 18},${y2 + 9}`}
           fill={el.stroke}
         />
       )}
@@ -430,14 +473,17 @@ function LineView({ el }: { el: LineElement }) {
 
 function TableView({ el }: { el: TableElement }) {
   const cols = el.rows[0]?.length ?? 1;
+  // PPTX-faithful: contiguous cells, no inter-cell gap, no rounded corners.
+  // Earlier "card grid" styling drifted too far from the source look.
   return (
     <div
       style={{
         display: "grid",
         gridTemplateColumns: `repeat(${cols}, 1fr)`,
+        gridAutoRows: "1fr",
         width: "100%",
         height: "100%",
-        gap: 6,
+        gap: 0,
         background: "transparent",
       }}
     >
@@ -449,11 +495,15 @@ function TableView({ el }: { el: TableElement }) {
               background: ri === 0 ? el.headerFill : el.rowFill,
               color: el.textColor,
               fontSize: el.fontSize,
-              padding: "16px 20px",
+              padding: "12px 16px",
               display: "flex",
               alignItems: "center",
-              fontWeight: ri === 0 ? 600 : 500,
-              borderRadius: 6,
+              fontWeight: ri === 0 ? 600 : 400,
+              boxSizing: "border-box",
+              minWidth: 0,
+              minHeight: 0,
+              overflow: "hidden",
+              wordBreak: "break-word",
             }}
           >
             {cell}

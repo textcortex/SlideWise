@@ -96,8 +96,15 @@ export interface ImageElement extends BaseElement {
   type: "image";
   src: string;
   alt?: string;
-  fit: "cover" | "contain";
+  fit: "cover" | "contain" | "fill";
   radius?: number;
+  /**
+   * PPTX <a:srcRect> source crop, expressed as fractions (0..1) of the source
+   * image to chop from each edge before placing into the bounding box.
+   * Caracas applies it via background-image / background-position so the
+   * final paint matches PowerPoint's "crop + stretch" behaviour.
+   */
+  crop?: { l: number; r: number; t: number; b: number };
 }
 
 export interface LineElement extends BaseElement {

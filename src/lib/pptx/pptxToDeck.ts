@@ -332,7 +332,25 @@ async function parsePic(pic: any, ctx: ParseContext): Promise<SlideElement | nul
   const ext = (fullPath.split(".").pop() || "png").toLowerCase();
   const mime = mimeForExt(ext);
 
-  const fitMode = pic?.["p:blipFill"]?.["a:stretch"] ? "cover" : "contain";
+  // PPTX semantics:
+  //   <a:stretch/>      stretch source to bounding box (CSS object-fit: fill)
+  //   <a:tile .../>     tile (rare; we approximate as cover)
+  //   <a:srcRect l/r/t/b="<percent×1000>"/> crop the source first
+  const blipFill = pic?.["p:blipFill"];
+  const hasStretch = !!blipFill?.["a:stretch"];
+  const fitMode: ImageElement["fit"] = hasStretch ? "fill" : "cover";
+
+  const sr = blipFill?.["a:srcRect"];
+  const crop = sr
+    ? {
+        l: Number(sr["@_l"] ?? 0) / 100000,
+        r: Number(sr["@_r"] ?? 0) / 100000,
+        t: Number(sr["@_t"] ?? 0) / 100000,
+        b: Number(sr["@_b"] ?? 0) / 100000,
+      }
+    : undefined;
+  const hasCrop =
+    crop && (crop.l > 0 || crop.r > 0 || crop.t > 0 || crop.b > 0);
 
   const image: ImageElement = {
     id: nanoid(8),
@@ -341,6 +359,7 @@ async function parsePic(pic: any, ctx: ParseContext): Promise<SlideElement | nul
     z: 0,
     src: `data:${mime};base64,${base64}`,
     fit: fitMode,
+    ...(hasCrop ? { crop } : {}),
   };
   return image;
 }
@@ -368,9 +387,11 @@ function makeLineFromGeometry(
     !!lineProps?.["a:headEnd"] || !!lineProps?.["a:tailEnd"];
   // Caracas LineElement renders a line from (x, y) to (x+w, y+h). PPTX
   // straight lines use cy=0 for horizontal and cx=0 for vertical; ensure a
-  // minimum extent so the line is visible, and handle flipV by inverting h.
+  // minimum extent so the bounding box is renderable, and handle flipV by
+  // inverting the y-axis sign.
+  const rawH = flipV ? -geom.h : geom.h;
   const w = geom.w === 0 ? 1 : geom.w;
-  const h = flipV ? -geom.h : geom.h;
+  const h = Math.abs(rawH) === 0 ? 1 : rawH;
   const line: LineElement = {
     id: nanoid(8),
     type: "line",
