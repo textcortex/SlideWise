@@ -1,14 +1,14 @@
 export {
-  CaracasEditor,
-  type CaracasEditorProps,
-  type CaracasEditorHandle,
-} from "./CaracasEditor";
+  SlidewiseEditor,
+  type SlidewiseEditorProps,
+  type SlidewiseEditorHandle,
+} from "./SlidewiseEditor";
 
 export {
-  CaracasFileEditor,
-  type CaracasFileEditorProps,
-  type CaracasFileEditorApi,
-} from "./CaracasFileEditor";
+  SlidewiseFileEditor,
+  type SlidewiseFileEditorProps,
+  type SlidewiseFileEditorApi,
+} from "./SlidewiseFileEditor";
 
 export { parsePptx, serializeDeck } from "./lib/pptx";
 export type { ParseDiagnostics, ParseResult } from "./lib/pptx/types";

@@ -11,8 +11,8 @@
   },
   "include": [
     "src/index.ts",
-    "src/CaracasEditor.tsx",
-    "src/CaracasFileEditor.tsx",
+    "src/SlidewiseEditor.tsx",
+    "src/SlidewiseFileEditor.tsx",
     "src/vite-env.d.ts",
     "src/lib/**/*.ts",
     "src/lib/**/*.tsx",

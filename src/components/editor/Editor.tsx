@@ -20,7 +20,7 @@ export function Editor({ showTopBar = true, onSave, onExport }: EditorProps = {}
 
   return (
     <div
-      className={`caracas-editor theme-${theme}`}
+      className={`slidewise-editor theme-${theme}`}
       style={{
         width: "100%",
         height: "100%",

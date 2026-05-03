@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Upload, RotateCcw } from "lucide-react";
-import { CaracasEditor, type CaracasEditorHandle } from "./CaracasEditor";
+import { SlidewiseEditor, type SlidewiseEditorHandle } from "./SlidewiseEditor";
 import { seedDeck } from "@/lib/seed";
 import { parsePptx, serializeDeck } from "@/lib/pptx";
 import type { Deck } from "@/lib/types";
 
-const STORAGE_KEY = "caracas-deck";
+const STORAGE_KEY = "slidewise-deck";
 
 function loadInitialDeck(): Deck {
   try {
@@ -22,7 +22,7 @@ function loadInitialDeck(): Deck {
 
 export function App() {
   const [deck, setDeck] = useState<Deck>(() => loadInitialDeck());
-  const editorRef = useRef<CaracasEditorHandle>(null);
+  const editorRef = useRef<SlidewiseEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [overlay, setOverlay] = useState<string | null>(null);
   const [sourceLabel, setSourceLabel] = useState<string>("Seed deck");
@@ -41,7 +41,7 @@ export function App() {
       setOverlay(`Loaded ${next.slides.length} slides from ${file.name}`);
       setTimeout(() => setOverlay(null), 1600);
     } catch (err) {
-      console.error("[caracas] PPTX parse failed:", err);
+      console.error("[slidewise] PPTX parse failed:", err);
       setOverlay("Failed to parse .pptx — see console");
       setTimeout(() => setOverlay(null), 2400);
     }
@@ -103,7 +103,7 @@ export function App() {
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
-      console.error("[caracas] PPTX export failed:", err);
+      console.error("[slidewise] PPTX export failed:", err);
     }
   };
 
@@ -139,7 +139,7 @@ export function App() {
         }}
       >
         <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: 0.6, opacity: 0.7 }}>
-          CARACAS DEV
+          SLIDEWISE DEV
         </span>
         <span
           style={{
@@ -193,12 +193,12 @@ export function App() {
       </div>
 
       <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
-        <CaracasEditor
+        <SlidewiseEditor
           ref={editorRef}
           deck={deck}
           onChange={(next) => {
             if (import.meta.env.DEV) {
-              console.debug("[caracas] onChange", next.slides.length, "slides");
+              console.debug("[slidewise] onChange", next.slides.length, "slides");
             }
           }}
           onSave={handleSave}

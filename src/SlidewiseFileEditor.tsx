@@ -6,11 +6,11 @@ import {
   useState,
   type CSSProperties,
 } from "react";
-import { CaracasEditor, type CaracasEditorHandle } from "./CaracasEditor";
+import { SlidewiseEditor, type SlidewiseEditorHandle } from "./SlidewiseEditor";
 import { parsePptx, serializeDeck } from "@/lib/pptx";
 import type { Deck } from "@/lib/types";
 
-export interface CaracasFileEditorProps {
+export interface SlidewiseFileEditorProps {
   /**
    * Async loader for the file's bytes. Host is responsible for fetching the
    * blob (e.g. via the platform's `getFile(fileId, { preview: true })`).
@@ -28,31 +28,31 @@ export interface CaracasFileEditorProps {
   /**
    * The sha256 of the file's contents at load time, if the host wants to do
    * conflict detection. Stored verbatim and surfaced via `getInitialSha256()`
-   * — Caracas itself doesn't read it; the host's saveBlob implementation does.
+   * — Slidewise itself doesn't read it; the host's saveBlob implementation does.
    */
   initialSha256?: string | null;
   /**
    * Receives an imperative API for save / dirty-tracking / play once the
    * editor is mounted. Called with `null` on unmount.
    */
-  onEditorApiChange?: (api: CaracasFileEditorApi | null) => void;
+  onEditorApiChange?: (api: SlidewiseFileEditorApi | null) => void;
   theme?: "light" | "dark";
   className?: string;
   style?: CSSProperties;
   /**
-   * Optional override for how the file is parsed. Default uses Caracas's
+   * Optional override for how the file is parsed. Default uses Slidewise's
    * built-in PPTX parser. Useful for testing or for hosting a different
    * binary deck format on top of the editor.
    */
   parse?: (blob: Blob | ArrayBuffer) => Promise<Deck>;
   /**
    * Optional override for how the file is serialized. Default uses
-   * Caracas's built-in PPTX writer.
+   * Slidewise's built-in PPTX writer.
    */
   serialize?: (deck: Deck) => Promise<Blob>;
 }
 
-export interface CaracasFileEditorApi {
+export interface SlidewiseFileEditorApi {
   save(): Promise<void>;
   isDirty(): boolean;
   play(): void;
@@ -67,10 +67,10 @@ type LoadState =
   | { status: "error"; error: Error }
   | { status: "ready"; deck: Deck };
 
-export const CaracasFileEditor = forwardRef<
-  CaracasFileEditorApi,
-  CaracasFileEditorProps
->(function CaracasFileEditor(
+export const SlidewiseFileEditor = forwardRef<
+  SlidewiseFileEditorApi,
+  SlidewiseFileEditorProps
+>(function SlidewiseFileEditor(
   {
     loadBlob,
     saveBlob,
@@ -85,7 +85,7 @@ export const CaracasFileEditor = forwardRef<
   ref
 ) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
-  const editorRef = useRef<CaracasEditorHandle>(null);
+  const editorRef = useRef<SlidewiseEditorHandle>(null);
   const [dirty, setDirty] = useState(false);
   const apiCallbackRef = useRef(onEditorApiChange);
 
@@ -123,7 +123,7 @@ export const CaracasFileEditor = forwardRef<
   useEffect(() => {
     if (state.status !== "ready") return;
 
-    const api: CaracasFileEditorApi = {
+    const api: SlidewiseFileEditorApi = {
       save: async () => {
         const current =
           editorRef.current?.getDeck() ?? state.deck;
@@ -184,7 +184,7 @@ export const CaracasFileEditor = forwardRef<
 
   return (
     <div style={{ ...frameStyle, ...style }} className={className}>
-      <CaracasEditor
+      <SlidewiseEditor
         ref={editorRef}
         deck={state.deck}
         theme={theme}
@@ -239,4 +239,4 @@ function UnsavedBadge() {
   );
 }
 
-export default CaracasFileEditor;
+export default SlidewiseFileEditor;
