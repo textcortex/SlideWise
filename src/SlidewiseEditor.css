@@ -1,3 +1,10 @@
+/*
+ * Slidewise editor stylesheet. Shipped with the library and loaded inside
+ * host applications, so every rule must be nested under `.slidewise-editor`
+ * to avoid colliding with host styles. At-rules (@font-face, @media, …) are
+ * fine at the top level. The `library CSS scope` test in
+ * src/lib/__tests__/css-scope.test.ts enforces this.
+ */
 @import "./fonts.css";
 
 .slidewise-editor {
