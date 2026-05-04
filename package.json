@@ -1,6 +1,9 @@
 {
-  "name": "slidewise",
+  "name": "@textcortex/slidewise",
   "version": "0.2.0",
+  "description": "Embeddable React PPTX editor.",
+  "license": "UNLICENSED",
+  "private": false,
   "type": "module",
   "main": "./dist/index.mjs",
   "module": "./dist/index.mjs",
@@ -15,6 +18,18 @@
     "./fonts.css": "./src/fonts.css"
   },
   "sideEffects": ["**/*.css"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/textcortex/SlideWise.git"
+  },
+  "homepage": "https://github.com/textcortex/SlideWise#readme",
+  "bugs": {
+    "url": "https://github.com/textcortex/SlideWise/issues"
+  },
+  "publishConfig": {
+    "access": "restricted",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -22,7 +37,10 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "pnpm run build:lib && changeset publish"
   },
   "peerDependencies": {
     "react": ">=19",
@@ -37,11 +55,10 @@
     "lucide-react": "^1.11.0",
     "nanoid": "^5.1.9",
     "pptxgenjs": "^4.0.1",
-    "react": "19.2.4",
-    "react-dom": "19.2.4",
     "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@changesets/cli": "^2.27.10",
     "@tailwindcss/vite": "^4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -53,6 +70,8 @@
     "eslint-plugin-react-refresh": "^0.4.20",
     "globals": "^16.2.0",
     "jsdom": "^29.1.1",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
     "tailwindcss": "^4",
     "typescript": "^5",
     "typescript-eslint": "^8.42.0",
