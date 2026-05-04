@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parsePptx, serializeDeck } from "../index";
+import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
 import type { Deck } from "@/lib/types";
 
 const baseElement = {
@@ -9,6 +10,7 @@ const baseElement = {
 
 function makeDeck(slideElements: Deck["slides"][number]["elements"]): Deck {
   return {
+    version: CURRENT_DECK_VERSION,
     title: "Round-trip fixture",
     slides: [
       {
@@ -110,6 +112,7 @@ describe("pptx round-trip", () => {
 
   it("preserves slide background colour", async () => {
     const deck: Deck = {
+      version: CURRENT_DECK_VERSION,
       title: "Bg",
       slides: [
         { id: "s", background: "#FAEEDC", elements: [] },
@@ -124,6 +127,7 @@ describe("pptx round-trip", () => {
 
   it("preserves multiple slides with mixed elements", async () => {
     const deck: Deck = {
+      version: CURRENT_DECK_VERSION,
       title: "Multi",
       slides: [
         {

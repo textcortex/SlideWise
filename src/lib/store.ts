@@ -8,6 +8,7 @@ import type {
   ShapeKind,
 } from "./types";
 import { SLIDE_W, SLIDE_H } from "./types";
+import { migrate } from "./schema/migrate";
 
 type Tool =
   | "select"
@@ -89,9 +90,13 @@ function snap(state: EditorState): HistorySnapshot {
 }
 
 export function createEditorStore(initialDeck: Deck): EditorStore {
-  const firstSlideId = initialDeck.slides[0]?.id ?? "";
+  // Run external decks through the migrator so the store always holds a
+  // current-shape Deck — even when the host hands us something written by
+  // an older Slidewise.
+  const deck = migrate(initialDeck);
+  const firstSlideId = deck.slides[0]?.id ?? "";
   return createStore<EditorState>((set, get) => ({
-    deck: initialDeck,
+    deck,
     currentSlideId: firstSlideId,
     selectedIds: [],
     tool: "select",
@@ -345,9 +350,10 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
     },
 
     setDeck: (deck) => {
+      const migrated = migrate(deck);
       set({
-        deck,
-        currentSlideId: deck.slides[0]?.id ?? "",
+        deck: migrated,
+        currentSlideId: migrated.slides[0]?.id ?? "",
         selectedIds: [],
         history: [],
         future: [],
