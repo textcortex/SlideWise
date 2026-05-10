@@ -15,6 +15,7 @@ import type {
   UnknownElement,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
+import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
 import { emuToPx, pointsToPx } from "./units";
 import type { ParseDiagnostics } from "./types";
 
@@ -179,7 +180,7 @@ export async function parsePptx(blob: Blob | ArrayBuffer): Promise<Deck> {
     diagnostics.warnings.push("PPTX contained no slides; created an empty one.");
   }
 
-  const deck: Deck = { title, slides };
+  const deck: Deck = { version: CURRENT_DECK_VERSION, title, slides };
   if (diagnostics.warnings.length) {
     console.info("[slidewise/pptx] parse diagnostics:", diagnostics);
   }

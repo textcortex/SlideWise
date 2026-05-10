@@ -1,5 +1,6 @@
 import { nanoid } from "nanoid";
-import type { Slide, SlideElement } from "./types";
+import type { Deck, Slide, SlideElement } from "./types";
+import { CURRENT_DECK_VERSION } from "./schema/migrate";
 
 const id = () => nanoid(8);
 
@@ -769,7 +770,8 @@ const slide6: Slide = {
   ],
 };
 
-export const seedDeck = {
+export const seedDeck: Deck = {
+  version: CURRENT_DECK_VERSION,
   title: "EldoraUI - Open-Source React Component Library",
   slides: [slide1, slide2, slide3, slide4, slide5, slide6],
 };

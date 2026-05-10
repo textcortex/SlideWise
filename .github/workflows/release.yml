@@ -1,0 +1,71 @@
+name: Release
+
+# On every push to main: if there are pending changesets, open (or update) a
+# "Version Packages" PR that consumes them and bumps package.json + writes
+# CHANGELOG. When that PR is merged there are no pending changesets, so the
+# action publishes to the registry instead.
+#
+# Required secrets:
+#   NPM_TOKEN  — automation token with publish access for @textcortex scope.
+#                If absent, the publish step is skipped (the Version Packages
+#                PR still gets opened).
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    name: Version or publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # changesets needs full history to compute changelog deltas.
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc -b
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build library bundle
+        run: pnpm run build:lib
+
+      - name: Create release PR or publish
+        uses: changesets/action@v1
+        with:
+          # Bump versions and update CHANGELOG when a Version Packages PR is
+          # opened/updated; publish to the registry when it merges.
+          version: pnpm run version-packages
+          publish: pnpm run release
+          commit: "chore(release): version packages"
+          title: "chore(release): version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

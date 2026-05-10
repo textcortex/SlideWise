@@ -169,6 +169,13 @@ export interface Slide {
 }
 
 export interface Deck {
+  /**
+   * Schema version this deck conforms to. Stamped by `migrate()` and by
+   * internal Deck constructors (seed, PPTX import). Hosts should not set
+   * this manually — pass an external deck through `migrate()` and read the
+   * version off the result.
+   */
+  version: number;
   title: string;
   slides: Slide[];
 }
