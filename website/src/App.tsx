@@ -1,16 +1,65 @@
-import { useEffect, useRef, useState } from "react";
-import { Upload, RotateCcw } from "lucide-react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
+import { Upload, RotateCcw, Sparkles, MessageSquare } from "lucide-react";
 import {
   SlidewiseEditor,
   type SlidewiseEditorHandle,
   parsePptx,
   serializeDeck,
   type Deck,
+  Root,
+  TopBar,
+  SlideRail,
+  Canvas,
+  BottomToolbar,
+  RightPanel,
+  Body,
+  CanvasFrame,
 } from "@textcortex/slidewise";
 import "@textcortex/slidewise/style.css";
 import { seedDeck } from "./seed";
 
 const STORAGE_KEY = "slidewise-deck";
+
+type DemoId = "default" | "no-bottom-toolbar" | "right-panel" | "retheme";
+
+interface Demo {
+  id: DemoId;
+  label: string;
+  description: string;
+}
+
+const DEMOS: Demo[] = [
+  {
+    id: "default",
+    label: "Default",
+    description:
+      "<SlidewiseEditor /> renders the standard tree — top bar, slide rail, canvas, and bottom toolbar.",
+  },
+  {
+    id: "no-bottom-toolbar",
+    label: "No bottom toolbar",
+    description:
+      "Same editor with showBottomToolbar={false}. Equivalent to omitting <Slidewise.BottomToolbar /> from the compound tree.",
+  },
+  {
+    id: "right-panel",
+    label: "Right panel",
+    description:
+      "Composed via the compound primitives with <Slidewise.RightPanel> containing host UI. Demos how AI suggestions or comments would slot in.",
+  },
+  {
+    id: "retheme",
+    label: "Themed override",
+    description:
+      "Default tree with --surface-bg / --app-bg / --rail-bg overridden via inline style on <Slidewise.Root>. Shows that hosts can retheme without forking.",
+  },
+];
 
 function loadInitialDeck(): Deck {
   try {
@@ -31,6 +80,7 @@ export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [overlay, setOverlay] = useState<string | null>(null);
   const [sourceLabel, setSourceLabel] = useState<string>("Seed deck");
+  const [activeDemo, setActiveDemo] = useState<DemoId>("default");
 
   const loadFromFile = async (file: File) => {
     if (!file.name.toLowerCase().endsWith(".pptx")) {
@@ -120,6 +170,11 @@ export function App() {
     setSourceLabel("Seed deck");
   };
 
+  const activeDemoMeta = useMemo(
+    () => DEMOS.find((d) => d.id === activeDemo) ?? DEMOS[0],
+    [activeDemo]
+  );
+
   return (
     <div
       style={{
@@ -197,15 +252,48 @@ export function App() {
         />
       </div>
 
-      <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
-        <SlidewiseEditor
-          ref={editorRef}
-          deck={deck}
-          onChange={(next) => {
-            if (import.meta.env.DEV) {
-              console.debug("[slidewise] onChange", next.slides.length, "slides");
-            }
+      <div
+        style={{
+          flex: "0 0 64px",
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "10px 14px",
+          background: "#0E1330",
+          color: "#fff",
+          fontFamily: "Inter, system-ui, sans-serif",
+          borderBottom: "1px solid rgba(255,255,255,0.06)",
+        }}
+      >
+        <div style={{ display: "flex", gap: 6 }}>
+          {DEMOS.map((d) => (
+            <button
+              key={d.id}
+              type="button"
+              onClick={() => setActiveDemo(d.id)}
+              style={tabBtn(activeDemo === d.id)}
+            >
+              {d.label}
+            </button>
+          ))}
+        </div>
+        <div
+          style={{
+            fontSize: 12,
+            color: "rgba(255,255,255,0.6)",
+            maxWidth: 760,
+            lineHeight: 1.4,
           }}
+        >
+          {activeDemoMeta.description}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+        <DemoSurface
+          demoId={activeDemo}
+          deck={deck}
+          editorRef={editorRef}
           onSave={handleSave}
           onExport={handleExportPptx}
         />
@@ -245,7 +333,152 @@ export function App() {
   );
 }
 
-function chipBtn(primary: boolean): React.CSSProperties {
+interface DemoProps {
+  demoId: DemoId;
+  deck: Deck;
+  editorRef: React.Ref<SlidewiseEditorHandle>;
+  onSave: (deck: Deck) => void;
+  onExport: (deck: Deck) => void;
+}
+
+function DemoSurface({ demoId, deck, editorRef, onSave, onExport }: DemoProps) {
+  const onChangeLog = (next: Deck) => {
+    if (import.meta.env.DEV) {
+      console.debug("[slidewise] onChange", next.slides.length, "slides");
+    }
+  };
+
+  if (demoId === "default") {
+    return (
+      <SlidewiseEditor
+        ref={editorRef}
+        deck={deck}
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      />
+    );
+  }
+
+  if (demoId === "no-bottom-toolbar") {
+    return (
+      <SlidewiseEditor
+        ref={editorRef}
+        deck={deck}
+        showBottomToolbar={false}
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      />
+    );
+  }
+
+  if (demoId === "right-panel") {
+    return (
+      <Root
+        ref={editorRef}
+        deck={deck}
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      >
+        <TopBar />
+        <Body>
+          <SlideRail />
+          <CanvasFrame>
+            <Canvas />
+            <BottomToolbar />
+          </CanvasFrame>
+          <RightPanel width={300}>
+            <DemoRightPanel />
+          </RightPanel>
+        </Body>
+      </Root>
+    );
+  }
+
+  if (demoId === "retheme") {
+    return (
+      <Root
+        ref={editorRef}
+        deck={deck}
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+        theme="dark"
+        style={
+          {
+            // Override a handful of surface tokens to demonstrate that hosts
+            // retheme by setting CSS variables — no fork required.
+            "--surface-bg": "#11131c",
+            "--surface-hover-bg": "#16182a",
+            "--surface-ring": "rgba(125, 91, 223, 0.25)",
+            "--app-bg": "#0a0d1c",
+            "--rail-bg": "#0c0f1a",
+          } as CSSProperties
+        }
+      >
+        <TopBar />
+        <Body>
+          <SlideRail />
+          <CanvasFrame>
+            <Canvas />
+            <BottomToolbar />
+          </CanvasFrame>
+        </Body>
+      </Root>
+    );
+  }
+
+  return null;
+}
+
+function DemoRightPanel() {
+  return (
+    <div
+      style={{
+        padding: 16,
+        display: "flex",
+        flexDirection: "column",
+        gap: 12,
+        color: "var(--ink)",
+        fontFamily: "var(--font-geist-sans), Inter, system-ui, sans-serif",
+        fontSize: 13,
+      }}
+    >
+      <div
+        className="slidewise-surface"
+        data-interactive="true"
+        style={{ padding: 14, display: "flex", gap: 10, alignItems: "flex-start" }}
+      >
+        <Sparkles size={18} style={{ color: "var(--accent)", flexShrink: 0, marginTop: 2 }} />
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>AI suggestion</div>
+          <div style={{ color: "var(--ink-muted)", lineHeight: 1.5 }}>
+            "Tighten this slide to a single sentence." Compose your own panel
+            here and Slidewise's surface tokens will style it consistently.
+          </div>
+        </div>
+      </div>
+      <div
+        className="slidewise-surface"
+        data-interactive="true"
+        style={{ padding: 14, display: "flex", gap: 10, alignItems: "flex-start" }}
+      >
+        <MessageSquare size={18} style={{ color: "var(--accent)", flexShrink: 0, marginTop: 2 }} />
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Comments</div>
+          <div style={{ color: "var(--ink-muted)", lineHeight: 1.5 }}>
+            Empty placeholder. Hosts inject any React tree they want into
+            &lt;Slidewise.RightPanel&gt;.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function chipBtn(primary: boolean): CSSProperties {
   return {
     display: "inline-flex",
     alignItems: "center",
@@ -262,5 +495,23 @@ function chipBtn(primary: boolean): React.CSSProperties {
     fontWeight: 600,
     cursor: "pointer",
     fontFamily: "inherit",
+  };
+}
+
+function tabBtn(active: boolean): CSSProperties {
+  return {
+    height: 32,
+    padding: "0 14px",
+    borderRadius: 8,
+    border: active
+      ? "1px solid rgba(138, 150, 240, 0.85)"
+      : "1px solid rgba(255,255,255,0.12)",
+    background: active ? "rgba(138, 150, 240, 0.18)" : "transparent",
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    transition: "background 120ms, border-color 120ms",
   };
 }
