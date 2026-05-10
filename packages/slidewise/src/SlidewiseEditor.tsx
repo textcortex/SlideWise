@@ -1,5 +1,10 @@
 import { forwardRef, type CSSProperties } from "react";
-import { Root, type SlidewiseRootHandle, type SlidewiseRootProps } from "./compound/SlidewiseRoot";
+import {
+  Root,
+  type SlidewiseRootHandle,
+  type SlidewiseRootProps,
+  type HistoryState,
+} from "./compound/SlidewiseRoot";
 import {
   TopBar,
   SlideRail,
@@ -30,6 +35,11 @@ export interface SlidewiseEditorProps {
   onExport?: (deck: Deck) => void;
   /** Fires when the dirty flag flips. Useful for "unsaved changes" banners. */
   onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * Fires whenever the undo/redo stack depths change. Use this to enable/disable
+   * Undo and Redo buttons reactively without polling `api.canUndo()`.
+   */
+  onHistoryChange?: (state: HistoryState) => void;
   /** Reserved for future use; not enforced yet. */
   readOnly?: boolean;
   /** "light" or "dark"; defaults to "light". Ignored after first render. */
@@ -86,6 +96,7 @@ export const SlidewiseEditor = forwardRef<
     onSave,
     onExport,
     onDirtyChange,
+    onHistoryChange,
     readOnly,
     theme,
     initialSlideId,
@@ -104,6 +115,7 @@ export const SlidewiseEditor = forwardRef<
     onSave,
     onExport,
     onDirtyChange,
+    onHistoryChange,
     readOnly,
     theme,
     initialSlideId,

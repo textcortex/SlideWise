@@ -29,6 +29,17 @@ interface HistorySnapshot {
 type Theme = "light" | "dark";
 type View = "editor" | "grid";
 
+/**
+ * Idle window in ms during which consecutive mutations with the same coalesce
+ * key collapse into a single history step. After this many ms with no edit,
+ * the next edit starts a fresh step. Drags on a single element typically run
+ * 60+ frames in well under this window; typing pauses around word boundaries
+ * usually exceed it. Hosts that want stricter granularity can call
+ * `endCoalesce()` explicitly (e.g. on mouseup or input blur).
+ */
+const COALESCE_IDLE_MS = 500;
+const HISTORY_LIMIT = 50;
+
 export interface EditorState {
   deck: Deck;
   currentSlideId: string;
@@ -41,6 +52,14 @@ export interface EditorState {
   view: View;
   history: HistorySnapshot[];
   future: HistorySnapshot[];
+  /**
+   * Coalesce key for the in-flight mutation burst. Two consecutive mutations
+   * with the same key (within `COALESCE_IDLE_MS`) collapse into one history
+   * step. `null` means "no burst in progress" — the next edit pushes a fresh
+   * snapshot.
+   */
+  _coalesceKey: string | null;
+  _coalesceUntil: number;
 
   // selectors
   currentSlide: () => Slide;
@@ -68,6 +87,23 @@ export interface EditorState {
   undo: () => void;
   redo: () => void;
   pushHistory: () => void;
+  /**
+   * Push a history snapshot, but only if `key` differs from the in-flight
+   * coalesce key OR more than `COALESCE_IDLE_MS` have passed since the last
+   * mutation. Use this for high-frequency edits (text typing, drag) so the
+   * burst collapses into one undo step.
+   */
+  pushHistoryCoalesced: (key: string) => void;
+  /**
+   * End the current coalesce burst. Hosts call this on natural commit
+   * boundaries (mouseup after a drag, blur on a text input) so the next
+   * mutation starts a fresh history step even within `COALESCE_IDLE_MS`.
+   */
+  endCoalesce: () => void;
+  /** True iff there's at least one snapshot to undo back to. */
+  canUndo: () => boolean;
+  /** True iff there's at least one snapshot to redo forward to. */
+  canRedo: () => boolean;
   setDeck: (deck: Deck) => void;
   setTheme: (t: Theme) => void;
   toggleTheme: () => void;
@@ -107,6 +143,8 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
     view: "editor",
     history: [],
     future: [],
+    _coalesceKey: null,
+    _coalesceUntil: 0,
 
     currentSlide: () => {
       const s = get();
@@ -118,20 +156,48 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
 
     pushHistory: () => {
       set((s) => ({
-        history: [...s.history, snap(s)].slice(-50),
+        history: [...s.history, snap(s)].slice(-HISTORY_LIMIT),
         future: [],
+        _coalesceKey: null,
+        _coalesceUntil: 0,
       }));
     },
 
+    pushHistoryCoalesced: (key) => {
+      const now = Date.now();
+      set((s) => {
+        // Same burst within the idle window → don't push, just extend.
+        if (s._coalesceKey === key && now < s._coalesceUntil) {
+          return { _coalesceUntil: now + COALESCE_IDLE_MS };
+        }
+        // New burst — snapshot the pre-mutation state and start coalescing.
+        return {
+          history: [...s.history, snap(s)].slice(-HISTORY_LIMIT),
+          future: [],
+          _coalesceKey: key,
+          _coalesceUntil: now + COALESCE_IDLE_MS,
+        };
+      });
+    },
+
+    endCoalesce: () => {
+      set({ _coalesceKey: null, _coalesceUntil: 0 });
+    },
+
+    canUndo: () => get().history.length > 0,
+    canRedo: () => get().future.length > 0,
+
     setTool: (t) => set({ tool: t }),
     setTitle: (t) => {
+      get().pushHistoryCoalesced("setTitle");
       set((s) => ({ deck: { ...s.deck, title: t } }));
     },
     setZoom: (z) =>
       set({ zoom: Math.max(0.1, Math.min(4, z)), fitMode: "manual" }),
     setFitMode: (f) => set({ fitMode: f }),
 
-    selectSlide: (id) => set({ currentSlideId: id, selectedIds: [] }),
+    selectSlide: (id) =>
+      set({ currentSlideId: id, selectedIds: [], _coalesceKey: null }),
     selectElement: (id, additive) =>
       set((s) => {
         if (id == null) return { selectedIds: [] };
@@ -228,6 +294,11 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
     },
 
     updateElement: (id, patch) => {
+      // Coalesce key: same element, same patch shape = same burst.
+      // Drag (x,y) coalesces; resize (w,h) starts a new burst even on the
+      // same element; switching elements also starts fresh.
+      const key = `updateElement:${id}:${Object.keys(patch).sort().join(",")}`;
+      get().pushHistoryCoalesced(key);
       set((s) => {
         const slides = s.deck.slides.map((sl) => {
           if (sl.id !== s.currentSlideId) return sl;
@@ -320,8 +391,10 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
           deck: last.deck,
           currentSlideId: last.currentSlideId,
           history: s.history.slice(0, -1),
-          future: [...s.future, snapshot].slice(-50),
+          future: [...s.future, snapshot].slice(-HISTORY_LIMIT),
           selectedIds: survivingIds,
+          _coalesceKey: null,
+          _coalesceUntil: 0,
         };
       });
     },
@@ -342,9 +415,11 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
         return {
           deck: next.deck,
           currentSlideId: next.currentSlideId,
-          history: [...s.history, snapshot].slice(-50),
+          history: [...s.history, snapshot].slice(-HISTORY_LIMIT),
           future: s.future.slice(0, -1),
           selectedIds: survivingIds,
+          _coalesceKey: null,
+          _coalesceUntil: 0,
         };
       });
     },
@@ -357,6 +432,8 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
         selectedIds: [],
         history: [],
         future: [],
+        _coalesceKey: null,
+        _coalesceUntil: 0,
       });
     },
 

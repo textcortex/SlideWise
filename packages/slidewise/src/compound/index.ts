@@ -27,6 +27,7 @@ export {
   Root,
   type SlidewiseRootProps,
   type SlidewiseRootHandle,
+  type HistoryState,
 } from "./SlidewiseRoot";
 export {
   TopBar,
