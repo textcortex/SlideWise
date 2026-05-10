@@ -42,3 +42,9 @@ export {
   useHostCallbacks,
   type SlidewiseHostCallbacks,
 } from "./HostContext";
+export {
+  IconProvider,
+  useIcons,
+  type SlidewiseIcons,
+} from "./IconContext";
+export { ReadOnlyProvider, useReadOnly } from "./ReadOnlyContext";
