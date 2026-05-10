@@ -24,6 +24,16 @@
 @import "./fonts.css";
 
 .slidewise-editor {
+  /* PUBLIC THEMING TOKENS
+     These are namespaced with `--slidewise-*` and intended for hosts to
+     override directly via the `style` prop on `<Slidewise.Root>` or via a
+     wrapping stylesheet. Internal variables (below) cascade from these
+     where the connection is structural. Hosts that want to override every
+     surface still have access to the unprefixed internal vars too. */
+  --slidewise-radius: 10px;
+  --slidewise-bar-bg: var(--app-bg);
+  --slidewise-accent: var(--accent);
+
   /* Layout backgrounds */
   --app-bg: #ffffff;
   --rail-bg: #fafafb;

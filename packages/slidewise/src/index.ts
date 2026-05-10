@@ -43,9 +43,12 @@ export {
   Body,
   CanvasFrame,
   useHostCallbacks,
+  useIcons,
+  useReadOnly,
   type SlidewiseRootProps,
   type SlidewiseRootHandle,
   type SlidewiseHostCallbacks,
+  type SlidewiseIcons,
   type RegionProps,
 } from "./compound";
 

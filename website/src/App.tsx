@@ -5,7 +5,16 @@ import {
   useState,
   type CSSProperties,
 } from "react";
-import { Upload, RotateCcw, Sparkles, MessageSquare } from "lucide-react";
+import {
+  Upload,
+  RotateCcw,
+  Sparkles,
+  MessageSquare,
+  Wand2,
+  ArrowLeft,
+  ArrowRight,
+  CloudUpload,
+} from "lucide-react";
 import {
   SlidewiseEditor,
   type SlidewiseEditorHandle,
@@ -26,7 +35,13 @@ import { seedDeck } from "./seed";
 
 const STORAGE_KEY = "slidewise-deck";
 
-type DemoId = "default" | "no-bottom-toolbar" | "right-panel" | "retheme";
+type DemoId =
+  | "default"
+  | "no-bottom-toolbar"
+  | "right-panel"
+  | "retheme"
+  | "icons"
+  | "read-only";
 
 interface Demo {
   id: DemoId;
@@ -58,6 +73,18 @@ const DEMOS: Demo[] = [
     label: "Themed override",
     description:
       "Default tree with --surface-bg / --app-bg / --rail-bg overridden via inline style on <Slidewise.Root>. Shows that hosts can retheme without forking.",
+  },
+  {
+    id: "icons",
+    label: "Custom icons",
+    description:
+      "icons={{ undo, redo, save, export, smart }} swaps lucide for an alternate set. Hosts use this to skin Slidewise with their own icon library (Nucleo, custom SVGs, etc.) without forking.",
+  },
+  {
+    id: "read-only",
+    label: "Read-only viewer",
+    description:
+      "editable={false} hides save/undo/redo and locks the title input. Use this for public viewers or non-owners.",
   },
 ];
 
@@ -394,6 +421,40 @@ function DemoSurface({ demoId, deck, editorRef, onSave, onExport }: DemoProps) {
           </RightPanel>
         </Body>
       </Root>
+    );
+  }
+
+  if (demoId === "icons") {
+    // Swap a few lucide icons for alternate lucide icons to demonstrate
+    // overrides. Hosts in production would pass their own icon set
+    // (Nucleo, custom SVGs, Heroicons, etc.) the same way.
+    return (
+      <SlidewiseEditor
+        ref={editorRef}
+        deck={deck}
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+        icons={{
+          undo: <ArrowLeft size={16} />,
+          redo: <ArrowRight size={16} />,
+          smart: <Wand2 size={11} />,
+          export: <CloudUpload size={14} />,
+        }}
+      />
+    );
+  }
+
+  if (demoId === "read-only") {
+    return (
+      <SlidewiseEditor
+        ref={editorRef}
+        deck={deck}
+        readOnly
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      />
     );
   }
 

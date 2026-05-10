@@ -18,6 +18,8 @@ import type { Deck } from "@/lib/types";
 import { GridView } from "@/components/editor/GridView";
 import { PlayMode } from "@/components/editor/PlayMode";
 import { HostProvider } from "./HostContext";
+import { IconProvider, type SlidewiseIcons } from "./IconContext";
+import { ReadOnlyProvider } from "./ReadOnlyContext";
 
 export interface SlidewiseRootProps {
   /**
@@ -34,7 +36,10 @@ export interface SlidewiseRootProps {
   onExport?: (deck: Deck) => void;
   /** Fires when the dirty flag flips. */
   onDirtyChange?: (dirty: boolean) => void;
-  /** Reserved; not enforced yet. */
+  /**
+   * Hide editing affordances (save / undo / redo) and disable canvas
+   * mutations. Use this when the host viewer doesn't have write access.
+   */
   readOnly?: boolean;
   /** "light" | "dark"; first-render only. */
   theme?: "light" | "dark";
@@ -42,6 +47,12 @@ export interface SlidewiseRootProps {
   initialSlideId?: string;
   /** Override the default Geist font; sets `--slidewise-font-sans`. */
   fontFamily?: string;
+  /**
+   * Per-action icon overrides for the chrome. Hosts pass any subset to
+   * skin Slidewise with their own icon set; missing slots fall back to
+   * the bundled lucide icons.
+   */
+  icons?: SlidewiseIcons;
   /** Extra class names appended to the root. */
   className?: string;
   /** Inline style applied to the root. */
@@ -84,9 +95,11 @@ function RootInner({
   onSave,
   onExport,
   onDirtyChange,
+  readOnly = false,
   theme,
   initialSlideId,
   fontFamily,
+  icons,
   className,
   style,
   children,
@@ -197,15 +210,19 @@ function RootInner({
     : undefined;
 
   return (
-    <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
-      <RootShell
-        fontFamily={fontFamily}
-        className={className}
-        style={style}
-      >
-        {children}
-      </RootShell>
-    </HostProvider>
+    <ReadOnlyProvider readOnly={readOnly}>
+      <IconProvider icons={icons ?? {}}>
+        <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
+          <RootShell
+            fontFamily={fontFamily}
+            className={className}
+            style={style}
+          >
+            {children}
+          </RootShell>
+        </HostProvider>
+      </IconProvider>
+    </ReadOnlyProvider>
   );
 }
 

@@ -9,6 +9,7 @@ import {
 import { SlidewiseEditor, type SlidewiseEditorHandle } from "./SlidewiseEditor";
 import { parsePptx, serializeDeck } from "@/lib/pptx";
 import type { Deck } from "@/lib/types";
+import type { SlidewiseIcons } from "./compound/IconContext";
 
 export interface SlidewiseFileEditorProps {
   /**
@@ -23,7 +24,11 @@ export interface SlidewiseFileEditorProps {
    * Called when `save()` is invoked on the imperative API.
    */
   saveBlob: (blob: Blob) => Promise<void>;
-  /** Disables editing affordances (TODO: not yet enforced). */
+  /**
+   * When `false`, the top bar's save / undo / redo buttons are hidden and
+   * the title input is read-only. Mirrors the host's "viewer doesn't have
+   * write access" state. Defaults to `true`.
+   */
   editable?: boolean;
   /**
    * The sha256 of the file's contents at load time, if the host wants to do
@@ -36,7 +41,37 @@ export interface SlidewiseFileEditorProps {
    * editor is mounted. Called with `null` on unmount.
    */
   onEditorApiChange?: (api: SlidewiseFileEditorApi | null) => void;
+  /** Fires after every committed mutation. Mirrors `SlidewiseEditor.onChange`. */
+  onChange?: (deck: Deck) => void;
+  /**
+   * Fires reactively when the dirty flag flips. Use this instead of polling
+   * `api.isDirty()` for "unsaved changes" UI.
+   */
+  onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * Fires when `loadBlob` or `parse` throws on mount. The default render
+   * still shows an in-editor "Could not open file" message, but hosts that
+   * want to surface their own error UI can replace it via this callback.
+   */
+  onLoadError?: (err: Error) => void;
   theme?: "light" | "dark";
+  /** Slide id to land on; falls back to the first. */
+  initialSlideId?: string;
+  /** Render the built-in top bar. Default `true`. */
+  showTopBar?: boolean;
+  /** Render the floating bottom toolbar. Default `true`. */
+  showBottomToolbar?: boolean;
+  /**
+   * Override the bundled Geist font; sets `--font-geist-sans` on the editor
+   * root.
+   */
+  fontFamily?: string;
+  /**
+   * Per-action icon overrides. Pass a ReactNode for any of `undo`, `redo`,
+   * `save`, `play`, `themeLight`, `themeDark`, `export`, `smart` to skin the
+   * editor's chrome with your own icon set.
+   */
+  icons?: SlidewiseIcons;
   className?: string;
   style?: CSSProperties;
   /**
@@ -59,6 +94,8 @@ export interface SlidewiseFileEditorApi {
   stop(): void;
   undo(): void;
   redo(): void;
+  /** Live deck snapshot. Hosts use this for header badges (slide count, etc.). */
+  getDeck(): Deck | null;
   getInitialSha256(): string | null;
 }
 
@@ -74,9 +111,18 @@ export const SlidewiseFileEditor = forwardRef<
   {
     loadBlob,
     saveBlob,
+    editable = true,
     initialSha256 = null,
     onEditorApiChange,
+    onChange,
+    onDirtyChange,
+    onLoadError,
     theme,
+    initialSlideId,
+    showTopBar,
+    showBottomToolbar,
+    fontFamily,
+    icons,
     className,
     style,
     parse = parsePptx,
@@ -88,10 +134,16 @@ export const SlidewiseFileEditor = forwardRef<
   const editorRef = useRef<SlidewiseEditorHandle>(null);
   const [dirty, setDirty] = useState(false);
   const apiCallbackRef = useRef(onEditorApiChange);
+  const onChangeRef = useRef(onChange);
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  const onLoadErrorRef = useRef(onLoadError);
 
   useEffect(() => {
     apiCallbackRef.current = onEditorApiChange;
-  }, [onEditorApiChange]);
+    onChangeRef.current = onChange;
+    onDirtyChangeRef.current = onDirtyChange;
+    onLoadErrorRef.current = onLoadError;
+  }, [onEditorApiChange, onChange, onDirtyChange, onLoadError]);
 
   // Load file once on mount.
   useEffect(() => {
@@ -103,12 +155,10 @@ export const SlidewiseFileEditor = forwardRef<
         const deck = await parse(blob);
         if (!cancelled) setState({ status: "ready", deck });
       } catch (err) {
-        if (!cancelled) {
-          setState({
-            status: "error",
-            error: err instanceof Error ? err : new Error(String(err)),
-          });
-        }
+        if (cancelled) return;
+        const error = err instanceof Error ? err : new Error(String(err));
+        setState({ status: "error", error });
+        onLoadErrorRef.current?.(error);
       }
     })();
     return () => {
@@ -125,8 +175,7 @@ export const SlidewiseFileEditor = forwardRef<
 
     const api: SlidewiseFileEditorApi = {
       save: async () => {
-        const current =
-          editorRef.current?.getDeck() ?? state.deck;
+        const current = editorRef.current?.getDeck() ?? state.deck;
         const blob = await serialize(current);
         await saveBlob(blob);
         editorRef.current?.resetDirty();
@@ -136,6 +185,7 @@ export const SlidewiseFileEditor = forwardRef<
       stop: () => editorRef.current?.stop(),
       undo: () => editorRef.current?.undo(),
       redo: () => editorRef.current?.redo(),
+      getDeck: () => editorRef.current?.getDeck() ?? state.deck,
       getInitialSha256: () => initialSha256,
     };
 
@@ -160,6 +210,10 @@ export const SlidewiseFileEditor = forwardRef<
       stop: () => editorRef.current?.stop(),
       undo: () => editorRef.current?.undo(),
       redo: () => editorRef.current?.redo(),
+      getDeck: () =>
+        state.status === "ready"
+          ? editorRef.current?.getDeck() ?? state.deck
+          : null,
       getInitialSha256: () => initialSha256,
     }),
     [state, serialize, saveBlob, initialSha256]
@@ -188,7 +242,19 @@ export const SlidewiseFileEditor = forwardRef<
         ref={editorRef}
         deck={state.deck}
         theme={theme}
-        onDirtyChange={setDirty}
+        readOnly={!editable}
+        initialSlideId={initialSlideId}
+        showTopBar={showTopBar}
+        showBottomToolbar={showBottomToolbar}
+        fontFamily={fontFamily}
+        icons={icons}
+        onChange={(next) => {
+          onChangeRef.current?.(next);
+        }}
+        onDirtyChange={(d) => {
+          setDirty(d);
+          onDirtyChangeRef.current?.(d);
+        }}
         onSave={async (next) => {
           const blob = await serialize(next);
           await saveBlob(blob);
