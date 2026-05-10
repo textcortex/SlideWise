@@ -38,12 +38,17 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
+      # Note: do NOT pass `registry-url` here. setup-node would write a
+      # second .npmrc at $RUNNER_TEMP/.npmrc and point NPM_CONFIG_USERCONFIG
+      # at it, with auth pulled from NODE_AUTH_TOKEN. We don't set
+      # NODE_AUTH_TOKEN, so that .npmrc ends up dead, and changesets/action's
+      # own ~/.npmrc (built from NPM_TOKEN) gets ignored — npm publish then
+      # 404s with no auth. Letting changesets/action manage auth is enough.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
