@@ -53,11 +53,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm exec tsc -b
+      - name: Typecheck (all workspaces)
+        run: pnpm run typecheck
 
-      - name: Test
-        run: pnpm test
+      - name: Test (library)
+        run: pnpm run test
 
       - name: Build library bundle
         run: pnpm run build:lib

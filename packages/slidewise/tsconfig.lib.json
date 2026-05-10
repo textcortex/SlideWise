@@ -1,5 +1,5 @@
 {
-  "extends": "./tsconfig.app.json",
+  "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
     "declaration": true,
@@ -13,15 +13,13 @@
     "src/index.ts",
     "src/SlidewiseEditor.tsx",
     "src/SlidewiseFileEditor.tsx",
-    "src/vite-env.d.ts",
+    "src/css.d.ts",
     "src/lib/**/*.ts",
     "src/lib/**/*.tsx",
     "src/components/**/*.ts",
     "src/components/**/*.tsx"
   ],
   "exclude": [
-    "src/main.tsx",
-    "src/App.tsx",
     "src/lib/pptx/__tests__/**",
     "**/*.test.ts",
     "**/*.test.tsx"

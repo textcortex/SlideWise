@@ -1,0 +1,71 @@
+{
+  "name": "@textcortex/slidewise",
+  "version": "1.0.1",
+  "description": "Embeddable React PPTX editor.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/types/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.mjs"
+    },
+    "./style.css": "./dist/slidewise.css",
+    "./fonts.css": "./src/fonts.css"
+  },
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/textcortex/SlideWise.git",
+    "directory": "packages/slidewise"
+  },
+  "homepage": "https://github.com/textcortex/SlideWise#readme",
+  "bugs": {
+    "url": "https://github.com/textcortex/SlideWise/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build:lib": "tsc -p tsconfig.lib.json && vite build --mode lib",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint ."
+  },
+  "peerDependencies": {
+    "react": ">=19",
+    "react-dom": ">=19"
+  },
+  "dependencies": {
+    "@fontsource-variable/geist": "^5.2.5",
+    "@fontsource-variable/geist-mono": "^5.2.5",
+    "fast-xml-parser": "^5.7.2",
+    "framer-motion": "^12.38.0",
+    "jszip": "^3.10.1",
+    "lucide-react": "^1.11.0",
+    "nanoid": "^5.1.9",
+    "pptxgenjs": "^4.0.1",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^5.0.0",
+    "jsdom": "^29.1.1",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "vite": "^7.0.0",
+    "vitest": "^4.1.5"
+  }
+}
