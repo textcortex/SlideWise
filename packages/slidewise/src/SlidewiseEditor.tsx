@@ -8,6 +8,7 @@ import {
   Body,
   CanvasFrame,
 } from "./compound/parts";
+import type { SlidewiseIcons } from "./compound/IconContext";
 import type { Deck } from "@/lib/types";
 import "./SlidewiseEditor.css";
 
@@ -41,6 +42,13 @@ export interface SlidewiseEditorProps {
   showBottomToolbar?: boolean;
   /** Override the bundled Geist font; sets `--font-geist-sans` on the root. */
   fontFamily?: string;
+  /**
+   * Per-action icon overrides. Pass a ReactNode for any of `undo`, `redo`,
+   * `save`, `play`, `themeLight`, `themeDark`, `export`, `smart` to skin the
+   * editor's chrome with your own icon set; missing slots fall back to the
+   * bundled lucide-react icons.
+   */
+  icons?: SlidewiseIcons;
   /** Extra class names appended to the editor root. */
   className?: string;
   /** Inline style applied to the editor root. */
@@ -84,6 +92,7 @@ export const SlidewiseEditor = forwardRef<
     showTopBar = true,
     showBottomToolbar = true,
     fontFamily,
+    icons,
     className,
     style,
   },
@@ -99,6 +108,7 @@ export const SlidewiseEditor = forwardRef<
     theme,
     initialSlideId,
     fontFamily,
+    icons,
     className,
     style,
   };
