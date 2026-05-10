@@ -62,6 +62,14 @@ jobs:
       - name: Build library bundle
         run: pnpm run build:lib
 
+      # Attribute release commits + GitHub release tags to a real maintainer
+      # rather than github-actions[bot]. Use the GitHub-issued no-reply email
+      # so the commit links to the user profile without leaking a real address.
+      - name: Configure git user for release commits
+        run: |
+          git config --global user.name "karthikmudunuri"
+          git config --global user.email "102793643+karthikmudunuri@users.noreply.github.com"
+
       - name: Create release PR or publish
         uses: changesets/action@v1
         with:
@@ -71,6 +79,8 @@ jobs:
           publish: pnpm run release
           commit: "chore(release): version packages"
           title: "chore(release): version packages"
+          # Don't let the action overwrite the git identity we just set.
+          setupGitUser: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
