@@ -38,12 +38,17 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
+      # Note: do NOT pass `registry-url` here. setup-node would write a
+      # second .npmrc at $RUNNER_TEMP/.npmrc and point NPM_CONFIG_USERCONFIG
+      # at it, with auth pulled from NODE_AUTH_TOKEN. We don't set
+      # NODE_AUTH_TOKEN, so that .npmrc ends up dead, and changesets/action's
+      # own ~/.npmrc (built from NPM_TOKEN) gets ignored — npm publish then
+      # 404s with no auth. Letting changesets/action manage auth is enough.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -57,6 +62,14 @@ jobs:
       - name: Build library bundle
         run: pnpm run build:lib
 
+      # Attribute release commits + GitHub release tags to a real maintainer
+      # rather than github-actions[bot]. Use the GitHub-issued no-reply email
+      # so the commit links to the user profile without leaking a real address.
+      - name: Configure git user for release commits
+        run: |
+          git config --global user.name "karthikmudunuri"
+          git config --global user.email "102793643+karthikmudunuri@users.noreply.github.com"
+
       - name: Create release PR or publish
         uses: changesets/action@v1
         with:
@@ -66,6 +79,8 @@ jobs:
           publish: pnpm run release
           commit: "chore(release): version packages"
           title: "chore(release): version packages"
+          # Don't let the action overwrite the git identity we just set.
+          setupGitUser: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
