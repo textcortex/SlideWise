@@ -1,18 +1,14 @@
+import { forwardRef, type CSSProperties } from "react";
+import { Root, type SlidewiseRootHandle, type SlidewiseRootProps } from "./compound/SlidewiseRoot";
 import {
-  forwardRef,
-  useEffect,
-  useId,
-  useImperativeHandle,
-  useRef,
-  type CSSProperties,
-  type Ref,
-} from "react";
-import { Editor } from "@/components/editor/Editor";
-import {
-  EditorStoreProvider,
-  useEditorStore,
-} from "@/lib/StoreProvider";
-import { collectFontFamilies, ensureGoogleFontsLoaded } from "@/lib/fonts";
+  TopBar,
+  SlideRail,
+  Canvas,
+  BottomToolbar,
+  Body,
+  CanvasFrame,
+} from "./compound/parts";
+import type { SlidewiseIcons } from "./compound/IconContext";
 import type { Deck } from "@/lib/types";
 import "./SlidewiseEditor.css";
 
@@ -42,173 +38,93 @@ export interface SlidewiseEditorProps {
   initialSlideId?: string;
   /** Render the built-in top bar (title, undo/redo, save, play). Default true. */
   showTopBar?: boolean;
+  /** Render the floating bottom toolbar (tool selector). Default true. */
+  showBottomToolbar?: boolean;
   /** Override the bundled Geist font; sets `--font-geist-sans` on the root. */
   fontFamily?: string;
+  /**
+   * Per-action icon overrides. Pass a ReactNode for any of `undo`, `redo`,
+   * `save`, `play`, `themeLight`, `themeDark`, `export`, `smart` to skin the
+   * editor's chrome with your own icon set; missing slots fall back to the
+   * bundled lucide-react icons.
+   */
+  icons?: SlidewiseIcons;
   /** Extra class names appended to the editor root. */
   className?: string;
   /** Inline style applied to the editor root. */
   style?: CSSProperties;
 }
 
-export interface SlidewiseEditorHandle {
-  play(): void;
-  stop(): void;
-  undo(): void;
-  redo(): void;
-  getDeck(): Deck;
-  isDirty(): boolean;
-  resetDirty(): void;
-}
+export type SlidewiseEditorHandle = SlidewiseRootHandle;
 
+/**
+ * Convenience wrapper that renders the default editor layout. Equivalent to:
+ *
+ * ```tsx
+ * <Slidewise.Root deck={deck} onChange={...}>
+ *   <Slidewise.TopBar />
+ *   <Slidewise.Body>
+ *     <Slidewise.SlideRail />
+ *     <Slidewise.CanvasFrame>
+ *       <Slidewise.Canvas />
+ *       <Slidewise.BottomToolbar />
+ *     </Slidewise.CanvasFrame>
+ *   </Slidewise.Body>
+ * </Slidewise.Root>
+ * ```
+ *
+ * Use `<Slidewise.Root>` directly when you need to wrap, replace, or omit
+ * any region.
+ */
 export const SlidewiseEditor = forwardRef<
   SlidewiseEditorHandle,
   SlidewiseEditorProps
->(function SlidewiseEditor(props, ref) {
-  return (
-    <EditorStoreProvider initialDeck={props.deck}>
-      <SlidewiseEditorInner {...props} forwardedRef={ref} />
-    </EditorStoreProvider>
-  );
-});
-
-function SlidewiseEditorInner({
-  deck,
-  onChange,
-  onSave,
-  onExport,
-  onDirtyChange,
-  theme,
-  initialSlideId,
-  showTopBar,
-  fontFamily,
-  className,
-  style,
-  forwardedRef,
-}: SlidewiseEditorProps & { forwardedRef: Ref<SlidewiseEditorHandle> }) {
-  const store = useEditorStore();
-  const savedDeckRef = useRef<Deck>(deck);
-  const dirtyRef = useRef(false);
-  const onChangeRef = useRef(onChange);
-  const onDirtyChangeRef = useRef(onDirtyChange);
-
-  // Keep callback refs current without re-subscribing.
-  useEffect(() => {
-    onChangeRef.current = onChange;
-    onDirtyChangeRef.current = onDirtyChange;
-  }, [onChange, onDirtyChange]);
-
-  // Apply theme on first render and whenever it changes.
-  useEffect(() => {
-    if (theme) {
-      store.getState().setTheme(theme);
-    }
-  }, [theme, store]);
-
-  // Land on the requested slide.
-  useEffect(() => {
-    if (initialSlideId) {
-      const exists = store
-        .getState()
-        .deck.slides.some((s) => s.id === initialSlideId);
-      if (exists) {
-        store.getState().selectSlide(initialSlideId);
-      }
-    }
-    // run once on mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // External deck reset: if a new Deck reference comes in, replace the store's
-  // deck and clear dirty. The first run is a no-op (savedDeckRef === deck).
-  useEffect(() => {
-    if (deck !== savedDeckRef.current) {
-      store.getState().setDeck(deck);
-      savedDeckRef.current = deck;
-      if (dirtyRef.current) {
-        dirtyRef.current = false;
-        onDirtyChangeRef.current?.(false);
-      }
-    }
-  }, [deck, store]);
-
-  // Subscribe once: emit onChange, recompute dirty, and refresh the Google
-  // Fonts <link> whenever the deck changes.
-  const instanceId = useId().replace(/[^a-z0-9]/gi, "");
-  useEffect(() => {
-    ensureGoogleFontsLoaded(
-      instanceId,
-      collectFontFamilies(store.getState().deck)
-    );
-    return store.subscribe((state, prev) => {
-      if (state.deck === prev.deck) return;
-      onChangeRef.current?.(state.deck);
-      const nextDirty = state.deck !== savedDeckRef.current;
-      if (nextDirty !== dirtyRef.current) {
-        dirtyRef.current = nextDirty;
-        onDirtyChangeRef.current?.(nextDirty);
-      }
-      ensureGoogleFontsLoaded(instanceId, collectFontFamilies(state.deck));
-    });
-  }, [store, instanceId]);
-
-  // Remove our font <link> when the editor unmounts.
-  useEffect(() => {
-    return () => {
-      ensureGoogleFontsLoaded(instanceId, []);
-    };
-  }, [instanceId]);
-
-  useImperativeHandle(
-    forwardedRef,
-    () => ({
-      play: () => store.getState().play(),
-      stop: () => store.getState().stop(),
-      undo: () => store.getState().undo(),
-      redo: () => store.getState().redo(),
-      getDeck: () => store.getState().deck,
-      isDirty: () => dirtyRef.current,
-      resetDirty: () => {
-        savedDeckRef.current = store.getState().deck;
-        if (dirtyRef.current) {
-          dirtyRef.current = false;
-          onDirtyChangeRef.current?.(false);
-        }
-      },
-    }),
-    [store]
-  );
-
-  // Wrap the host save callback so a successful save resets the dirty flag.
-  const handleSave = onSave
-    ? async (d: Deck) => {
-        await onSave(d);
-        savedDeckRef.current = d;
-        if (dirtyRef.current) {
-          dirtyRef.current = false;
-          onDirtyChangeRef.current?.(false);
-        }
-      }
-    : undefined;
-
-  const rootStyle: CSSProperties = {
-    width: "100%",
-    height: "100%",
-    ...(fontFamily ? { ["--font-geist-sans" as string]: fontFamily } : null),
-    ...style,
+>(function SlidewiseEditor(
+  {
+    deck,
+    onChange,
+    onSave,
+    onExport,
+    onDirtyChange,
+    readOnly,
+    theme,
+    initialSlideId,
+    showTopBar = true,
+    showBottomToolbar = true,
+    fontFamily,
+    icons,
+    className,
+    style,
+  },
+  ref
+) {
+  const rootProps: SlidewiseRootProps = {
+    deck,
+    onChange,
+    onSave,
+    onExport,
+    onDirtyChange,
+    readOnly,
+    theme,
+    initialSlideId,
+    fontFamily,
+    icons,
+    className,
+    style,
   };
 
   return (
-    <div
-      className={className ? `slidewise-editor-host ${className}` : "slidewise-editor-host"}
-      style={rootStyle}
-    >
-      <Editor
-        showTopBar={showTopBar !== false}
-        onSave={handleSave}
-        onExport={onExport}
-      />
-    </div>
+    <Root {...rootProps} ref={ref}>
+      {showTopBar && <TopBar />}
+      <Body>
+        <SlideRail />
+        <CanvasFrame>
+          <Canvas />
+          {showBottomToolbar && <BottomToolbar />}
+        </CanvasFrame>
+      </Body>
+    </Root>
   );
-}
+});
 
 export default SlidewiseEditor;

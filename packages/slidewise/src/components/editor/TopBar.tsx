@@ -9,8 +9,10 @@ import {
   Moon,
 } from "lucide-react";
 import { useEditor, useEditorStore } from "@/lib/StoreProvider";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type { Deck } from "@/lib/types";
+import { useIcons } from "@/compound/IconContext";
+import { useReadOnly } from "@/compound/ReadOnlyContext";
 
 interface TopBarProps {
   onSave?: (deck: Deck) => void | Promise<void>;
@@ -26,6 +28,8 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
   const play = useEditor((s) => s.play);
   const theme = useEditor((s) => s.theme);
   const toggleTheme = useEditor((s) => s.toggleTheme);
+  const icons = useIcons();
+  const readOnly = useReadOnly();
   const [saved, setSaved] = useState<"idle" | "saving" | "saved">("idle");
 
   const onSave = async () => {
@@ -71,7 +75,7 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
         alignItems: "center",
         padding: "0 14px",
         gap: 10,
-        background: "var(--app-bg)",
+        background: "var(--slidewise-bar-bg, var(--app-bg))",
         borderBottom: "1px solid var(--border)",
         boxShadow: "var(--topbar-shadow)",
         fontFamily: "Inter, system-ui, sans-serif",
@@ -80,12 +84,16 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
         color: "var(--ink)",
       }}
     >
-      <IconBtn onClick={undo} title="Undo">
-        <Undo2 size={16} />
-      </IconBtn>
-      <IconBtn onClick={redo} title="Redo">
-        <Redo2 size={16} />
-      </IconBtn>
+      {!readOnly && (
+        <>
+          <IconBtn onClick={undo} title="Undo">
+            {icons.undo ?? <Undo2 size={16} />}
+          </IconBtn>
+          <IconBtn onClick={redo} title="Redo">
+            {icons.redo ?? <Redo2 size={16} />}
+          </IconBtn>
+        </>
+      )}
 
       <div
         style={{
@@ -111,12 +119,13 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
             letterSpacing: 0.2,
           }}
         >
-          <Sparkles size={11} />
+          {icons.smart ?? <Sparkles size={11} />}
           Smart
         </span>
         <input
           aria-label="Deck title"
           value={title}
+          readOnly={readOnly}
           onChange={(e) => setTitle(e.target.value)}
           style={{
             background: "transparent",
@@ -135,18 +144,22 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
         onClick={toggleTheme}
         title={theme === "dark" ? "Light mode" : "Dark mode"}
       >
-        {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+        {theme === "dark"
+          ? (icons.themeLight ?? <Sun size={16} />)
+          : (icons.themeDark ?? <Moon size={16} />)}
       </IconBtn>
 
-      <button
-        onClick={onSave}
-        style={chromeBtnStyle()}
-        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
-        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-      >
-        <Save size={14} />
-        {saved === "saving" ? "Saving…" : saved === "saved" ? "Saved" : "Save"}
-      </button>
+      {!readOnly && (
+        <button
+          onClick={onSave}
+          style={chromeBtnStyle()}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
+          {icons.save ?? <Save size={14} />}
+          {saved === "saving" ? "Saving…" : saved === "saved" ? "Saved" : "Save"}
+        </button>
+      )}
 
       <button
         onClick={play}
@@ -154,7 +167,7 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
         onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
         onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       >
-        <Play size={14} />
+        {icons.play ?? <Play size={14} />}
         Play
       </button>
 
@@ -168,7 +181,7 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
           gap: 6,
           background: "var(--primary-bg)",
           border: "1px solid var(--primary-bg)",
-          borderRadius: 10,
+          borderRadius: "var(--slidewise-radius, 10px)",
           cursor: "pointer",
           color: "var(--primary-fg)",
           fontSize: 13,
@@ -181,7 +194,7 @@ export function TopBar({ onSave: onSaveProp, onExport: onExportProp }: TopBarPro
           (e.currentTarget.style.background = "var(--primary-bg)")
         }
       >
-        <Download size={14} />
+        {icons.export ?? <Download size={14} />}
         Export
       </button>
     </div>
@@ -197,7 +210,7 @@ function chromeBtnStyle(): React.CSSProperties {
     gap: 6,
     background: "transparent",
     border: "1px solid var(--border-strong)",
-    borderRadius: 10,
+    borderRadius: "var(--slidewise-radius, 10px)",
     cursor: "pointer",
     color: "var(--ink)",
     fontSize: 13,
@@ -210,7 +223,7 @@ function IconBtn({
   onClick,
   title,
 }: {
-  children: React.ReactNode;
+  children: ReactNode;
   onClick: () => void;
   title: string;
 }) {

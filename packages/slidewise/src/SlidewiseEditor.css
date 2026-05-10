@@ -4,24 +4,75 @@
  * to avoid colliding with host styles. At-rules (@font-face, @media, …) are
  * fine at the top level. The `library CSS scope` test in
  * src/lib/__tests__/css-scope.test.ts enforces this.
+ *
+ * THEMING
+ * -------
+ * Every chrome surface (panels, cards, popovers, the canvas frame) reads
+ * from a small set of CSS custom properties exposed below. Hosts override
+ * any of them by either:
+ *
+ *   1. Passing them via the `style` prop on `<Slidewise.Root>`:
+ *        <Slidewise.Root style={{ "--surface-bg": "#0f0f12" }}>
+ *
+ *   2. Setting them in a stylesheet that targets a wrapping class:
+ *        .my-host .slidewise-editor { --surface-bg: #0f0f12; }
+ *
+ * The light defaults track the rest of TextCortex's web app; the dark
+ * defaults adopt the kit from textcortex/platform#7428 (charcoal-purple
+ * surface with a faint inset highlight + layered shadow on hover).
  */
 @import "./fonts.css";
 
 .slidewise-editor {
+  /* PUBLIC THEMING TOKENS
+     These are namespaced with `--slidewise-*` and intended for hosts to
+     override directly via the `style` prop on `<Slidewise.Root>` or via a
+     wrapping stylesheet. Internal variables (below) cascade from these
+     where the connection is structural. Hosts that want to override every
+     surface still have access to the unprefixed internal vars too. */
+  --slidewise-radius: 10px;
+  --slidewise-bar-bg: var(--app-bg);
+  --slidewise-accent: var(--accent);
+
+  /* Layout backgrounds */
   --app-bg: #ffffff;
   --rail-bg: #fafafb;
   --canvas-bg-from: #f4f6fb;
   --canvas-bg-to: #e7eaf2;
+
+  /* Generic chrome surface (cards, popovers, dialogs). Mirrors the kit
+     introduced for the Browse Agents redesign — neutral surface with a
+     hairline inset ring and a layered shadow that lifts on hover. */
+  --surface-bg: #ffffff;
+  --surface-ring: rgba(0, 0, 0, 0.06);
+  --surface-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.6) inset,
+    0 1px 2px rgba(16, 24, 40, 0.06),
+    0 1px 3px rgba(16, 24, 40, 0.08);
+  --surface-hover-bg: #f6f3ff;
+  --surface-hover-ring: rgba(213, 192, 253, 0.6);
+  --surface-hover-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.6) inset,
+    0 2px 4px rgba(128, 67, 249, 0.1),
+    0 8px 24px -4px rgba(128, 67, 249, 0.22);
+
+  /* Borders and dividers */
   --border: rgba(15, 23, 42, 0.08);
   --border-strong: rgba(15, 23, 42, 0.1);
   --border-dashed: rgba(15, 23, 42, 0.18);
+
+  /* Text */
   --ink: #0e1330;
   --ink-muted: #5b6178;
+
+  /* Hover/active states for interactive elements (buttons, list rows) */
   --hover: rgba(15, 23, 42, 0.05);
   --hover-strong: rgba(15, 23, 42, 0.06);
   --active: rgba(15, 23, 42, 0.08);
+
+  /* Brand accent */
   --accent: #4f5bd5;
   --accent-soft: rgba(79, 91, 213, 0.14);
+
+  /* Floating UI shadows */
   --toolbar-bg: rgba(255, 255, 255, 0.94);
   --toolbar-shadow: 0 1px 2px rgba(15, 23, 42, 0.04),
     0 12px 32px rgba(15, 23, 42, 0.1);
@@ -32,20 +83,33 @@
     0 24px 60px rgba(15, 23, 42, 0.16);
   --thumb-shadow: 0 1px 2px rgba(15, 23, 42, 0.04),
     0 6px 20px rgba(15, 23, 42, 0.08);
+
+  /* Tool selector active pill */
   --tool-active-bg: #0e1330;
   --tool-active-fg: #ffffff;
+
+  /* Primary button (e.g. Save) */
   --primary-bg: #0e1330;
   --primary-bg-hover: #1a2147;
   --primary-fg: #ffffff;
+
+  /* Form inputs */
   --input-bg: rgba(15, 23, 42, 0.04);
+
+  /* Popover surfaces */
   --menu-bg: #ffffff;
   --menu-shadow: 0 12px 24px rgba(15, 23, 42, 0.12);
+
+  /* Misc */
   --gap-icon-bg: #ffffff;
   --scroll-thumb: rgba(15, 23, 42, 0.14);
   --scroll-thumb-hover: rgba(15, 23, 42, 0.24);
   --smart-grad: linear-gradient(135deg, #e7e9ff, #fce7df);
   --smart-fg: #4f5bd5;
   --grid-overlay-bg: rgba(245, 246, 250, 0.96);
+  --loading-overlay-bg: rgba(255, 255, 255, 0.6);
+
+  /* Typography */
   --font-geist-sans: "Geist Variable";
   --font-geist-mono: "Geist Mono Variable";
   color-scheme: light;
@@ -58,20 +122,38 @@
 
 .slidewise-editor.theme-dark {
   --app-bg: #0a0d1c;
-  --rail-bg: #0d1124;
+  --rail-bg: #11131c;
   --canvas-bg-from: #181c38;
   --canvas-bg-to: #0c1027;
+
+  /* Charcoal-purple surface kit from textcortex/platform#7428 — neutral
+     dark base, faint inset highlight, layered shadow that lifts to a
+     subtle plum tint on hover. */
+  --surface-bg: #1c1c22;
+  --surface-ring: rgba(255, 255, 255, 0.05);
+  --surface-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.06) inset,
+    0 1px 2px rgba(0, 0, 0, 0.5),
+    0 4px 10px -2px rgba(0, 0, 0, 0.4);
+  --surface-hover-bg: #241834;
+  --surface-hover-ring: rgba(125, 91, 223, 0.2);
+  --surface-hover-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.04) inset,
+    0 4px 16px -2px rgba(125, 91, 223, 0.4);
+
   --border: rgba(255, 255, 255, 0.08);
   --border-strong: rgba(255, 255, 255, 0.14);
   --border-dashed: rgba(255, 255, 255, 0.18);
+
   --ink: #ecedfa;
   --ink-muted: #969ab8;
+
   --hover: rgba(255, 255, 255, 0.06);
   --hover-strong: rgba(255, 255, 255, 0.09);
   --active: rgba(255, 255, 255, 0.12);
+
   --accent: #8a96f0;
   --accent-soft: rgba(138, 150, 240, 0.22);
-  --toolbar-bg: rgba(22, 26, 56, 0.88);
+
+  --toolbar-bg: rgba(28, 28, 34, 0.92);
   --toolbar-shadow: 0 1px 2px rgba(0, 0, 0, 0.5),
     0 12px 32px rgba(0, 0, 0, 0.5);
   --rail-shadow: 4px 0 14px rgba(0, 0, 0, 0.35);
@@ -81,15 +163,20 @@
     0 30px 80px rgba(0, 0, 0, 0.55);
   --thumb-shadow: 0 1px 2px rgba(0, 0, 0, 0.5),
     0 8px 24px rgba(0, 0, 0, 0.45);
+
   --tool-active-bg: #ecedfa;
   --tool-active-fg: #0a0d1c;
+
   --primary-bg: #ecedfa;
   --primary-bg-hover: #ffffff;
   --primary-fg: #0a0d1c;
+
   --input-bg: rgba(255, 255, 255, 0.07);
-  --menu-bg: #181c3a;
+
+  --menu-bg: #1c1c22;
   --menu-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
-  --gap-icon-bg: #181c3a;
+
+  --gap-icon-bg: #1c1c22;
   --scroll-thumb: rgba(255, 255, 255, 0.16);
   --scroll-thumb-hover: rgba(255, 255, 255, 0.3);
   --smart-grad: linear-gradient(
@@ -99,6 +186,7 @@
   );
   --smart-fg: #c8cefb;
   --grid-overlay-bg: rgba(10, 13, 28, 0.96);
+  --loading-overlay-bg: rgba(0, 0, 0, 0.5);
   color-scheme: dark;
 }
 
@@ -143,4 +231,33 @@
 
 .slidewise-editor button {
   font-family: inherit;
+}
+
+/*
+ * Ambient surface utility — a card / panel base that uses the surface-*
+ * tokens. Region parts (e.g. RightPanel) and host injections under it
+ * automatically pick up the kit's hairline ring + layered shadow with no
+ * extra styling. Hosts can apply this class manually or override the
+ * token values to retheme every surface in one place.
+ */
+.slidewise-editor .slidewise-surface {
+  background: var(--surface-bg);
+  box-shadow: var(--surface-shadow);
+  border: 1px solid transparent;
+  outline: 1px solid var(--surface-ring);
+  outline-offset: -1px;
+  border-radius: 12px;
+  transition: background-color 200ms, box-shadow 200ms, outline-color 200ms;
+}
+
+.slidewise-editor .slidewise-surface[data-interactive="true"]:hover {
+  background: var(--surface-hover-bg);
+  box-shadow: var(--surface-hover-shadow);
+  outline-color: var(--surface-hover-ring);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slidewise-editor .slidewise-surface {
+    transition: none;
+  }
 }
