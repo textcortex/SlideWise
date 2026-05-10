@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+
+    "baseUrl": ".",
+    "paths": {
+      "@textcortex/slidewise": ["../packages/slidewise/src/index.ts"],
+      "@textcortex/slidewise/style.css": [
+        "../packages/slidewise/src/SlidewiseEditor.css"
+      ],
+      "@textcortex/slidewise/fonts.css": [
+        "../packages/slidewise/src/fonts.css"
+      ],
+      "@/*": ["../packages/slidewise/src/*"]
+    }
+  },
+  "include": ["src"]
+}

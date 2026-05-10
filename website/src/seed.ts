@@ -1,6 +1,10 @@
 import { nanoid } from "nanoid";
-import type { Deck, Slide, SlideElement } from "./types";
-import { CURRENT_DECK_VERSION } from "./schema/migrate";
+import {
+  CURRENT_DECK_VERSION,
+  type Deck,
+  type Slide,
+  type SlideElement,
+} from "@textcortex/slidewise";
 
 const id = () => nanoid(8);
 

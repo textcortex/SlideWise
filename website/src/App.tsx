@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Upload, RotateCcw } from "lucide-react";
-import { SlidewiseEditor, type SlidewiseEditorHandle } from "./SlidewiseEditor";
-import { seedDeck } from "@/lib/seed";
-import { parsePptx, serializeDeck } from "@/lib/pptx";
-import type { Deck } from "@/lib/types";
+import {
+  SlidewiseEditor,
+  type SlidewiseEditorHandle,
+  parsePptx,
+  serializeDeck,
+  type Deck,
+} from "@textcortex/slidewise";
+import "@textcortex/slidewise/style.css";
+import { seedDeck } from "./seed";
 
 const STORAGE_KEY = "slidewise-deck";
 
