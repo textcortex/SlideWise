@@ -10,7 +10,7 @@ import { SlidewiseEditor, type SlidewiseEditorHandle } from "./SlidewiseEditor";
 import { parsePptx, serializeDeck } from "@/lib/pptx";
 import type { Deck } from "@/lib/types";
 import type { SlidewiseIcons } from "./compound/IconContext";
-import type { HistoryState } from "./compound/SlidewiseRoot";
+import type { HistoryState, SelectionSnapshot } from "./compound/SlidewiseRoot";
 
 export interface SlidewiseFileEditorProps {
   /**
@@ -55,6 +55,18 @@ export interface SlidewiseFileEditorProps {
    * `api.canUndo()` / `api.canRedo()`.
    */
   onHistoryChange?: (state: HistoryState) => void;
+  /** Fires when the active slide changes (user click, programmatic goToSlide). */
+  onActiveSlideChange?: (slideId: string) => void;
+  /** Fires when the selected element ids change. */
+  onSelectionChange?: (selection: SelectionSnapshot) => void;
+  /** Fires when the canvas zoom level changes. */
+  onZoomChange?: (scale: number) => void;
+  /** Fires immediately before the host's `saveBlob` is invoked. */
+  onSaveStart?: () => void;
+  /** Fires after `saveBlob` resolves successfully. */
+  onSaveSuccess?: () => void;
+  /** Fires when `saveBlob` throws. The error still propagates. */
+  onSaveError?: (err: Error) => void;
   /**
    * Fires when `loadBlob` or `parse` throws on mount. The default render
    * still shows an in-editor "Could not open file" message, but hosts that
@@ -114,6 +126,37 @@ export interface SlidewiseFileEditorApi {
    * handles typical typing/drag bursts automatically.
    */
   endCoalesce(): void;
+
+  /** Switch the active slide. No-op when `slideId` is not in the deck. */
+  goToSlide(slideId: string): void;
+  /** Advance to the next slide. No-op past the last slide. */
+  nextSlide(): void;
+  /** Step back to the previous slide. No-op past the first. */
+  prevSlide(): void;
+
+  /** Zoom out by one step. */
+  zoomOut(): void;
+  /** Zoom in by one step. */
+  zoomIn(): void;
+  /** Set absolute zoom (1 = 100%); clamped to [0.1, 4]. */
+  setZoom(scale: number): void;
+
+  /**
+   * Insert a blank slide after `afterId`, or at the end. Returns the new
+   * slide's id. The new slide becomes active.
+   */
+  addSlide(afterId?: string): string | null;
+  /**
+   * Duplicate `slideId`. Returns the new slide's id, or `null` if not
+   * found. The duplicate becomes active.
+   */
+  duplicateSlide(slideId: string): string | null;
+  /** Delete `slideId`. No-op when the deck would be left empty. */
+  deleteSlide(slideId: string): void;
+
+  /** Current selection snapshot (slide id + selected element ids). */
+  getSelection(): SelectionSnapshot;
+
   /** Live deck snapshot. Hosts use this for header badges (slide count, etc.). */
   getDeck(): Deck | null;
   getInitialSha256(): string | null;
@@ -138,6 +181,12 @@ export const SlidewiseFileEditor = forwardRef<
     onDirtyChange,
     onLoadError,
     onHistoryChange,
+    onActiveSlideChange,
+    onSelectionChange,
+    onZoomChange,
+    onSaveStart,
+    onSaveSuccess,
+    onSaveError,
     theme,
     initialSlideId,
     showTopBar,
@@ -211,6 +260,23 @@ export const SlidewiseFileEditor = forwardRef<
       getHistorySize: () =>
         editorRef.current?.getHistorySize() ?? { undo: 0, redo: 0 },
       endCoalesce: () => editorRef.current?.endCoalesce(),
+      goToSlide: (slideId: string) => editorRef.current?.goToSlide(slideId),
+      nextSlide: () => editorRef.current?.nextSlide(),
+      prevSlide: () => editorRef.current?.prevSlide(),
+      zoomIn: () => editorRef.current?.zoomIn(),
+      zoomOut: () => editorRef.current?.zoomOut(),
+      setZoom: (scale: number) => editorRef.current?.setZoom(scale),
+      addSlide: (afterId?: string) =>
+        editorRef.current?.addSlide(afterId) ?? null,
+      duplicateSlide: (slideId: string) =>
+        editorRef.current?.duplicateSlide(slideId) ?? null,
+      deleteSlide: (slideId: string) =>
+        editorRef.current?.deleteSlide(slideId),
+      getSelection: () =>
+        editorRef.current?.getSelection() ?? {
+          slideId: state.deck.slides[0]?.id ?? "",
+          elementIds: [],
+        },
       getDeck: () => editorRef.current?.getDeck() ?? state.deck,
       getInitialSha256: () => initialSha256,
     };
@@ -241,6 +307,24 @@ export const SlidewiseFileEditor = forwardRef<
       getHistorySize: () =>
         editorRef.current?.getHistorySize() ?? { undo: 0, redo: 0 },
       endCoalesce: () => editorRef.current?.endCoalesce(),
+      goToSlide: (slideId: string) => editorRef.current?.goToSlide(slideId),
+      nextSlide: () => editorRef.current?.nextSlide(),
+      prevSlide: () => editorRef.current?.prevSlide(),
+      zoomIn: () => editorRef.current?.zoomIn(),
+      zoomOut: () => editorRef.current?.zoomOut(),
+      setZoom: (scale: number) => editorRef.current?.setZoom(scale),
+      addSlide: (afterId?: string) =>
+        editorRef.current?.addSlide(afterId) ?? null,
+      duplicateSlide: (slideId: string) =>
+        editorRef.current?.duplicateSlide(slideId) ?? null,
+      deleteSlide: (slideId: string) =>
+        editorRef.current?.deleteSlide(slideId),
+      getSelection: () =>
+        editorRef.current?.getSelection() ?? {
+          slideId:
+            state.status === "ready" ? state.deck.slides[0]?.id ?? "" : "",
+          elementIds: [],
+        },
       getDeck: () =>
         state.status === "ready"
           ? editorRef.current?.getDeck() ?? state.deck
@@ -287,6 +371,12 @@ export const SlidewiseFileEditor = forwardRef<
           onDirtyChangeRef.current?.(d);
         }}
         onHistoryChange={onHistoryChange}
+        onActiveSlideChange={onActiveSlideChange}
+        onSelectionChange={onSelectionChange}
+        onZoomChange={onZoomChange}
+        onSaveStart={onSaveStart}
+        onSaveSuccess={onSaveSuccess}
+        onSaveError={onSaveError}
         onSave={async (next) => {
           const blob = await serialize(next);
           await saveBlob(blob);

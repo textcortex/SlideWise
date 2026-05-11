@@ -37,6 +37,7 @@ export {
   type SlidewiseRootProps,
   type SlidewiseRootHandle,
   type HistoryState,
+  type SelectionSnapshot,
 } from "./SlidewiseRoot";
 export {
   SlideRail,

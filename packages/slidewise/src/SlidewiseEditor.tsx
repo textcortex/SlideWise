@@ -4,6 +4,7 @@ import {
   type SlidewiseRootHandle,
   type SlidewiseRootProps,
   type HistoryState,
+  type SelectionSnapshot,
 } from "./compound/SlidewiseRoot";
 import { TopBar } from "./compound/topbar";
 import {
@@ -40,6 +41,18 @@ export interface SlidewiseEditorProps {
    * Undo and Redo buttons reactively without polling `api.canUndo()`.
    */
   onHistoryChange?: (state: HistoryState) => void;
+  /** Fires when the active slide changes (user click, programmatic goToSlide). */
+  onActiveSlideChange?: (slideId: string) => void;
+  /** Fires when the selected element ids change. */
+  onSelectionChange?: (selection: SelectionSnapshot) => void;
+  /** Fires when the canvas zoom level changes. */
+  onZoomChange?: (scale: number) => void;
+  /** Fires immediately before the host's `onSave` is invoked. */
+  onSaveStart?: () => void;
+  /** Fires after the host's `onSave` resolves successfully. */
+  onSaveSuccess?: () => void;
+  /** Fires when the host's `onSave` throws. The error still propagates. */
+  onSaveError?: (err: Error) => void;
   /** Reserved for future use; not enforced yet. */
   readOnly?: boolean;
   /** "light" or "dark"; defaults to "light". Ignored after first render. */
@@ -97,6 +110,12 @@ export const SlidewiseEditor = forwardRef<
     onExport,
     onDirtyChange,
     onHistoryChange,
+    onActiveSlideChange,
+    onSelectionChange,
+    onZoomChange,
+    onSaveStart,
+    onSaveSuccess,
+    onSaveError,
     readOnly,
     theme,
     initialSlideId,
@@ -116,6 +135,12 @@ export const SlidewiseEditor = forwardRef<
     onExport,
     onDirtyChange,
     onHistoryChange,
+    onActiveSlideChange,
+    onSelectionChange,
+    onZoomChange,
+    onSaveStart,
+    onSaveSuccess,
+    onSaveError,
     readOnly,
     theme,
     initialSlideId,

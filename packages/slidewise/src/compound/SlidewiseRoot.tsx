@@ -43,6 +43,18 @@ export interface SlidewiseRootProps {
    * "Undo"/"Redo" button enabled state without polling `canUndo()`/`canRedo()`.
    */
   onHistoryChange?: (state: HistoryState) => void;
+  /** Fires when the active slide changes (user click, programmatic goToSlide). */
+  onActiveSlideChange?: (slideId: string) => void;
+  /** Fires when the selected element ids change. */
+  onSelectionChange?: (selection: SelectionSnapshot) => void;
+  /** Fires when the canvas zoom level changes. */
+  onZoomChange?: (scale: number) => void;
+  /** Fires immediately before the host's `onSave` is invoked. */
+  onSaveStart?: () => void;
+  /** Fires after the host's `onSave` resolves successfully. */
+  onSaveSuccess?: () => void;
+  /** Fires when the host's `onSave` throws. The error still propagates. */
+  onSaveError?: (err: Error) => void;
   /**
    * Hide editing affordances (save / undo / redo) and disable canvas
    * mutations. Use this when the host viewer doesn't have write access.
@@ -74,6 +86,12 @@ export interface HistoryState {
   redoSize: number;
 }
 
+/** Snapshot of the current selection, scoped to the active slide. */
+export interface SelectionSnapshot {
+  slideId: string;
+  elementIds: string[];
+}
+
 export interface SlidewiseRootHandle {
   play(): void;
   stop(): void;
@@ -92,6 +110,44 @@ export interface SlidewiseRootHandle {
    * window handles typical typing/drag bursts.
    */
   endCoalesce(): void;
+
+  // ---- Navigation ----
+  /** Switch the active slide. No-op when `slideId` is not in the deck. */
+  goToSlide(slideId: string): void;
+  /** Advance to the slide after the current one. No-op past the last slide. */
+  nextSlide(): void;
+  /** Step back to the slide before the current one. No-op past the first. */
+  prevSlide(): void;
+
+  // ---- Zoom ----
+  /** Zoom out by one step (×0.8), clamped to the editor's min zoom. */
+  zoomOut(): void;
+  /** Zoom in by one step (×1.25), clamped to the editor's max zoom. */
+  zoomIn(): void;
+  /** Set the absolute zoom (1 = 100%); clamped to [0.1, 4]. */
+  setZoom(scale: number): void;
+
+  // ---- Slide CRUD ----
+  /**
+   * Insert a blank slide after `afterId`, or at the end if `afterId` is
+   * omitted. Returns the new slide's id. The new slide becomes active.
+   */
+  addSlide(afterId?: string): string;
+  /**
+   * Insert a copy of `slideId` immediately after it. Returns the new
+   * slide's id, or `null` if `slideId` wasn't found. The copy becomes
+   * active.
+   */
+  duplicateSlide(slideId: string): string | null;
+  /**
+   * Delete a slide. No-op when the deck would be left with zero slides.
+   */
+  deleteSlide(slideId: string): void;
+
+  // ---- Selection ----
+  /** Current selection snapshot (slide id + selected element ids). */
+  getSelection(): SelectionSnapshot;
+
   getDeck(): Deck;
   isDirty(): boolean;
   resetDirty(): void;
@@ -124,6 +180,12 @@ function RootInner({
   onExport,
   onDirtyChange,
   onHistoryChange: props_onHistoryChange,
+  onActiveSlideChange,
+  onSelectionChange,
+  onZoomChange,
+  onSaveStart,
+  onSaveSuccess,
+  onSaveError,
   readOnly = false,
   theme,
   initialSlideId,
@@ -145,6 +207,12 @@ function RootInner({
   const onSaveRef = useRef(onSave);
   const onExportRef = useRef(onExport);
   const onHistoryChangeRef = useRef(props_onHistoryChange);
+  const onActiveSlideChangeRef = useRef(onActiveSlideChange);
+  const onSelectionChangeRef = useRef(onSelectionChange);
+  const onZoomChangeRef = useRef(onZoomChange);
+  const onSaveStartRef = useRef(onSaveStart);
+  const onSaveSuccessRef = useRef(onSaveSuccess);
+  const onSaveErrorRef = useRef(onSaveError);
 
   useEffect(() => {
     onChangeRef.current = onChange;
@@ -152,7 +220,25 @@ function RootInner({
     onSaveRef.current = onSave;
     onExportRef.current = onExport;
     onHistoryChangeRef.current = props_onHistoryChange;
-  }, [onChange, onDirtyChange, onSave, onExport, props_onHistoryChange]);
+    onActiveSlideChangeRef.current = onActiveSlideChange;
+    onSelectionChangeRef.current = onSelectionChange;
+    onZoomChangeRef.current = onZoomChange;
+    onSaveStartRef.current = onSaveStart;
+    onSaveSuccessRef.current = onSaveSuccess;
+    onSaveErrorRef.current = onSaveError;
+  }, [
+    onChange,
+    onDirtyChange,
+    onSave,
+    onExport,
+    props_onHistoryChange,
+    onActiveSlideChange,
+    onSelectionChange,
+    onZoomChange,
+    onSaveStart,
+    onSaveSuccess,
+    onSaveError,
+  ]);
 
   useEffect(() => {
     if (theme) {
@@ -207,6 +293,29 @@ function RootInner({
           redoSize: nextFut,
         });
       }
+
+      // Active slide changes (click in rail, programmatic goToSlide).
+      if (state.currentSlideId !== prev.currentSlideId) {
+        onActiveSlideChangeRef.current?.(state.currentSlideId);
+      }
+
+      // Selection — shallow compare ids since the array is rebuilt on
+      // every selectElement call. Same slideId + same ids = no emit.
+      if (
+        state.selectedIds !== prev.selectedIds &&
+        !shallowEqualIds(state.selectedIds, prev.selectedIds)
+      ) {
+        onSelectionChangeRef.current?.({
+          slideId: state.currentSlideId,
+          elementIds: state.selectedIds,
+        });
+      }
+
+      // Zoom.
+      if (state.zoom !== prev.zoom) {
+        onZoomChangeRef.current?.(state.zoom);
+      }
+
       if (state.deck === prev.deck) return;
       onChangeRef.current?.(state.deck);
       const nextDirty = state.deck !== savedDeckRef.current;
@@ -239,12 +348,54 @@ function RootInner({
         return { undo: s.history.length, redo: s.future.length };
       },
       endCoalesce: () => store.getState().endCoalesce(),
+
+      goToSlide: (slideId: string) => {
+        const s = store.getState();
+        if (s.deck.slides.some((sl) => sl.id === slideId)) {
+          s.selectSlide(slideId);
+        }
+      },
+      nextSlide: () => {
+        const s = store.getState();
+        const idx = s.deck.slides.findIndex(
+          (sl) => sl.id === s.currentSlideId
+        );
+        const next = s.deck.slides[idx + 1];
+        if (next) s.selectSlide(next.id);
+      },
+      prevSlide: () => {
+        const s = store.getState();
+        const idx = s.deck.slides.findIndex(
+          (sl) => sl.id === s.currentSlideId
+        );
+        const prev = s.deck.slides[idx - 1];
+        if (prev) s.selectSlide(prev.id);
+      },
+
+      zoomIn: () => store.getState().zoomIn(),
+      zoomOut: () => store.getState().zoomOut(),
+      setZoom: (scale: number) => store.getState().setZoom(scale),
+
+      addSlide: (afterId?: string) => store.getState().addSlide(afterId),
+      duplicateSlide: (slideId: string) =>
+        store.getState().duplicateSlide(slideId),
+      deleteSlide: (slideId: string) => store.getState().deleteSlide(slideId),
+
+      getSelection: (): SelectionSnapshot => {
+        const s = store.getState();
+        return {
+          slideId: s.currentSlideId,
+          elementIds: [...s.selectedIds],
+        };
+      },
+
       getDeck: () => store.getState().deck,
       isDirty: () => dirtyRef.current,
       resetDirty: () => {
         savedDeckRef.current = store.getState().deck;
         if (dirtyRef.current) {
           dirtyRef.current = false;
+          setDirty(false);
           onDirtyChangeRef.current?.(false);
         }
       },
@@ -252,15 +403,28 @@ function RootInner({
     [store]
   );
 
-  // Wrap host save with dirty-flag reset so any TopBar.Save / imperative save
-  // path that funnels through here clears the dirty state on success.
+  // Wrap host save with:
+  //   - onSaveStart / onSaveSuccess / onSaveError lifecycle hooks
+  //   - dirty-flag reset on success
+  // The error still propagates so TopBar.Save's local "Saving…" → "idle"
+  // transition kicks in correctly.
   const wrappedSave = onSave
     ? async (d: Deck) => {
-        await onSaveRef.current!(d);
-        savedDeckRef.current = d;
-        if (dirtyRef.current) {
-          dirtyRef.current = false;
-          onDirtyChangeRef.current?.(false);
+        onSaveStartRef.current?.();
+        try {
+          await onSaveRef.current!(d);
+          savedDeckRef.current = d;
+          if (dirtyRef.current) {
+            dirtyRef.current = false;
+            setDirty(false);
+            onDirtyChangeRef.current?.(false);
+          }
+          onSaveSuccessRef.current?.();
+        } catch (err) {
+          onSaveErrorRef.current?.(
+            err instanceof Error ? err : new Error(String(err))
+          );
+          throw err;
         }
       }
     : undefined;
@@ -329,4 +493,13 @@ function RootShell({
       {playing && <PlayMode />}
     </div>
   );
+}
+
+function shallowEqualIds(a: readonly string[], b: readonly string[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
