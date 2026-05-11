@@ -10,6 +10,7 @@ import { SlidewiseEditor, type SlidewiseEditorHandle } from "./SlidewiseEditor";
 import { parsePptx, serializeDeck } from "@/lib/pptx";
 import type { Deck } from "@/lib/types";
 import type { SlidewiseIcons } from "./compound/IconContext";
+import type { HistoryState } from "./compound/SlidewiseRoot";
 
 export interface SlidewiseFileEditorProps {
   /**
@@ -48,6 +49,12 @@ export interface SlidewiseFileEditorProps {
    * `api.isDirty()` for "unsaved changes" UI.
    */
   onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * Fires whenever the undo/redo stack depths change. Use this to enable/
+   * disable host-rendered Undo/Redo buttons reactively without polling
+   * `api.canUndo()` / `api.canRedo()`.
+   */
+  onHistoryChange?: (state: HistoryState) => void;
   /**
    * Fires when `loadBlob` or `parse` throws on mount. The default render
    * still shows an in-editor "Could not open file" message, but hosts that
@@ -94,6 +101,19 @@ export interface SlidewiseFileEditorApi {
   stop(): void;
   undo(): void;
   redo(): void;
+  /** True iff there's at least one snapshot to undo back to. */
+  canUndo(): boolean;
+  /** True iff there's at least one snapshot to redo forward to. */
+  canRedo(): boolean;
+  /** Current undo/redo stack depths. */
+  getHistorySize(): { undo: number; redo: number };
+  /**
+   * End the in-flight coalesce burst. Call on natural commit boundaries
+   * (mouseup after drag, blur on a text input) so the next mutation starts
+   * a fresh history step. Most hosts won't need this — a 500ms idle window
+   * handles typical typing/drag bursts automatically.
+   */
+  endCoalesce(): void;
   /** Live deck snapshot. Hosts use this for header badges (slide count, etc.). */
   getDeck(): Deck | null;
   getInitialSha256(): string | null;
@@ -117,6 +137,7 @@ export const SlidewiseFileEditor = forwardRef<
     onChange,
     onDirtyChange,
     onLoadError,
+    onHistoryChange,
     theme,
     initialSlideId,
     showTopBar,
@@ -185,6 +206,11 @@ export const SlidewiseFileEditor = forwardRef<
       stop: () => editorRef.current?.stop(),
       undo: () => editorRef.current?.undo(),
       redo: () => editorRef.current?.redo(),
+      canUndo: () => editorRef.current?.canUndo() ?? false,
+      canRedo: () => editorRef.current?.canRedo() ?? false,
+      getHistorySize: () =>
+        editorRef.current?.getHistorySize() ?? { undo: 0, redo: 0 },
+      endCoalesce: () => editorRef.current?.endCoalesce(),
       getDeck: () => editorRef.current?.getDeck() ?? state.deck,
       getInitialSha256: () => initialSha256,
     };
@@ -210,6 +236,11 @@ export const SlidewiseFileEditor = forwardRef<
       stop: () => editorRef.current?.stop(),
       undo: () => editorRef.current?.undo(),
       redo: () => editorRef.current?.redo(),
+      canUndo: () => editorRef.current?.canUndo() ?? false,
+      canRedo: () => editorRef.current?.canRedo() ?? false,
+      getHistorySize: () =>
+        editorRef.current?.getHistorySize() ?? { undo: 0, redo: 0 },
+      endCoalesce: () => editorRef.current?.endCoalesce(),
       getDeck: () =>
         state.status === "ready"
           ? editorRef.current?.getDeck() ?? state.deck
@@ -255,6 +286,7 @@ export const SlidewiseFileEditor = forwardRef<
           setDirty(d);
           onDirtyChangeRef.current?.(d);
         }}
+        onHistoryChange={onHistoryChange}
         onSave={async (next) => {
           const blob = await serialize(next);
           await saveBlob(blob);

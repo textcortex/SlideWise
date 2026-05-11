@@ -47,6 +47,7 @@ export {
   useReadOnly,
   type SlidewiseRootProps,
   type SlidewiseRootHandle,
+  type HistoryState,
   type SlidewiseHostCallbacks,
   type SlidewiseIcons,
   type RegionProps,

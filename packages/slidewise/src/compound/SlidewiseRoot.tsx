@@ -37,6 +37,11 @@ export interface SlidewiseRootProps {
   /** Fires when the dirty flag flips. */
   onDirtyChange?: (dirty: boolean) => void;
   /**
+   * Fires whenever the undo/redo stacks change depth. Use this to update
+   * "Undo"/"Redo" button enabled state without polling `canUndo()`/`canRedo()`.
+   */
+  onHistoryChange?: (state: HistoryState) => void;
+  /**
    * Hide editing affordances (save / undo / redo) and disable canvas
    * mutations. Use this when the host viewer doesn't have write access.
    */
@@ -59,11 +64,32 @@ export interface SlidewiseRootProps {
   style?: CSSProperties;
 }
 
+export interface HistoryState {
+  canUndo: boolean;
+  canRedo: boolean;
+  /** Snapshot counts. Useful for "X steps to redo" indicators. */
+  undoSize: number;
+  redoSize: number;
+}
+
 export interface SlidewiseRootHandle {
   play(): void;
   stop(): void;
   undo(): void;
   redo(): void;
+  /** True iff there's at least one snapshot to undo back to. */
+  canUndo(): boolean;
+  /** True iff there's at least one snapshot to redo forward to. */
+  canRedo(): boolean;
+  /** Current undo/redo stack depths. */
+  getHistorySize(): { undo: number; redo: number };
+  /**
+   * End the in-flight coalesce burst. Call on natural commit boundaries
+   * (mouseup after drag, blur on a text input) so the next mutation starts
+   * a fresh history step. Most hosts won't need this — the 500ms idle
+   * window handles typical typing/drag bursts.
+   */
+  endCoalesce(): void;
   getDeck(): Deck;
   isDirty(): boolean;
   resetDirty(): void;
@@ -95,6 +121,7 @@ function RootInner({
   onSave,
   onExport,
   onDirtyChange,
+  onHistoryChange: props_onHistoryChange,
   readOnly = false,
   theme,
   initialSlideId,
@@ -114,13 +141,15 @@ function RootInner({
   const onDirtyChangeRef = useRef(onDirtyChange);
   const onSaveRef = useRef(onSave);
   const onExportRef = useRef(onExport);
+  const onHistoryChangeRef = useRef(props_onHistoryChange);
 
   useEffect(() => {
     onChangeRef.current = onChange;
     onDirtyChangeRef.current = onDirtyChange;
     onSaveRef.current = onSave;
     onExportRef.current = onExport;
-  }, [onChange, onDirtyChange, onSave, onExport]);
+    onHistoryChangeRef.current = props_onHistoryChange;
+  }, [onChange, onDirtyChange, onSave, onExport, props_onHistoryChange]);
 
   useEffect(() => {
     if (theme) {
@@ -159,6 +188,21 @@ function RootInner({
       collectFontFamilies(store.getState().deck)
     );
     return store.subscribe((state, prev) => {
+      // Fire onHistoryChange whenever stack depths change. Independent of
+      // deck identity so undo/redo always emit, even if the resulting deck
+      // happens to be reference-equal (shouldn't, but defensive).
+      const prevHist = prev.history.length;
+      const prevFut = prev.future.length;
+      const nextHist = state.history.length;
+      const nextFut = state.future.length;
+      if (prevHist !== nextHist || prevFut !== nextFut) {
+        onHistoryChangeRef.current?.({
+          canUndo: nextHist > 0,
+          canRedo: nextFut > 0,
+          undoSize: nextHist,
+          redoSize: nextFut,
+        });
+      }
       if (state.deck === prev.deck) return;
       onChangeRef.current?.(state.deck);
       const nextDirty = state.deck !== savedDeckRef.current;
@@ -183,6 +227,13 @@ function RootInner({
       stop: () => store.getState().stop(),
       undo: () => store.getState().undo(),
       redo: () => store.getState().redo(),
+      canUndo: () => store.getState().canUndo(),
+      canRedo: () => store.getState().canRedo(),
+      getHistorySize: () => {
+        const s = store.getState();
+        return { undo: s.history.length, redo: s.future.length };
+      },
+      endCoalesce: () => store.getState().endCoalesce(),
       getDeck: () => store.getState().deck,
       isDirty: () => dirtyRef.current,
       resetDirty: () => {
