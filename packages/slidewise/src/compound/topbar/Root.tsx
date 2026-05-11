@@ -35,7 +35,8 @@ export function Root({
         alignItems: "center",
         padding: "0 14px",
         gap: 10,
-        background: "var(--slidewise-bar-bg, var(--app-bg))",
+        background:
+          "var(--slidewise-bg-topbar, var(--slidewise-bar-bg, var(--app-bg)))",
         borderBottom: "1px solid var(--border)",
         boxShadow: "var(--topbar-shadow)",
         fontFamily: "Inter, system-ui, sans-serif",

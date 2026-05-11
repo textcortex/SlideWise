@@ -2,6 +2,7 @@ import type { CSSProperties, ReactNode } from "react";
 import { Play as PlayIcon } from "lucide-react";
 import { useEditor } from "@/lib/StoreProvider";
 import { useIcons } from "../IconContext";
+import { useLabels } from "../LabelsContext";
 import { chromeBtnStyle, hoverHandlers } from "./styles";
 
 /**
@@ -19,24 +20,26 @@ export interface TopBarPlayProps {
 export function Play({
   className,
   style,
-  ariaLabel = "Play",
-  label = "Play",
+  ariaLabel,
+  label,
   children,
 }: TopBarPlayProps = {}) {
   const play = useEditor((s) => s.play);
   const icons = useIcons();
+  const labels = useLabels();
+  const resolved = label ?? labels.play;
 
   return (
     <button
       type="button"
       className={className}
-      aria-label={ariaLabel}
+      aria-label={ariaLabel ?? resolved}
       onClick={play}
       style={{ ...chromeBtnStyle(), ...style }}
       {...hoverHandlers()}
     >
       {children ?? icons.play ?? <PlayIcon size={14} />}
-      {label}
+      {resolved}
     </button>
   );
 }

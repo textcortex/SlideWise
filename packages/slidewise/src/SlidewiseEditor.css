@@ -34,6 +34,34 @@
   --slidewise-bar-bg: var(--app-bg);
   --slidewise-accent: var(--accent);
 
+  /* Per-surface background tokens. Map onto internal vars by default so
+     existing theme styling is preserved. Hosts override any subset (or
+     pass the `surfaces` prop on <Slidewise.Root>) to retint individual
+     regions independently. */
+  --slidewise-bg-app: var(--app-bg);
+  --slidewise-bg-topbar: var(--app-bg);
+  --slidewise-bg-rail: var(--rail-bg);
+  --slidewise-bg-rail-item: transparent;
+  --slidewise-bg-rail-item-active: var(--accent-soft);
+  --slidewise-bg-canvas-frame: transparent;
+  --slidewise-bg-canvas-from: var(--canvas-bg-from);
+  --slidewise-bg-canvas-to: var(--canvas-bg-to);
+  --slidewise-bg-bottom-toolbar: var(--toolbar-bg);
+  --slidewise-bg-right-panel: var(--rail-bg);
+  --slidewise-bg-menu: var(--menu-bg);
+  --slidewise-bg-tooltip: var(--menu-bg);
+  --slidewise-bg-popover: var(--menu-bg);
+  --slidewise-bg-dialog: var(--menu-bg);
+  --slidewise-bg-slide: #ffffff;
+  --slidewise-bg-selection: var(--accent-soft);
+  --slidewise-bg-hover: var(--hover);
+  --slidewise-bg-active: var(--active);
+  --slidewise-bg-input: var(--input-bg);
+  --slidewise-bg-button: transparent;
+  --slidewise-bg-button-hover: var(--hover);
+  --slidewise-bg-pill: var(--smart-grad);
+  --slidewise-bg-unsaved-badge: rgba(232, 80, 76, 0.12);
+
   /* Layout backgrounds */
   --app-bg: #ffffff;
   --rail-bg: #fafafb;
@@ -125,6 +153,12 @@
   --rail-bg: #11131c;
   --canvas-bg-from: #181c38;
   --canvas-bg-to: #0c1027;
+
+  /* Dark-mode overrides for the public --slidewise-bg-* surface tokens.
+     Hosts can still override any one of these from a higher specificity
+     selector or via the `surfaces` prop. */
+  --slidewise-bg-slide: #ffffff;
+  --slidewise-bg-unsaved-badge: rgba(232, 80, 76, 0.18);
 
   /* Charcoal-purple surface kit from textcortex/platform#7428 — neutral
      dark base, faint inset highlight, layered shadow that lifts to a

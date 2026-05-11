@@ -74,6 +74,19 @@ export {
 } from "./IconContext";
 export { ReadOnlyProvider, useReadOnly } from "./ReadOnlyContext";
 export { DirtyProvider, useDirty } from "./DirtyContext";
+export {
+  LabelsProvider,
+  useLabels,
+  DEFAULT_LABELS,
+  type SlidewiseLabels,
+  type ResolvedLabels,
+} from "./LabelsContext";
+export {
+  SurfacesProvider,
+  useSurfaces,
+  surfacesToCssVars,
+  type SlidewiseSurfaces,
+} from "./SurfacesContext";
 
 /**
  * Store hooks. Use these from host components anywhere under

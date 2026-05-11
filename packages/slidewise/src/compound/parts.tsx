@@ -68,7 +68,7 @@ export function RightPanel({
         width,
         flexShrink: 0,
         height: "100%",
-        background: "var(--rail-bg)",
+        background: "var(--slidewise-bg-right-panel, var(--rail-bg))",
         borderLeft: "1px solid var(--border)",
         boxShadow: "var(--rail-shadow)",
         overflow: "auto",

@@ -3,6 +3,7 @@ import { Sparkles } from "lucide-react";
 import { useEditor } from "@/lib/StoreProvider";
 import { useIcons } from "../IconContext";
 import { useReadOnly } from "../ReadOnlyContext";
+import { useLabels } from "../LabelsContext";
 
 /**
  * Deck title input wrapped in the "Smart" pill. Reads + writes
@@ -23,6 +24,7 @@ export function Title({ className, style }: TopBarTitleProps = {}) {
   const setTitle = useEditor((s) => s.setTitle);
   const icons = useIcons();
   const readOnly = useReadOnly();
+  const labels = useLabels();
 
   return (
     <div
@@ -56,10 +58,10 @@ export function Title({ className, style }: TopBarTitleProps = {}) {
         }}
       >
         {icons.smart ?? <Sparkles size={11} />}
-        Smart
+        {labels.smart}
       </span>
       <input
-        aria-label="Deck title"
+        aria-label={labels.titleAriaLabel}
         value={title}
         readOnly={readOnly}
         onChange={(e) => setTitle(e.target.value)}

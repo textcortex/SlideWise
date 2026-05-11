@@ -89,6 +89,95 @@ editor only sees current-shape decks. It throws if the input was written by a
 newer Slidewise than the host has installed — pin the version range you can
 support.
 
+## Theming
+
+Slidewise exposes its surface colors and chrome metrics as CSS custom
+properties, all namespaced under `--slidewise-*`. Override any subset on the
+`style` prop of `<Slidewise.Root>` (or in a stylesheet that targets the
+`.slidewise-editor` class) to retheme without forking.
+
+```tsx
+<Slidewise.Root
+  style={{
+    "--slidewise-bg-app": "#0a0a0e",
+    "--slidewise-bg-rail": "#1c1c22",
+    "--slidewise-bg-topbar": "linear-gradient(180deg, #1c1c22, #14141a)",
+    "--slidewise-radius": "8px",
+  } as React.CSSProperties}
+>
+  ...
+</Slidewise.Root>
+```
+
+For the most-customized surfaces there's also a typed prop equivalent:
+
+```tsx
+<Slidewise.Root
+  surfaces={{
+    app: "#0a0a0e",
+    rail: "#1c1c22",
+    canvasFrom: "#16181c",
+    canvasTo: "#0f0f12",
+    button: "transparent",
+    buttonHover: "rgba(255,255,255,0.06)",
+  }}
+>
+```
+
+### Public CSS variables
+
+| Variable | What it controls | Default |
+|---|---|---|
+| `--slidewise-radius` | Primary chrome button border-radius. | `10px` |
+| `--slidewise-bar-bg` | Top-bar background (alias kept for v1.1 hosts). | `var(--app-bg)` |
+| `--slidewise-accent` | Accent color used for focus rings, the Smart pill, hover affordances. | `var(--accent)` |
+| `--slidewise-bg-app` | Outermost app shell background. | `var(--app-bg)` |
+| `--slidewise-bg-topbar` | Top bar surface. | `var(--app-bg)` |
+| `--slidewise-bg-rail` | Slide-rail container. | `var(--rail-bg)` |
+| `--slidewise-bg-rail-item` | Idle slide-rail item. | `transparent` |
+| `--slidewise-bg-rail-item-active` | Active/selected rail item. | `var(--accent-soft)` |
+| `--slidewise-bg-canvas-frame` | Frame around the canvas. | `transparent` |
+| `--slidewise-bg-canvas-from` / `--slidewise-bg-canvas-to` | Canvas gradient stops. | `var(--canvas-bg-from)` / `var(--canvas-bg-to)` |
+| `--slidewise-bg-bottom-toolbar` | Floating tool selector. | `var(--toolbar-bg)` |
+| `--slidewise-bg-right-panel` | `<Slidewise.RightPanel>` surface. | `var(--rail-bg)` |
+| `--slidewise-bg-menu` / `--slidewise-bg-tooltip` / `--slidewise-bg-popover` / `--slidewise-bg-dialog` | Floating UI surfaces. | `var(--menu-bg)` |
+| `--slidewise-bg-slide` | Slide paper. | `#ffffff` |
+| `--slidewise-bg-selection` | Selection overlay tint. | `var(--accent-soft)` |
+| `--slidewise-bg-hover` / `--slidewise-bg-active` | Interactive state tints. | `var(--hover)` / `var(--active)` |
+| `--slidewise-bg-input` | Form input background. | `var(--input-bg)` |
+| `--slidewise-bg-button` / `--slidewise-bg-button-hover` | Chrome button surfaces. | `transparent` / `var(--hover)` |
+| `--slidewise-bg-pill` | Smart pill background. | `var(--smart-grad)` |
+| `--slidewise-bg-unsaved-badge` | Unsaved-changes badge. | `rgba(232, 80, 76, 0.12)` |
+
+The library also ships a smaller `--surface-*` token family for ad-hoc
+card/panel surfaces (`--surface-bg`, `--surface-ring`, `--surface-shadow`,
+plus their `-hover` variants) and a `.slidewise-surface` utility class that
+applies all three together.
+
+## Localization
+
+Every user-visible string in the chrome is overridable through the `labels`
+prop:
+
+```tsx
+<Slidewise.Root
+  labels={{
+    save: { idle: "Speichern", saving: "Wird gespeichert…", saved: "Gespeichert" },
+    play: "Wiedergabe",
+    export: "Exportieren",
+    undo: "Rückgängig",
+    redo: "Wiederherstellen",
+    themeToggle: { toDark: "Dunkler Modus", toLight: "Heller Modus" },
+    smart: "Smart",
+    unsavedBadge: "Nicht gespeicherte Änderungen",
+    fileLoadError: (msg) => `Datei konnte nicht geöffnet werden: ${msg}`,
+    fileLoading: "Wird geladen…",
+  }}
+>
+```
+
+Missing entries fall back to the English defaults (`DEFAULT_LABELS`).
+
 ## Releasing
 
 Versioning and publishing run through

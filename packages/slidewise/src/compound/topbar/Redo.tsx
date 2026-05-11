@@ -3,6 +3,7 @@ import { Redo2 } from "lucide-react";
 import { useEditor } from "@/lib/StoreProvider";
 import { useIcons } from "../IconContext";
 import { useReadOnly } from "../ReadOnlyContext";
+import { useLabels } from "../LabelsContext";
 import { iconBtnStyle, hoverHandlers } from "./styles";
 
 /**
@@ -19,21 +20,23 @@ export interface TopBarRedoProps {
 export function Redo({
   className,
   style,
-  ariaLabel = "Redo",
+  ariaLabel,
   children,
 }: TopBarRedoProps = {}) {
   const redo = useEditor((s) => s.redo);
   const canRedo = useEditor((s) => s.future.length > 0);
   const icons = useIcons();
   const readOnly = useReadOnly();
+  const labels = useLabels();
+  const resolvedAria = ariaLabel ?? labels.redo;
   if (readOnly) return null;
 
   return (
     <button
       type="button"
       className={className}
-      title={ariaLabel}
-      aria-label={ariaLabel}
+      title={resolvedAria}
+      aria-label={resolvedAria}
       disabled={!canRedo}
       onClick={redo}
       style={{
