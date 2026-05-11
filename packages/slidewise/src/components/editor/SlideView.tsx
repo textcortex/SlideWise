@@ -1,6 +1,10 @@
 import type { Slide } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
 import { ElementView } from "./ElementView";
+import {
+  useCanvasConfig,
+  resolveSlideBackground,
+} from "@/compound/CanvasContext";
 
 export function SlideView({
   slide,
@@ -9,12 +13,13 @@ export function SlideView({
   slide: Slide;
   scale?: number;
 }) {
+  const canvasConfig = useCanvasConfig();
   return (
     <div
       style={{
         width: SLIDE_W * scale,
         height: SLIDE_H * scale,
-        background: slide.background,
+        background: resolveSlideBackground(canvasConfig, slide),
         position: "relative",
         overflow: "hidden",
         borderRadius: 12 * scale,

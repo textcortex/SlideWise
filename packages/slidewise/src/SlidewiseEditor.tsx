@@ -17,6 +17,7 @@ import {
 import type { SlidewiseIcons } from "./compound/IconContext";
 import type { SlidewiseLabels } from "./compound/LabelsContext";
 import type { SlidewiseSurfaces } from "./compound/SurfacesContext";
+import type { SlidewiseCanvasConfig } from "./compound/CanvasContext";
 import type { Transition } from "framer-motion";
 import type { Deck } from "@/lib/types";
 import "./SlidewiseEditor.css";
@@ -96,6 +97,13 @@ export interface SlidewiseEditorProps {
    * list of keys.
    */
   surfaces?: SlidewiseSurfaces;
+  /**
+   * Canvas/viewport configuration: padding, initial zoom, slide shadow +
+   * radius, and host-driven slide-background overrides. Use this when the
+   * default "slide fills the workspace" presentation isn't right for your
+   * host chrome.
+   */
+  canvas?: SlidewiseCanvasConfig;
   /** Extra class names appended to the editor root. */
   className?: string;
   /** Inline style applied to the editor root. */
@@ -151,6 +159,7 @@ export const SlidewiseEditor = forwardRef<
     icons,
     labels,
     surfaces,
+    canvas,
     className,
     style,
   },
@@ -178,6 +187,7 @@ export const SlidewiseEditor = forwardRef<
     icons,
     labels,
     surfaces,
+    canvas,
     className,
     style,
   };

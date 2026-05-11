@@ -99,6 +99,14 @@ export {
   surfacesToCssVars,
   type SlidewiseSurfaces,
 } from "./SurfacesContext";
+export {
+  CanvasConfigProvider,
+  useCanvasConfig,
+  resolveSlideBackground,
+  DEFAULT_CANVAS_CONFIG,
+  type SlidewiseCanvasConfig,
+  type ResolvedCanvasConfig,
+} from "./CanvasContext";
 
 /**
  * Store hooks. Use these from host components anywhere under
