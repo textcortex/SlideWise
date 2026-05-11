@@ -13,6 +13,7 @@ import type { SlidewiseIcons } from "./compound/IconContext";
 import type { SlidewiseLabels } from "./compound/LabelsContext";
 import type { SlidewiseSurfaces } from "./compound/SurfacesContext";
 import { DEFAULT_LABELS } from "./compound/LabelsContext";
+import type { Transition } from "framer-motion";
 import type { HistoryState, SelectionSnapshot } from "./compound/SlidewiseRoot";
 
 export interface SlidewiseFileEditorProps {
@@ -105,6 +106,13 @@ export interface SlidewiseFileEditorProps {
    * `--slidewise-bg-*` CSS variables.
    */
   surfaces?: SlidewiseSurfaces;
+  /**
+   * Reduced-motion behavior. `"system"` (default) respects the OS
+   * preference; `true` forces motion off; `false` forces it on.
+   */
+  reduceMotion?: boolean | "system";
+  /** Default framer-motion transition applied via `<MotionConfig>`. */
+  transition?: Transition;
   className?: string;
   style?: CSSProperties;
   /**
@@ -209,6 +217,8 @@ export const SlidewiseFileEditor = forwardRef<
     icons,
     labels,
     surfaces,
+    reduceMotion,
+    transition,
     className,
     style,
     parse = parsePptx,
@@ -384,6 +394,8 @@ export const SlidewiseFileEditor = forwardRef<
         icons={icons}
         labels={labels}
         surfaces={surfaces}
+        reduceMotion={reduceMotion}
+        transition={transition}
         onChange={(next) => {
           onChangeRef.current?.(next);
         }}

@@ -62,6 +62,26 @@
   --slidewise-bg-pill: var(--smart-grad);
   --slidewise-bg-unsaved-badge: rgba(232, 80, 76, 0.12);
 
+  /* Motion tokens. Hosts retune the editor's whole animation feel by
+     overriding these. Defaults match Material 3 "standard" easings. */
+  --slidewise-duration-instant: 0ms;
+  --slidewise-duration-fast: 120ms;
+  --slidewise-duration-base: 200ms;
+  --slidewise-duration-slow: 320ms;
+  --slidewise-easing-standard: cubic-bezier(0.2, 0, 0, 1);
+  --slidewise-easing-emphasized: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --slidewise-easing-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Per-region animation flags. Set to 0 on a wrapping scope to disable a
+     specific region's animations without killing motion globally. They are
+     read internally by region-scoped transitions; CSS rules use them via
+     `transition-duration: calc(var(--slidewise-duration-base) * var(--slidewise-anim-topbar))`. */
+  --slidewise-anim-topbar: 1;
+  --slidewise-anim-rail: 1;
+  --slidewise-anim-canvas: 1;
+  --slidewise-anim-floating-toolbar: 1;
+  --slidewise-anim-play-mode: 1;
+
   /* Layout backgrounds */
   --app-bg: #ffffff;
   --rail-bg: #fafafb;
@@ -293,5 +313,42 @@
 @media (prefers-reduced-motion: reduce) {
   .slidewise-editor .slidewise-surface {
     transition: none;
+  }
+}
+
+/*
+ * Reduced motion plumbing.
+ *
+ *   <Slidewise.Root reduceMotion="system">  → no class; respects the
+ *                                              OS preference via the media
+ *                                              query below.
+ *   <Slidewise.Root reduceMotion={true}>    → adds `.reduce-motion` class
+ *                                              for hard-off.
+ *   <Slidewise.Root reduceMotion={false}>   → adds `.reduce-motion-off`
+ *                                              class to override the OS
+ *                                              preference (testing /
+ *                                              previewing animations).
+ */
+.slidewise-editor.reduce-motion,
+.slidewise-editor.reduce-motion *,
+.slidewise-editor.reduce-motion *::before,
+.slidewise-editor.reduce-motion *::after {
+  animation-duration: 0ms !important;
+  animation-delay: 0ms !important;
+  transition-duration: 0ms !important;
+  transition-delay: 0ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slidewise-editor:not(.reduce-motion-off),
+  .slidewise-editor:not(.reduce-motion-off) *,
+  .slidewise-editor:not(.reduce-motion-off) *::before,
+  .slidewise-editor:not(.reduce-motion-off) *::after {
+    animation-duration: 0ms !important;
+    animation-delay: 0ms !important;
+    transition-duration: 0ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
   }
 }
