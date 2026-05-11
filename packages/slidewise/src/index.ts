@@ -60,6 +60,7 @@ export {
   type SlidewiseRootProps,
   type SlidewiseRootHandle,
   type HistoryState,
+  type SelectionSnapshot,
   type SlidewiseHostCallbacks,
   type SlidewiseIcons,
   type RegionProps,

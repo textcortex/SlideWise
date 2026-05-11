@@ -68,12 +68,18 @@ export interface EditorState {
   setTool: (t: Tool) => void;
   setTitle: (t: string) => void;
   setZoom: (z: number) => void;
+  /** Multiplicative zoom-in step (×1.25), clamped to the same range as setZoom. */
+  zoomIn: () => void;
+  /** Multiplicative zoom-out step (×0.8), clamped to the same range as setZoom. */
+  zoomOut: () => void;
   setFitMode: (f: "fit" | "fill" | "manual") => void;
   selectSlide: (id: string) => void;
   selectElement: (id: string | null, additive?: boolean) => void;
   clearSelection: () => void;
-  addSlide: (afterId?: string) => void;
-  duplicateSlide: (id: string) => void;
+  /** Returns the id of the newly inserted slide. */
+  addSlide: (afterId?: string) => string;
+  /** Returns the id of the newly inserted duplicate, or null if `id` wasn't found. */
+  duplicateSlide: (id: string) => string | null;
   deleteSlide: (id: string) => void;
   reorderSlide: (id: string, toIndex: number) => void;
   addElement: (partial: ElementDraft) => string;
@@ -194,6 +200,8 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
     },
     setZoom: (z) =>
       set({ zoom: Math.max(0.1, Math.min(4, z)), fitMode: "manual" }),
+    zoomIn: () => get().setZoom(get().zoom * 1.25),
+    zoomOut: () => get().setZoom(get().zoom * 0.8),
     setFitMode: (f) => set({ fitMode: f }),
 
     selectSlide: (id) =>
@@ -215,8 +223,8 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
 
     addSlide: (afterId) => {
       get().pushHistory();
+      const slide = blankSlide();
       set((s) => {
-        const slide = blankSlide();
         const slides = [...s.deck.slides];
         const idx = afterId
           ? slides.findIndex((sl) => sl.id === afterId)
@@ -228,26 +236,28 @@ export function createEditorStore(initialDeck: Deck): EditorStore {
           selectedIds: [],
         };
       });
+      return slide.id;
     },
 
     duplicateSlide: (id) => {
+      const orig = get().deck.slides.find((sl) => sl.id === id);
+      if (!orig) return null;
       get().pushHistory();
+      const copy: Slide = {
+        ...structuredClone(orig),
+        id: nanoid(8),
+        elements: orig.elements.map((e) => ({ ...e, id: nanoid(8) })),
+      };
       set((s) => {
         const slides = [...s.deck.slides];
         const idx = slides.findIndex((sl) => sl.id === id);
-        if (idx < 0) return s;
-        const orig = slides[idx];
-        const copy: Slide = {
-          ...structuredClone(orig),
-          id: nanoid(8),
-          elements: orig.elements.map((e) => ({ ...e, id: nanoid(8) })),
-        };
         slides.splice(idx + 1, 0, copy);
         return {
           deck: { ...s.deck, slides },
           currentSlideId: copy.id,
         };
       });
+      return copy.id;
     },
 
     deleteSlide: (id) => {
