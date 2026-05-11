@@ -14,6 +14,8 @@ import {
   ArrowLeft,
   ArrowRight,
   CloudUpload,
+  ChevronLeft,
+  Share2,
 } from "lucide-react";
 import {
   SlidewiseEditor,
@@ -41,7 +43,9 @@ type DemoId =
   | "right-panel"
   | "retheme"
   | "icons"
-  | "read-only";
+  | "read-only"
+  | "topbar-hide"
+  | "topbar-compound";
 
 interface Demo {
   id: DemoId;
@@ -85,6 +89,18 @@ const DEMOS: Demo[] = [
     label: "Read-only viewer",
     description:
       "editable={false} hides save/undo/redo and locks the title input. Use this for public viewers or non-owners.",
+  },
+  {
+    id: "topbar-hide",
+    label: "TopBar hide",
+    description:
+      "<Slidewise.TopBar hide={['export','play']} /> drops individual buttons from the default arrangement without going full compound.",
+  },
+  {
+    id: "topbar-compound",
+    label: "TopBar compound",
+    description:
+      "Full <Slidewise.TopBar.Root> with host buttons mixed in: an Exit button leftmost, a Share button rightmost, and the built-in subparts reordered between them.",
   },
 ];
 
@@ -445,6 +461,65 @@ function DemoSurface({ demoId, deck, editorRef, onSave, onExport }: DemoProps) {
     );
   }
 
+  if (demoId === "topbar-hide") {
+    return (
+      <Root
+        ref={editorRef}
+        deck={deck}
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      >
+        <TopBar hide={["export", "play"]} />
+        <Body>
+          <SlideRail />
+          <CanvasFrame>
+            <Canvas />
+            <BottomToolbar />
+          </CanvasFrame>
+        </Body>
+      </Root>
+    );
+  }
+
+  if (demoId === "topbar-compound") {
+    return (
+      <Root
+        ref={editorRef}
+        deck={deck}
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      >
+        <TopBar.Root>
+          <button type="button" style={hostTopBarBtn()}>
+            <ChevronLeft size={14} />
+            Exit
+          </button>
+          <TopBar.Group>
+            <TopBar.Undo />
+            <TopBar.Redo />
+          </TopBar.Group>
+          <TopBar.Title />
+          <TopBar.ThemeToggle />
+          <TopBar.Save />
+          <TopBar.Export />
+          <button type="button" style={hostTopBarBtn()}>
+            <Share2 size={14} />
+            Share
+          </button>
+        </TopBar.Root>
+        <Body>
+          <SlideRail />
+          <CanvasFrame>
+            <Canvas />
+            <BottomToolbar />
+          </CanvasFrame>
+        </Body>
+      </Root>
+    );
+  }
+
   if (demoId === "read-only") {
     return (
       <SlidewiseEditor
@@ -537,6 +612,24 @@ function DemoRightPanel() {
       </div>
     </div>
   );
+}
+
+function hostTopBarBtn(): CSSProperties {
+  return {
+    height: 32,
+    padding: "0 12px",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    background: "transparent",
+    border: "1px solid var(--border-strong)",
+    borderRadius: "var(--slidewise-radius, 10px)",
+    cursor: "pointer",
+    color: "var(--ink)",
+    fontSize: 13,
+    fontWeight: 500,
+    fontFamily: "inherit",
+  };
 }
 
 function chipBtn(primary: boolean): CSSProperties {
