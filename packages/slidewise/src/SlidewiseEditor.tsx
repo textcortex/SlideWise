@@ -17,6 +17,7 @@ import {
 import type { SlidewiseIcons } from "./compound/IconContext";
 import type { SlidewiseLabels } from "./compound/LabelsContext";
 import type { SlidewiseSurfaces } from "./compound/SurfacesContext";
+import type { Transition } from "framer-motion";
 import type { Deck } from "@/lib/types";
 import "./SlidewiseEditor.css";
 
@@ -67,6 +68,16 @@ export interface SlidewiseEditorProps {
   showBottomToolbar?: boolean;
   /** Override the bundled Geist font; sets `--font-geist-sans` on the root. */
   fontFamily?: string;
+  /**
+   * Reduced-motion behavior. `"system"` (default) respects the OS
+   * preference; `true` forces motion off; `false` forces it on.
+   */
+  reduceMotion?: boolean | "system";
+  /**
+   * Default framer-motion transition applied via `<MotionConfig>`. Use
+   * this to retune the editor's animation feel globally.
+   */
+  transition?: Transition;
   /**
    * Per-action icon overrides. Pass a ReactNode for any of `undo`, `redo`,
    * `save`, `play`, `themeLight`, `themeDark`, `export`, `smart` to skin the
@@ -135,6 +146,8 @@ export const SlidewiseEditor = forwardRef<
     showTopBar = true,
     showBottomToolbar = true,
     fontFamily,
+    reduceMotion,
+    transition,
     icons,
     labels,
     surfaces,
@@ -160,6 +173,8 @@ export const SlidewiseEditor = forwardRef<
     theme,
     initialSlideId,
     fontFamily,
+    reduceMotion,
+    transition,
     icons,
     labels,
     surfaces,

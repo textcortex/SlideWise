@@ -18,6 +18,7 @@ import { collectFontFamilies, ensureGoogleFontsLoaded } from "@/lib/fonts";
 import type { Deck } from "@/lib/types";
 import { GridView } from "@/components/editor/GridView";
 import { PlayMode } from "@/components/editor/PlayMode";
+import { MotionConfig, type Transition } from "framer-motion";
 import { HostProvider } from "./HostContext";
 import { IconProvider, type SlidewiseIcons } from "./IconContext";
 import { ReadOnlyProvider } from "./ReadOnlyContext";
@@ -72,6 +73,29 @@ export interface SlidewiseRootProps {
   initialSlideId?: string;
   /** Override the default Geist font; sets `--slidewise-font-sans`. */
   fontFamily?: string;
+  /**
+   * Controls reduced-motion behavior.
+   *
+   * - `"system"` (default) — respect the user's OS preference via the
+   *   `prefers-reduced-motion` media query.
+   * - `true` — force all CSS animations + transitions off and tell
+   *   framer-motion to skip motion. Use for hosts whose own product
+   *   already has a global motion-off toggle.
+   * - `false` — force motion on even when the OS reports reduced-motion.
+   *   Useful for previewing animations during development; not generally
+   *   recommended in production since it overrides an accessibility hint.
+   */
+  reduceMotion?: boolean | "system";
+  /**
+   * Default framer-motion transition. Passed through to a wrapping
+   * `<MotionConfig>` so every motion component inside the editor inherits
+   * it. Useful for retuning the editor's overall feel (faster, springier,
+   * etc.) without touching individual components.
+   *
+   * For CSS transitions, override the duration/easing tokens instead —
+   * `--slidewise-duration-base`, `--slidewise-easing-standard`, etc.
+   */
+  transition?: Transition;
   /**
    * Per-action icon overrides for the chrome. Hosts pass any subset to
    * skin Slidewise with their own icon set; missing slots fall back to
@@ -212,6 +236,8 @@ function RootInner({
   theme,
   initialSlideId,
   fontFamily,
+  reduceMotion = "system",
+  transition,
   icons,
   labels,
   surfaces,
@@ -461,26 +487,50 @@ function RootInner({
     ? { ...style, ...(surfaceVars as CSSProperties) }
     : style;
 
+  // Map our reduceMotion enum to:
+  //  - a CSS class on the root (drives the @media + class rules in
+  //    SlidewiseEditor.css)
+  //  - framer-motion's reducedMotion prop on MotionConfig
+  const motionClass =
+    reduceMotion === true
+      ? "reduce-motion"
+      : reduceMotion === false
+        ? "reduce-motion-off"
+        : "";
+  const fmReducedMotion =
+    reduceMotion === true
+      ? "always"
+      : reduceMotion === false
+        ? "never"
+        : "user";
+  const combinedClassName = motionClass
+    ? className
+      ? `${className} ${motionClass}`
+      : motionClass
+    : className;
+
   return (
-    <ReadOnlyProvider readOnly={readOnly}>
-      <IconProvider icons={icons ?? {}}>
-        <LabelsProvider labels={labels}>
-          <SurfacesProvider surfaces={surfaces}>
-            <DirtyProvider dirty={dirty}>
-              <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
-                <RootShell
-                  fontFamily={fontFamily}
-                  className={className}
-                  style={mergedStyle}
-                >
-                  {children}
-                </RootShell>
-              </HostProvider>
-            </DirtyProvider>
-          </SurfacesProvider>
-        </LabelsProvider>
-      </IconProvider>
-    </ReadOnlyProvider>
+    <MotionConfig reducedMotion={fmReducedMotion} transition={transition}>
+      <ReadOnlyProvider readOnly={readOnly}>
+        <IconProvider icons={icons ?? {}}>
+          <LabelsProvider labels={labels}>
+            <SurfacesProvider surfaces={surfaces}>
+              <DirtyProvider dirty={dirty}>
+                <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
+                  <RootShell
+                    fontFamily={fontFamily}
+                    className={combinedClassName}
+                    style={mergedStyle}
+                  >
+                    {children}
+                  </RootShell>
+                </HostProvider>
+              </DirtyProvider>
+            </SurfacesProvider>
+          </LabelsProvider>
+        </IconProvider>
+      </ReadOnlyProvider>
+    </MotionConfig>
   );
 }
 
