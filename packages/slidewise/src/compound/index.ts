@@ -40,7 +40,6 @@ export {
   type SelectionSnapshot,
 } from "./SlidewiseRoot";
 export {
-  SlideRail,
   Canvas,
   BottomToolbar,
   RightPanel,
@@ -50,6 +49,19 @@ export {
 } from "./parts";
 
 export { TopBar, type TopBarProps, type TopBarSlotId } from "./topbar";
+export {
+  SlideRail,
+  useSlideRailItem,
+  type SlideRailProps,
+  type SlideRailRootProps,
+  type SlideRailHeaderProps,
+  type SlideRailListProps,
+  type SlideRailItemProps,
+  type SlideRailThumbnailProps,
+  type SlideRailNumberProps,
+  type SlideRailAddButtonProps,
+  type SlideRailItemContextValue,
+} from "./sliderail";
 export type {
   TopBarRootProps,
   TopBarTitleProps,

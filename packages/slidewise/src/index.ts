@@ -68,9 +68,19 @@ export {
   type SlidewiseLabels,
   type SlidewiseSurfaces,
   type ResolvedLabels,
+  useSlideRailItem,
   type RegionProps,
   type TopBarProps,
   type TopBarSlotId,
+  type SlideRailProps,
+  type SlideRailRootProps,
+  type SlideRailHeaderProps,
+  type SlideRailListProps,
+  type SlideRailItemProps,
+  type SlideRailThumbnailProps,
+  type SlideRailNumberProps,
+  type SlideRailAddButtonProps,
+  type SlideRailItemContextValue,
 } from "./compound";
 
 export { parsePptx, serializeDeck } from "./lib/pptx";

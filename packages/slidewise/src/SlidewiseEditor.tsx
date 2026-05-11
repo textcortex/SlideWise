@@ -7,8 +7,8 @@ import {
   type SelectionSnapshot,
 } from "./compound/SlidewiseRoot";
 import { TopBar } from "./compound/topbar";
+import { SlideRail } from "./compound/sliderail";
 import {
-  SlideRail,
   Canvas,
   BottomToolbar,
   Body,
