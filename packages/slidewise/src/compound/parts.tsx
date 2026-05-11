@@ -1,32 +1,21 @@
 import type { CSSProperties, ReactNode } from "react";
-import { TopBar as TopBarInternal } from "@/components/editor/TopBar";
 import { SlideRail as SlideRailInternal } from "@/components/editor/SlideRail";
 import { Canvas as CanvasInternal } from "@/components/editor/Canvas";
 import { BottomToolbar as BottomToolbarInternal } from "@/components/editor/BottomToolbar";
-import { useHostCallbacks } from "./HostContext";
 
 /**
  * Region-level compound parts. Each consumes the editor store via context,
  * so any part can be omitted, wrapped, or replaced. None of these accept
  * deck/onChange/onSave props — those live on `<Slidewise.Root>`.
+ *
+ * Note: `<Slidewise.TopBar>` is defined separately in `./topbar/` because
+ * it itself decomposes into subparts (`TopBar.Root`, `TopBar.Title`,
+ * `TopBar.Undo`, etc.) and ships a `hide` prop for per-button removal.
  */
 
 export interface RegionProps {
   className?: string;
   style?: CSSProperties;
-}
-
-/**
- * The default top bar (title input, undo/redo, save, play, theme toggle,
- * export). Reads host callbacks from context, so the Save and Export
- * buttons fire the host's `onSave` / `onExport` from `<Slidewise.Root>`.
- *
- * Omit it from the tree to hide the whole bar; or render your own toolbar
- * alongside `<Slidewise.Canvas>` for full control.
- */
-export function TopBar(_props: RegionProps = {}) {
-  const { onSave, onExport } = useHostCallbacks();
-  return <TopBarInternal onSave={onSave} onExport={onExport} />;
 }
 
 /**

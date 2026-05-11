@@ -4,6 +4,7 @@ import {
   useId,
   useImperativeHandle,
   useRef,
+  useState,
   type CSSProperties,
   type PropsWithChildren,
   type Ref,
@@ -20,6 +21,7 @@ import { PlayMode } from "@/components/editor/PlayMode";
 import { HostProvider } from "./HostContext";
 import { IconProvider, type SlidewiseIcons } from "./IconContext";
 import { ReadOnlyProvider } from "./ReadOnlyContext";
+import { DirtyProvider } from "./DirtyContext";
 
 export interface SlidewiseRootProps {
   /**
@@ -137,6 +139,7 @@ function RootInner({
   const store = useEditorStore();
   const savedDeckRef = useRef<Deck>(deck);
   const dirtyRef = useRef(false);
+  const [dirty, setDirty] = useState(false);
   const onChangeRef = useRef(onChange);
   const onDirtyChangeRef = useRef(onDirtyChange);
   const onSaveRef = useRef(onSave);
@@ -176,6 +179,7 @@ function RootInner({
       savedDeckRef.current = deck;
       if (dirtyRef.current) {
         dirtyRef.current = false;
+        setDirty(false);
         onDirtyChangeRef.current?.(false);
       }
     }
@@ -208,6 +212,7 @@ function RootInner({
       const nextDirty = state.deck !== savedDeckRef.current;
       if (nextDirty !== dirtyRef.current) {
         dirtyRef.current = nextDirty;
+        setDirty(nextDirty);
         onDirtyChangeRef.current?.(nextDirty);
       }
       ensureGoogleFontsLoaded(instanceId, collectFontFamilies(state.deck));
@@ -263,15 +268,17 @@ function RootInner({
   return (
     <ReadOnlyProvider readOnly={readOnly}>
       <IconProvider icons={icons ?? {}}>
-        <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
-          <RootShell
-            fontFamily={fontFamily}
-            className={className}
-            style={style}
-          >
-            {children}
-          </RootShell>
-        </HostProvider>
+        <DirtyProvider dirty={dirty}>
+          <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
+            <RootShell
+              fontFamily={fontFamily}
+              className={className}
+              style={style}
+            >
+              {children}
+            </RootShell>
+          </HostProvider>
+        </DirtyProvider>
       </IconProvider>
     </ReadOnlyProvider>
   );

@@ -5,8 +5,8 @@ import {
   type SlidewiseRootProps,
   type HistoryState,
 } from "./compound/SlidewiseRoot";
+import { TopBar } from "./compound/topbar";
 import {
-  TopBar,
   SlideRail,
   Canvas,
   BottomToolbar,
