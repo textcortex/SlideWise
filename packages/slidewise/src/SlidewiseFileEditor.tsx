@@ -12,6 +12,7 @@ import type { Deck } from "@/lib/types";
 import type { SlidewiseIcons } from "./compound/IconContext";
 import type { SlidewiseLabels } from "./compound/LabelsContext";
 import type { SlidewiseSurfaces } from "./compound/SurfacesContext";
+import type { SlidewiseCanvasConfig } from "./compound/CanvasContext";
 import { DEFAULT_LABELS } from "./compound/LabelsContext";
 import type { Transition } from "framer-motion";
 import type { HistoryState, SelectionSnapshot } from "./compound/SlidewiseRoot";
@@ -106,6 +107,11 @@ export interface SlidewiseFileEditorProps {
    * `--slidewise-bg-*` CSS variables.
    */
   surfaces?: SlidewiseSurfaces;
+  /**
+   * Canvas/viewport configuration: padding, initial zoom, slide shadow +
+   * radius, and host-driven slide-background overrides.
+   */
+  canvas?: SlidewiseCanvasConfig;
   /**
    * Reduced-motion behavior. `"system"` (default) respects the OS
    * preference; `true` forces motion off; `false` forces it on.
@@ -217,6 +223,7 @@ export const SlidewiseFileEditor = forwardRef<
     icons,
     labels,
     surfaces,
+    canvas,
     reduceMotion,
     transition,
     className,
@@ -394,6 +401,7 @@ export const SlidewiseFileEditor = forwardRef<
         icons={icons}
         labels={labels}
         surfaces={surfaces}
+        canvas={canvas}
         reduceMotion={reduceMotion}
         transition={transition}
         onChange={(next) => {

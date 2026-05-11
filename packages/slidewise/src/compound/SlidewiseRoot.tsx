@@ -29,6 +29,10 @@ import {
   surfacesToCssVars,
   type SlidewiseSurfaces,
 } from "./SurfacesContext";
+import {
+  CanvasConfigProvider,
+  type SlidewiseCanvasConfig,
+} from "./CanvasContext";
 
 export interface SlidewiseRootProps {
   /**
@@ -118,6 +122,14 @@ export interface SlidewiseRootProps {
    * ```
    */
   surfaces?: SlidewiseSurfaces;
+  /**
+   * Canvas/viewport configuration. Set `padding`, `slideRadius`,
+   * `slideShadow`, and an initial `defaultZoom` to keep the slide
+   * presented as a centered card rather than letting a bold deck fill
+   * paint the entire workspace. `forceSlideBackground` /
+   * `resolveSlideBackground` let hosts override per-slide fills.
+   */
+  canvas?: SlidewiseCanvasConfig;
   /** Extra class names appended to the root. */
   className?: string;
   /** Inline style applied to the root. */
@@ -241,6 +253,7 @@ function RootInner({
   icons,
   labels,
   surfaces,
+  canvas,
   className,
   style,
   children,
@@ -304,6 +317,14 @@ function RootInner({
       if (exists) {
         store.getState().selectSlide(initialSlideId);
       }
+    }
+    // Apply canvas defaults once on mount. setZoom auto-flips fitMode to
+    // "manual" so we set fitMode last to honor an explicit canvas.fitMode.
+    if (canvas?.defaultZoom !== undefined) {
+      store.getState().setZoom(canvas.defaultZoom);
+    }
+    if (canvas?.fitMode) {
+      store.getState().setFitMode(canvas.fitMode);
     }
     // run once on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -515,17 +536,19 @@ function RootInner({
         <IconProvider icons={icons ?? {}}>
           <LabelsProvider labels={labels}>
             <SurfacesProvider surfaces={surfaces}>
-              <DirtyProvider dirty={dirty}>
-                <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
-                  <RootShell
-                    fontFamily={fontFamily}
-                    className={combinedClassName}
-                    style={mergedStyle}
-                  >
-                    {children}
-                  </RootShell>
-                </HostProvider>
-              </DirtyProvider>
+              <CanvasConfigProvider config={canvas}>
+                <DirtyProvider dirty={dirty}>
+                  <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
+                    <RootShell
+                      fontFamily={fontFamily}
+                      className={combinedClassName}
+                      style={mergedStyle}
+                    >
+                      {children}
+                    </RootShell>
+                  </HostProvider>
+                </DirtyProvider>
+              </CanvasConfigProvider>
             </SurfacesProvider>
           </LabelsProvider>
         </IconProvider>

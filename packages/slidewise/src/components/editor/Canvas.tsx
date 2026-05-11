@@ -5,6 +5,10 @@ import { SLIDE_W, SLIDE_H, type SlideElement, type ElementDraft } from "@/lib/ty
 import { ElementView } from "./ElementView";
 import { SelectionFrame } from "./SelectionFrame";
 import { FloatingToolbar } from "./FloatingToolbar";
+import {
+  useCanvasConfig,
+  resolveSlideBackground,
+} from "@/compound/CanvasContext";
 
 export function Canvas() {
   const store = useEditorStore();
@@ -22,6 +26,7 @@ export function Canvas() {
   const deleteElement = useEditor((s) => s.deleteElement);
   const pushHistory = useEditor((s) => s.pushHistory);
 
+  const canvasConfig = useCanvasConfig();
   const [editingId, setEditingId] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [autoScale, setAutoScale] = useState(0.6);
@@ -30,10 +35,12 @@ export function Canvas() {
     if (fitMode !== "fit" || !wrapRef.current) return;
     const recompute = () => {
       const r = wrapRef.current!.getBoundingClientRect();
-      // Generous fill: small breathing room horizontally, plus enough vertical
-      // headroom for the floating toolbar (~56) and the bottom toolbar (~76).
-      const padX = 32;
-      const padY = 56 + 76 + 16;
+      // Host-controllable padding via `canvas.padding` on <Slidewise.Root>.
+      // Default mirrors what the editor needed before the prop existed —
+      // ~32px horizontal breathing room and enough vertical headroom for
+      // the floating toolbar (~56) and the bottom toolbar (~76).
+      const padX = canvasConfig.padding.x * 2;
+      const padY = canvasConfig.padding.y * 2;
       const fit = Math.min(
         (r.width - padX) / SLIDE_W,
         (r.height - padY) / SLIDE_H
@@ -44,7 +51,7 @@ export function Canvas() {
     const ro = new ResizeObserver(recompute);
     ro.observe(wrapRef.current);
     return () => ro.disconnect();
-  }, [fitMode]);
+  }, [fitMode, canvasConfig.padding.x, canvasConfig.padding.y]);
 
   const scale = fitMode === "fit" ? autoScale : zoom;
 
@@ -245,9 +252,9 @@ export function Canvas() {
           width: SLIDE_W * scale,
           height: SLIDE_H * scale,
           transform: "translate(-50%, -50%)",
-          background: slide.background,
-          borderRadius: 8,
-          boxShadow: "var(--slide-shadow)",
+          background: resolveSlideBackground(canvasConfig, slide),
+          borderRadius: canvasConfig.slideRadius,
+          boxShadow: canvasConfig.slideShadow,
         }}
       >
         <div
