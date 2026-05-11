@@ -4,6 +4,7 @@ import { useEditorStore } from "@/lib/StoreProvider";
 import { useHostCallbacks } from "../HostContext";
 import { useIcons } from "../IconContext";
 import { useReadOnly } from "../ReadOnlyContext";
+import { useLabels } from "../LabelsContext";
 import { chromeBtnStyle, hoverHandlers } from "./styles";
 
 /**
@@ -27,7 +28,7 @@ export interface TopBarSaveProps {
 export function Save({
   className,
   style,
-  ariaLabel = "Save",
+  ariaLabel,
   labels,
   children,
 }: TopBarSaveProps = {}) {
@@ -35,6 +36,7 @@ export function Save({
   const { onSave: onSaveHost } = useHostCallbacks();
   const icons = useIcons();
   const readOnly = useReadOnly();
+  const ctxLabels = useLabels();
   const [phase, setPhase] = useState<"idle" | "saving" | "saved">("idle");
 
   if (readOnly) return null;
@@ -59,16 +61,16 @@ export function Save({
 
   const text =
     phase === "saving"
-      ? (labels?.saving ?? "Saving…")
+      ? (labels?.saving ?? ctxLabels.save.saving)
       : phase === "saved"
-        ? (labels?.saved ?? "Saved")
-        : (labels?.idle ?? "Save");
+        ? (labels?.saved ?? ctxLabels.save.saved)
+        : (labels?.idle ?? ctxLabels.save.idle);
 
   return (
     <button
       type="button"
       className={className}
-      aria-label={ariaLabel}
+      aria-label={ariaLabel ?? ctxLabels.save.idle}
       onClick={onClick}
       style={{ ...chromeBtnStyle(), ...style }}
       {...hoverHandlers()}

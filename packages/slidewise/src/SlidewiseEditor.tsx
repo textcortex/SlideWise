@@ -15,6 +15,8 @@ import {
   CanvasFrame,
 } from "./compound/parts";
 import type { SlidewiseIcons } from "./compound/IconContext";
+import type { SlidewiseLabels } from "./compound/LabelsContext";
+import type { SlidewiseSurfaces } from "./compound/SurfacesContext";
 import type { Deck } from "@/lib/types";
 import "./SlidewiseEditor.css";
 
@@ -72,6 +74,17 @@ export interface SlidewiseEditorProps {
    * bundled lucide-react icons.
    */
   icons?: SlidewiseIcons;
+  /**
+   * User-visible string overrides for i18n. Pass any subset; missing
+   * entries fall back to English defaults.
+   */
+  labels?: SlidewiseLabels;
+  /**
+   * Per-surface background overrides, equivalent to setting the
+   * `--slidewise-bg-*` CSS variables. See `SlidewiseSurfaces` for the full
+   * list of keys.
+   */
+  surfaces?: SlidewiseSurfaces;
   /** Extra class names appended to the editor root. */
   className?: string;
   /** Inline style applied to the editor root. */
@@ -123,6 +136,8 @@ export const SlidewiseEditor = forwardRef<
     showBottomToolbar = true,
     fontFamily,
     icons,
+    labels,
+    surfaces,
     className,
     style,
   },
@@ -146,6 +161,8 @@ export const SlidewiseEditor = forwardRef<
     initialSlideId,
     fontFamily,
     icons,
+    labels,
+    surfaces,
     className,
     style,
   };

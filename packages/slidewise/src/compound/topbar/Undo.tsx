@@ -3,6 +3,7 @@ import { Undo2 } from "lucide-react";
 import { useEditor } from "@/lib/StoreProvider";
 import { useIcons } from "../IconContext";
 import { useReadOnly } from "../ReadOnlyContext";
+import { useLabels } from "../LabelsContext";
 import { iconBtnStyle, hoverHandlers } from "./styles";
 
 /**
@@ -31,21 +32,23 @@ export interface TopBarUndoProps {
 export function Undo({
   className,
   style,
-  ariaLabel = "Undo",
+  ariaLabel,
   children,
 }: TopBarUndoProps = {}) {
   const undo = useEditor((s) => s.undo);
   const canUndo = useEditor((s) => s.history.length > 0);
   const icons = useIcons();
   const readOnly = useReadOnly();
+  const labels = useLabels();
+  const resolvedAria = ariaLabel ?? labels.undo;
   if (readOnly) return null;
 
   return (
     <button
       type="button"
       className={className}
-      title={ariaLabel}
-      aria-label={ariaLabel}
+      title={resolvedAria}
+      aria-label={resolvedAria}
       disabled={!canUndo}
       onClick={undo}
       style={{

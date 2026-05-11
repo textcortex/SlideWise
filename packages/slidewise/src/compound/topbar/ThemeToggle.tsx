@@ -2,6 +2,7 @@ import type { CSSProperties, ReactNode } from "react";
 import { Sun, Moon } from "lucide-react";
 import { useEditor } from "@/lib/StoreProvider";
 import { useIcons } from "../IconContext";
+import { useLabels } from "../LabelsContext";
 import { iconBtnStyle, hoverHandlers } from "./styles";
 
 /**
@@ -24,11 +25,12 @@ export function ThemeToggle({
   const theme = useEditor((s) => s.theme);
   const toggleTheme = useEditor((s) => s.toggleTheme);
   const icons = useIcons();
+  const ctxLabels = useLabels();
 
   const label =
     theme === "dark"
-      ? (labels?.toggleToLight ?? "Light mode")
-      : (labels?.toggleToDark ?? "Dark mode");
+      ? (labels?.toggleToLight ?? ctxLabels.themeToggle.toLight)
+      : (labels?.toggleToDark ?? ctxLabels.themeToggle.toDark);
 
   return (
     <button

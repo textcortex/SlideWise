@@ -10,6 +10,9 @@ import { SlidewiseEditor, type SlidewiseEditorHandle } from "./SlidewiseEditor";
 import { parsePptx, serializeDeck } from "@/lib/pptx";
 import type { Deck } from "@/lib/types";
 import type { SlidewiseIcons } from "./compound/IconContext";
+import type { SlidewiseLabels } from "./compound/LabelsContext";
+import type { SlidewiseSurfaces } from "./compound/SurfacesContext";
+import { DEFAULT_LABELS } from "./compound/LabelsContext";
 import type { HistoryState, SelectionSnapshot } from "./compound/SlidewiseRoot";
 
 export interface SlidewiseFileEditorProps {
@@ -91,6 +94,17 @@ export interface SlidewiseFileEditorProps {
    * editor's chrome with your own icon set.
    */
   icons?: SlidewiseIcons;
+  /**
+   * User-visible string overrides for i18n. Pass any subset; missing
+   * entries fall back to English defaults. The "Unsaved changes" badge
+   * and the loading / load-error messages also key off this table.
+   */
+  labels?: SlidewiseLabels;
+  /**
+   * Per-surface background overrides; equivalent to setting the
+   * `--slidewise-bg-*` CSS variables.
+   */
+  surfaces?: SlidewiseSurfaces;
   className?: string;
   style?: CSSProperties;
   /**
@@ -193,6 +207,8 @@ export const SlidewiseFileEditor = forwardRef<
     showBottomToolbar,
     fontFamily,
     icons,
+    labels,
+    surfaces,
     className,
     style,
     parse = parsePptx,
@@ -337,15 +353,18 @@ export const SlidewiseFileEditor = forwardRef<
   if (state.status === "loading") {
     return (
       <div style={{ ...frameStyle, ...style }} className={className}>
-        <div style={messageStyle}>Loading…</div>
+        <div style={messageStyle}>
+          {labels?.fileLoading ?? DEFAULT_LABELS.fileLoading}
+        </div>
       </div>
     );
   }
   if (state.status === "error") {
+    const fmt = labels?.fileLoadError ?? DEFAULT_LABELS.fileLoadError;
     return (
       <div style={{ ...frameStyle, ...style }} className={className}>
         <div style={{ ...messageStyle, color: "#E8504C" }}>
-          Could not open file: {state.error.message}
+          {fmt(state.error.message)}
         </div>
       </div>
     );
@@ -363,6 +382,8 @@ export const SlidewiseFileEditor = forwardRef<
         showBottomToolbar={showBottomToolbar}
         fontFamily={fontFamily}
         icons={icons}
+        labels={labels}
+        surfaces={surfaces}
         onChange={(next) => {
           onChangeRef.current?.(next);
         }}
@@ -382,7 +403,11 @@ export const SlidewiseFileEditor = forwardRef<
           await saveBlob(blob);
         }}
       />
-      {dirty && <UnsavedBadge />}
+      {dirty && (
+        <UnsavedBadge
+          label={labels?.unsavedBadge ?? DEFAULT_LABELS.unsavedBadge}
+        />
+      )}
     </div>
   );
 });
@@ -403,7 +428,7 @@ const messageStyle: CSSProperties = {
   color: "#5b6178",
 };
 
-function UnsavedBadge() {
+function UnsavedBadge({ label }: { label: string }) {
   return (
     <div
       style={{
@@ -411,7 +436,8 @@ function UnsavedBadge() {
         top: 12,
         right: 12,
         padding: "4px 10px",
-        background: "rgba(232, 80, 76, 0.12)",
+        background:
+          "var(--slidewise-bg-unsaved-badge, rgba(232, 80, 76, 0.12))",
         color: "#E8504C",
         borderRadius: 999,
         fontFamily: "Inter, system-ui, sans-serif",
@@ -422,7 +448,7 @@ function UnsavedBadge() {
         pointerEvents: "none",
       }}
     >
-      Unsaved changes
+      {label}
     </div>
   );
 }

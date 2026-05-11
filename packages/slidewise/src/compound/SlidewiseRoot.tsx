@@ -22,6 +22,12 @@ import { HostProvider } from "./HostContext";
 import { IconProvider, type SlidewiseIcons } from "./IconContext";
 import { ReadOnlyProvider } from "./ReadOnlyContext";
 import { DirtyProvider } from "./DirtyContext";
+import { LabelsProvider, type SlidewiseLabels } from "./LabelsContext";
+import {
+  SurfacesProvider,
+  surfacesToCssVars,
+  type SlidewiseSurfaces,
+} from "./SurfacesContext";
 
 export interface SlidewiseRootProps {
   /**
@@ -72,6 +78,22 @@ export interface SlidewiseRootProps {
    * the bundled lucide icons.
    */
   icons?: SlidewiseIcons;
+  /**
+   * User-visible string overrides for i18n. Pass any subset; missing
+   * entries fall back to English defaults. Pairs with `icons` for full
+   * locale customization.
+   */
+  labels?: SlidewiseLabels;
+  /**
+   * Per-surface background overrides. Equivalent to setting the
+   * `--slidewise-bg-*` CSS variables on the root, but as a typed prop so
+   * hosts can drive theming from JS without writing CSS:
+   *
+   * ```tsx
+   * <Slidewise.Root surfaces={{ app: "#0b0d10", rail: "#1c1c22" }}>
+   * ```
+   */
+  surfaces?: SlidewiseSurfaces;
   /** Extra class names appended to the root. */
   className?: string;
   /** Inline style applied to the root. */
@@ -191,6 +213,8 @@ function RootInner({
   initialSlideId,
   fontFamily,
   icons,
+  labels,
+  surfaces,
   className,
   style,
   children,
@@ -429,20 +453,32 @@ function RootInner({
       }
     : undefined;
 
+  // Merge host's `style` prop with the surface overrides so a host can
+  // pass both without one clobbering the other. Surfaces win on conflict
+  // because they're the more specific theming intent.
+  const surfaceVars = surfacesToCssVars(surfaces);
+  const mergedStyle: CSSProperties | undefined = surfaceVars
+    ? { ...style, ...(surfaceVars as CSSProperties) }
+    : style;
+
   return (
     <ReadOnlyProvider readOnly={readOnly}>
       <IconProvider icons={icons ?? {}}>
-        <DirtyProvider dirty={dirty}>
-          <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
-            <RootShell
-              fontFamily={fontFamily}
-              className={className}
-              style={style}
-            >
-              {children}
-            </RootShell>
-          </HostProvider>
-        </DirtyProvider>
+        <LabelsProvider labels={labels}>
+          <SurfacesProvider surfaces={surfaces}>
+            <DirtyProvider dirty={dirty}>
+              <HostProvider callbacks={{ onSave: wrappedSave, onExport }}>
+                <RootShell
+                  fontFamily={fontFamily}
+                  className={className}
+                  style={mergedStyle}
+                >
+                  {children}
+                </RootShell>
+              </HostProvider>
+            </DirtyProvider>
+          </SurfacesProvider>
+        </LabelsProvider>
       </IconProvider>
     </ReadOnlyProvider>
   );

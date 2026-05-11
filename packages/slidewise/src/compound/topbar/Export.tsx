@@ -3,6 +3,7 @@ import { Download } from "lucide-react";
 import { useEditorStore } from "@/lib/StoreProvider";
 import { useHostCallbacks } from "../HostContext";
 import { useIcons } from "../IconContext";
+import { useLabels } from "../LabelsContext";
 import { primaryBtnStyle, primaryHoverHandlers } from "./styles";
 
 /**
@@ -24,13 +25,15 @@ export interface TopBarExportProps {
 export function Export({
   className,
   style,
-  ariaLabel = "Export",
-  label = "Export",
+  ariaLabel,
+  label,
   children,
 }: TopBarExportProps = {}) {
   const store = useEditorStore();
   const { onExport: onExportHost } = useHostCallbacks();
   const icons = useIcons();
+  const labels = useLabels();
+  const resolved = label ?? labels.export;
 
   const onClick = () => {
     const deck = store.getState().deck;
@@ -53,13 +56,13 @@ export function Export({
     <button
       type="button"
       className={className}
-      aria-label={ariaLabel}
+      aria-label={ariaLabel ?? resolved}
       onClick={onClick}
       style={{ ...primaryBtnStyle(), ...style }}
       {...primaryHoverHandlers()}
     >
       {children ?? icons.export ?? <Download size={14} />}
-      {label}
+      {resolved}
     </button>
   );
 }
