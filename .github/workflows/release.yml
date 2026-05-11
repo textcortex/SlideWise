@@ -6,9 +6,16 @@ name: Release
 # action publishes to the registry instead.
 #
 # Required secrets:
-#   NPM_TOKEN  — automation token with publish access for @textcortex scope.
-#                If absent, the publish step is skipped (the Version Packages
-#                PR still gets opened).
+#   NPM_TOKEN          — automation token with publish access for @textcortex
+#                        scope. If absent, the publish step is skipped (the
+#                        Version Packages PR still gets opened).
+#   MAINTAINER_GITHUB_TOKEN — Personal Access Token of the maintainer who
+#                        should appear as the author of the Version Packages
+#                        PR and its commits. If absent, the workflow falls
+#                        back to the default GITHUB_TOKEN, which authenticates
+#                        as github-actions[bot]. Required scopes for a classic
+#                        PAT: `repo` (or fine-grained: contents=write +
+#                        pull-requests=write on this repo).
 on:
   push:
     branches:
@@ -34,6 +41,11 @@ jobs:
         with:
           # changesets needs full history to compute changelog deltas.
           fetch-depth: 0
+          # Use the maintainer PAT (when present) so any push back to main
+          # is authored by the maintainer rather than github-actions[bot].
+          # Fallback to the default GITHUB_TOKEN keeps the workflow functional
+          # even before the secret is configured.
+          token: ${{ secrets.MAINTAINER_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -82,5 +94,8 @@ jobs:
           # Don't let the action overwrite the git identity we just set.
           setupGitUser: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Attribute the auto-opened Version Packages PR + push to the
+          # maintainer. Falls back to the default token (github-actions[bot])
+          # if the PAT isn't configured yet so the workflow still functions.
+          GITHUB_TOKEN: ${{ secrets.MAINTAINER_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
