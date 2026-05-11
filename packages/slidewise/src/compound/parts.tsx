@@ -1,5 +1,4 @@
 import type { CSSProperties, ReactNode } from "react";
-import { SlideRail as SlideRailInternal } from "@/components/editor/SlideRail";
 import { Canvas as CanvasInternal } from "@/components/editor/Canvas";
 import { BottomToolbar as BottomToolbarInternal } from "@/components/editor/BottomToolbar";
 
@@ -8,21 +7,15 @@ import { BottomToolbar as BottomToolbarInternal } from "@/components/editor/Bott
  * so any part can be omitted, wrapped, or replaced. None of these accept
  * deck/onChange/onSave props — those live on `<Slidewise.Root>`.
  *
- * Note: `<Slidewise.TopBar>` is defined separately in `./topbar/` because
- * it itself decomposes into subparts (`TopBar.Root`, `TopBar.Title`,
- * `TopBar.Undo`, etc.) and ships a `hide` prop for per-button removal.
+ * Note: `<Slidewise.TopBar>` and `<Slidewise.SlideRail>` are defined
+ * separately under `./topbar/` and `./sliderail/` because they decompose
+ * into their own subparts. Both ship a callable component for the default
+ * arrangement plus a namespace of named subparts.
  */
 
 export interface RegionProps {
   className?: string;
   style?: CSSProperties;
-}
-
-/**
- * Left-side slide thumbnail rail with add/duplicate/delete.
- */
-export function SlideRail(_props: RegionProps = {}) {
-  return <SlideRailInternal />;
 }
 
 /**
