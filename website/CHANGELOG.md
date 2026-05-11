@@ -1,5 +1,12 @@
 # website
 
+## 0.0.7
+
+### Patch Changes
+
+- Updated dependencies [7c2456c]
+  - @textcortex/slidewise@1.7.0
+
 ## 0.0.6
 
 ### Patch Changes
