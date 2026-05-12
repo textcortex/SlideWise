@@ -1033,8 +1033,19 @@ async function parsePic(
   const file = ctx.zip.file(fullPath);
   if (!file) return toUnknown(pic, "p:pic", ctx, outer);
 
-  const base64 = await file.async("base64");
   const ext = (fullPath.split(".").pop() || "png").toLowerCase();
+  // EMF / WMF are Microsoft vector formats that browsers can't render
+  // natively — emitting them as <img src="data:application/octet-stream…">
+  // surfaces a broken-image icon. Drop them with a diagnostic so the slide
+  // stays clean; consumers that need fidelity should pre-rasterise these
+  // before import.
+  if (ext === "emf" || ext === "wmf") {
+    ctx.diagnostics.warnings.push(
+      `Skipped ${ext.toUpperCase()} image at ${fullPath} — vector metafiles aren't supported in the browser.`
+    );
+    return null;
+  }
+  const base64 = await file.async("base64");
   const mime = mimeForExt(ext);
 
   const blipFill = pic?.["p:blipFill"];
