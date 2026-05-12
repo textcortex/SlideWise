@@ -66,6 +66,10 @@ function TextView({
           ? "center"
           : "flex-end",
     background: el.background,
+    padding: el.padding
+      ? `${el.padding.t}px ${el.padding.r}px ${el.padding.b}px ${el.padding.l}px`
+      : undefined,
+    boxSizing: el.padding ? "border-box" : undefined,
     cursor: editing ? "text" : "inherit",
   };
   const inner: React.CSSProperties = {

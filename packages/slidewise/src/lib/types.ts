@@ -89,6 +89,12 @@ export interface TextElement extends BaseElement {
     fillRule?: "nonzero" | "evenodd";
   };
   /**
+   * Optional inner padding (in canvas pixels) for the text box. The PPTX
+   * importer fills this from `<a:bodyPr lIns/tIns/rIns/bIns>` so tinted
+   * placeholder boxes don't render with text flush to their edges.
+   */
+  padding?: { l: number; t: number; r: number; b: number };
+  /**
    * Optional rich-text breakdown. When present, the renderer and PPTX writer
    * use these per-run styles; the flat fields above act as defaults for any
    * field a run leaves unset. Editing the text via the contentEditable surface

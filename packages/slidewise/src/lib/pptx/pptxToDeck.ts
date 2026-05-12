@@ -922,6 +922,36 @@ function makeTextElement(
       : 0,
     ...(hasMixedFormatting ? { runs } : {}),
   };
+  // Inner padding from <a:bodyPr lIns/tIns/rIns/bIns>. PowerPoint applies
+  // these as text-box insets (the typographic equivalent of CSS padding).
+  // Default values in OOXML are 91440 / 45720 / 91440 / 45720 EMU. The
+  // slide often carries an empty <a:bodyPr/> that should silently inherit
+  // each attribute from the layout/master, so we read per-field rather
+  // than swap whole bodyPr objects.
+  const slideBp = effectiveTxBody?.["a:bodyPr"];
+  const layoutBp = layoutPh?.bodyPr;
+  const masterBp = masterPh?.bodyPr;
+  const readIns = (key: string, fallback: number): number => {
+    const v =
+      slideBp?.[`@_${key}`] ??
+      layoutBp?.[`@_${key}`] ??
+      masterBp?.[`@_${key}`];
+    return v !== undefined ? Number(v) : fallback;
+  };
+  const lIns = readIns("lIns", 91440);
+  const tIns = readIns("tIns", 45720);
+  const rIns = readIns("rIns", 91440);
+  const bIns = readIns("bIns", 45720);
+  const padding = {
+    l: Math.round(emuToPx(lIns) * ctx.fit.scale),
+    t: Math.round(emuToPx(tIns) * ctx.fit.scale),
+    r: Math.round(emuToPx(rIns) * ctx.fit.scale),
+    b: Math.round(emuToPx(bIns) * ctx.fit.scale),
+  };
+  if (padding.l || padding.t || padding.r || padding.b) {
+    el.padding = padding;
+  }
+
   // Layout placeholders often supply a fill (e.g. a tinted body box) or a
   // <a:custGeom> path (a white brand-logo plate) that should sit
   // *immediately* behind the slide's hosted text — at the same z, not in
