@@ -1651,25 +1651,36 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
       // the shape so the gradient peaks where PowerPoint draws it.
       const ftrCx = (lIn + (100 - rIn)) / 2;
       const ftrCy = (tIn + (100 - bIn)) / 2;
+      // CSS focus is the geometric opposite of fillToRect's centre — the
+      // gradient fills *toward* fillToRect.
       const focusX = clampPct(100 - ftrCx);
       const focusY = clampPct(100 - ftrCy);
-      // PowerPoint renders `path="circle"` to fit the shape's aspect, not a
-      // true geometric circle. On a tall side-panel that means the purple
-      // ramp stretches mostly along the long axis, reading as a near-linear
-      // top→bottom gradient. CSS `ellipse` matches that behaviour; a true
-      // `circle` would collapse the purple to a small corner blob.
-      const shape = "ellipse";
       void pathType;
-      // OOXML radial stops ramp outer→focus: pos=0 at the boundary,
-      // pos=100000 at the focus. CSS goes centre→edge, so we flip each
-      // stop's position.
+      // PowerPoint's `<a:path path="circle">` doesn't render as a strict
+      // geometric circle — combined with the typical `tileRect` extension
+      // and a corner focus, the visible result on real decks is much
+      // closer to a linear ramp along the dominant axis from the focus
+      // toward fillToRect. CSS linear-gradient matches that intent
+      // cleanly (a CSS radial leaves an obvious "blob" at the corner that
+      // PowerPoint doesn't draw).
+      const dx = (100 - focusX) - focusX; // toward fillToRect, horizontal
+      const dy = (100 - focusY) - focusY; // toward fillToRect, vertical
+      // CSS linear-gradient angle: 0deg = bottom→top, 90deg = left→right.
+      // We want the angle whose direction vector points from focus toward
+      // fillToRect's centre (i.e. the "outer" end of the ramp).
+      const angle =
+        (Math.atan2(dx, -dy) * 180) / Math.PI;
+      const cssAngle = ((angle % 360) + 360) % 360;
+      // OOXML stops ramp outer→focus: pos=0 at the boundary (fillToRect),
+      // pos=100000 at the focus. CSS linear goes start→end (0%→100%); we
+      // place the focus colour at 0% (start) and the boundary at 100%.
       const flipped = stops
         .map((s) => ({ pos: 100 - s.pos, color: s.color }))
         .sort((a, b) => a.pos - b.pos);
       const stopsCss = flipped
         .map((s) => `${s.color} ${s.pos.toFixed(2)}%`)
         .join(", ");
-      return `radial-gradient(${shape} at ${focusX.toFixed(2)}% ${focusY.toFixed(2)}%, ${stopsCss})`;
+      return `linear-gradient(${cssAngle.toFixed(2)}deg, ${stopsCss})`;
     }
     const angDeg = gf["a:lin"]?.["@_ang"]
       ? (Number(gf["a:lin"]["@_ang"]) / 60000 + 90) % 360
