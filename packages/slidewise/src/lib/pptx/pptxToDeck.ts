@@ -1653,7 +1653,13 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
       const ftrCy = (tIn + (100 - bIn)) / 2;
       const focusX = clampPct(100 - ftrCx);
       const focusY = clampPct(100 - ftrCy);
-      const shape = pathType === "circle" ? "circle" : "ellipse";
+      // PowerPoint renders `path="circle"` to fit the shape's aspect, not a
+      // true geometric circle. On a tall side-panel that means the purple
+      // ramp stretches mostly along the long axis, reading as a near-linear
+      // top→bottom gradient. CSS `ellipse` matches that behaviour; a true
+      // `circle` would collapse the purple to a small corner blob.
+      const shape = "ellipse";
+      void pathType;
       // OOXML radial stops ramp outer→focus: pos=0 at the boundary,
       // pos=100000 at the focus. CSS goes centre→edge, so we flip each
       // stop's position.
