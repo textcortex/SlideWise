@@ -79,9 +79,26 @@ interface ParseContext {
   slideRels: Rels;
   fit: Fit;
   theme: ThemeColors;
+  themeFills: ThemeFills;
   layoutPh: Map<string, PlaceholderInfo>;
   masterPh: Map<string, PlaceholderInfo>;
   masterTextDefaults: MasterTextDefaults;
+}
+
+/**
+ * Ordered theme fill lists from a:fmtScheme. PPTX <p:bgRef idx="1001+"> looks
+ * up the (idx - 1000)th entry of bgFillStyleLst (and analogously fillStyleLst
+ * for 1+). Order across mixed tag types matters — fast-xml-parser flattens by
+ * tag, so we reconstruct order from the raw XML.
+ */
+interface ThemeFill {
+  kind: "solidFill" | "gradFill" | "blipFill" | "pattFill" | "noFill";
+  node: any;
+}
+
+interface ThemeFills {
+  bg: ThemeFill[];
+  fg: ThemeFill[];
 }
 
 const xmlParser = new XMLParser({
@@ -224,7 +241,12 @@ async function parseSlide(
       ? normalisePath(themeTarget, dirOf(masterPath))
       : null;
   const themeXml = themePath ? await readXml(zip, themePath) : null;
+  const themeRaw = themePath ? await readXmlRaw(zip, themePath) : null;
   const theme = themeXml ? extractTheme(themeXml) : DEFAULT_THEME;
+  const themeFills =
+    themeXml && themeRaw
+      ? extractThemeFills(themeXml, themeRaw)
+      : { bg: [], fg: [] };
 
   const layoutPh = layoutXml ? extractPlaceholders(layoutXml) : new Map();
   const masterPh = masterXml ? extractPlaceholders(masterXml) : new Map();
@@ -239,6 +261,7 @@ async function parseSlide(
     slideRels,
     fit,
     theme,
+    themeFills,
     layoutPh,
     masterPh,
     masterTextDefaults,
@@ -246,27 +269,55 @@ async function parseSlide(
 
   const sld = xml["p:sld"];
   const cSld = sld?.["p:cSld"];
-  const slideBg = extractBackgroundColor(cSld?.["p:bg"], theme);
+  const slideBg = extractBackground(cSld?.["p:bg"], ctx);
   const layoutBg = layoutXml
-    ? extractBackgroundColor(
+    ? extractBackground(
         layoutXml?.["p:sldLayout"]?.["p:cSld"]?.["p:bg"],
-        theme
+        ctx
       )
     : undefined;
   const masterBg = masterXml
-    ? extractBackgroundColor(
+    ? extractBackground(
         masterXml?.["p:sldMaster"]?.["p:cSld"]?.["p:bg"],
-        theme
+        ctx
       )
     : undefined;
   const background = slideBg ?? layoutBg ?? masterBg ?? "#FFFFFF";
 
   const spTree = cSld?.["p:spTree"];
+
+  // Layout & master visuals (non-placeholder shapes/pics, plus the fill of
+  // placeholder-bearing shapes) form an underlay so brand bars, side gradients,
+  // logo pics, and tinted placeholder boxes appear behind slide content.
+  // Placeholders the slide already overrides (e.g. picture placeholder filled
+  // by an in-slide <p:pic>) are skipped so their "Insert Picture" prompt
+  // background doesn't leak through.
+  const slidePhKeys = collectSlidePlaceholderKeys(spTree);
+  const masterUnderlay = masterXml
+    ? await parseUnderlay(
+        masterXml["p:sldMaster"]?.["p:cSld"]?.["p:spTree"],
+        ctx,
+        masterPath!,
+        masterRels,
+        slidePhKeys
+      )
+    : [];
+  const layoutUnderlay = layoutXml
+    ? await parseUnderlay(
+        layoutXml["p:sldLayout"]?.["p:cSld"]?.["p:spTree"],
+        ctx,
+        layoutPath!,
+        layoutRels,
+        slidePhKeys
+      )
+    : [];
   const elements: SlideElement[] = [];
 
+  let z = 1;
+  for (const el of masterUnderlay) elements.push({ ...el, z: z++ });
+  for (const el of layoutUnderlay) elements.push({ ...el, z: z++ });
   if (spTree) {
     const collected = await parseSpTree(spTree, ctx, identityTransform());
-    let z = 1;
     for (const el of collected) {
       elements.push({ ...el, z: z++ });
     }
@@ -276,6 +327,146 @@ async function parseSlide(
     id: nanoid(8),
     background,
     elements,
+  };
+}
+
+/**
+ * Walk a layout or master spTree and return elements to render behind the
+ * slide: non-placeholder shapes/pics (the brand bars, gradient bands, corner
+ * logos) and any explicit fill on placeholder-bearing shapes (the tinted
+ * boxes some templates host on layout placeholders). Hidden shapes are
+ * skipped. Placeholder text/positions remain handled by the existing
+ * inheritance path so we don't duplicate them.
+ */
+async function parseUnderlay(
+  spTree: any,
+  ctx: ParseContext,
+  ownerPath: string,
+  ownerRels: Rels,
+  slidePhKeys: Set<string>
+): Promise<SlideElement[]> {
+  if (!spTree) return [];
+  const underlayCtx: ParseContext = {
+    ...ctx,
+    slidePath: ownerPath,
+    slideRels: ownerRels,
+  };
+  return walkUnderlay(spTree, underlayCtx, identityTransform(), slidePhKeys);
+}
+
+async function walkUnderlay(
+  spTree: any,
+  ctx: ParseContext,
+  outer: GroupTransform,
+  slidePhKeys: Set<string>
+): Promise<SlideElement[]> {
+  const out: SlideElement[] = [];
+  for (const sp of asArray(spTree["p:sp"])) {
+    if (isHiddenNode(sp, "p:nvSpPr")) continue;
+    const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
+    if (ph) {
+      // Picture placeholders are "Insert Picture" prompts in PowerPoint; when
+      // the slide supplies an actual image, the prompt panel must hide.
+      const isPicPrompt = ph["@_type"] === "pic";
+      if (isPicPrompt && slidePhKeys.has(placeholderKey(ph))) continue;
+      // For other placeholders (tinted body boxes, numbered chips, etc.) the
+      // slide owns the text but the layout owns the fill — emit a fill-only
+      // backing rect behind it.
+      const filler = await placeholderFillUnderlay(sp, ctx, outer);
+      if (filler) out.push(filler);
+      continue;
+    }
+    const el = await parseSpOrText(sp, ctx, outer, { underlay: true });
+    if (el) out.push(el);
+  }
+  for (const pic of asArray(spTree["p:pic"])) {
+    if (isHiddenNode(pic, "p:nvPicPr")) continue;
+    const ph = pic?.["p:nvPicPr"]?.["p:nvPr"]?.["p:ph"];
+    if (ph && slidePhKeys.has(placeholderKey(ph))) continue;
+    const el = await parsePic(pic, ctx, outer);
+    if (el) out.push(el);
+  }
+  for (const cxn of asArray(spTree["p:cxnSp"])) {
+    const el = parseCxn(cxn, ctx, outer);
+    if (el) out.push(el);
+  }
+  for (const grp of asArray(spTree["p:grpSp"])) {
+    const inner = composeGroupTransform(grp, outer);
+    out.push(...(await walkUnderlay(grp, ctx, inner, slidePhKeys)));
+  }
+  return out;
+}
+
+function collectSlidePlaceholderKeys(spTree: any): Set<string> {
+  const keys = new Set<string>();
+  if (!spTree) return keys;
+  const visit = (tree: any) => {
+    if (!tree) return;
+    for (const sp of asArray(tree["p:sp"])) {
+      const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
+      if (ph) keys.add(placeholderKey(ph));
+    }
+    for (const pic of asArray(tree["p:pic"])) {
+      const ph = pic?.["p:nvPicPr"]?.["p:nvPr"]?.["p:ph"];
+      if (ph) keys.add(placeholderKey(ph));
+    }
+    for (const grp of asArray(tree["p:grpSp"])) visit(grp);
+  };
+  visit(spTree);
+  return keys;
+}
+
+function isHiddenNode(node: any, nvKey: "p:nvSpPr" | "p:nvPicPr"): boolean {
+  const cNvPr = node?.[nvKey]?.["p:cNvPr"];
+  return cNvPr?.["@_hidden"] === "1" || cNvPr?.["@_hidden"] === 1;
+}
+
+/**
+ * Resolve a shape's <p:style><a:fillRef idx="N">...<a:schemeClr/></a:fillRef>
+ * against the theme's fillStyleLst. idx=0 = noFill; 1+ indexes the fillStyleLst
+ * children; 1001+ indexes bgFillStyleLst (rarely used here). The colour child
+ * inside fillRef plays the role of phClr in the theme fill template.
+ */
+function resolveStyleFillRef(sp: any, ctx: ParseContext): string | undefined {
+  const fillRef = sp?.["p:style"]?.["a:fillRef"];
+  if (!fillRef) return undefined;
+  const idx = Number(fillRef["@_idx"]);
+  if (!Number.isFinite(idx) || idx === 0) return undefined;
+  const list = idx >= 1000 ? ctx.themeFills.bg : ctx.themeFills.fg;
+  const entry = list[(idx >= 1000 ? idx - 1001 : idx - 1)];
+  if (!entry) return undefined;
+  const phColor = readBaseHex(fillRef, ctx.theme);
+  if (entry.kind === "solidFill") {
+    return resolveColor(substitutePhClr(entry.node, phColor), ctx.theme);
+  }
+  if (entry.kind === "gradFill") {
+    return extractShapeFill(
+      { "a:gradFill": substitutePhClr(entry.node, phColor) },
+      ctx.theme
+    );
+  }
+  if (entry.kind === "noFill") return "transparent";
+  return undefined;
+}
+
+async function placeholderFillUnderlay(
+  sp: any,
+  ctx: ParseContext,
+  outer: GroupTransform = identityTransform()
+): Promise<ShapeElement | null> {
+  const spPr = sp?.["p:spPr"];
+  if (!spPr) return null;
+  const fill = extractShapeFill(spPr, ctx.theme);
+  if (!fill || fill === "transparent") return null;
+  const geom = readGeometry(spPr["a:xfrm"], ctx.fit, outer);
+  if (!geom) return null;
+  return {
+    id: nanoid(8),
+    type: "shape",
+    ...geom,
+    z: 0,
+    shape: "rect",
+    fill,
   };
 }
 
@@ -367,7 +558,8 @@ function composeGroupTransform(grp: any, outer: GroupTransform): GroupTransform 
 async function parseSpOrText(
   sp: any,
   ctx: ParseContext,
-  outer: GroupTransform
+  outer: GroupTransform,
+  opts: { underlay?: boolean } = {}
 ): Promise<SlideElement | null> {
   const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
   const phKey = ph ? placeholderKey(ph) : null;
@@ -401,10 +593,14 @@ async function parseSpOrText(
   const phType = ph?.["@_type"];
   const isPlaceholderTextHost = !!ph && phType !== "pic";
   const hasText = !!txBody && hasAnyText(txBody);
-  const isText =
-    hasText ||
-    (isPlaceholderTextHost && !presetName) ||
-    (!!txBody && (!presetName || presetName === "rect"));
+  // Underlay shapes come from layout/master decoration; the slide's own
+  // placeholder will host the text, so don't promote an empty txBody to a
+  // text element (that would drop the shape's fill).
+  const isText = opts.underlay
+    ? hasText
+    : hasText ||
+      (isPlaceholderTextHost && !presetName) ||
+      (!!txBody && (!presetName || presetName === "rect"));
 
   if (isText) {
     return makeTextElement(sp, txBody, geom, ctx, ph, layoutPh, masterPh);
@@ -412,7 +608,10 @@ async function parseSpOrText(
 
   // Fill / stroke. Use placeholder-inherited spPr if slide spPr is empty.
   const spPr = sp?.["p:spPr"];
-  const fillColor = extractShapeFill(spPr, ctx.theme) ?? "transparent";
+  const fillColor =
+    extractShapeFill(spPr, ctx.theme)
+    ?? resolveStyleFillRef(sp, ctx)
+    ?? "transparent";
   const lineProps = spPr?.["a:ln"];
   const lineHasNoFill = lineProps?.["a:noFill"] !== undefined;
   const stroke = lineHasNoFill
@@ -601,10 +800,25 @@ async function parsePic(
   outer: GroupTransform
 ): Promise<SlideElement | null> {
   const xfrm = pic?.["p:spPr"]?.["a:xfrm"];
-  const geom = readGeometry(xfrm, ctx.fit, outer);
+  // Picture placeholders (<p:ph type="pic">) often omit xfrm — inherit
+  // geometry from the layout/master placeholder of the same key.
+  const ph = pic?.["p:nvPicPr"]?.["p:nvPr"]?.["p:ph"];
+  const layoutPh = ph ? lookupPlaceholder(ctx.layoutPh, ph) : undefined;
+  const masterPh = ph ? lookupPlaceholder(ctx.masterPh, ph) : undefined;
+  const geom =
+    readGeometry(xfrm, ctx.fit, outer)
+    ?? placeholderGeometry(layoutPh, ctx.fit, outer)
+    ?? placeholderGeometry(masterPh, ctx.fit, outer);
   if (!geom) return toUnknown(pic, "p:pic", ctx, outer);
 
-  const blipRef = pic?.["p:blipFill"]?.["a:blip"]?.["@_r:embed"];
+  // Modern PPTX embeds SVGs via a dual-blip: <a:blip r:embed="rId_png">…
+  //   <a:extLst><a:ext uri="…"><asvg:svgBlip r:embed="rId_svg"/></a:ext></a:extLst>
+  // </a:blip>. The outer embed is the raster fallback; prefer the SVG when
+  // present so vector logos stay sharp.
+  const blip = pic?.["p:blipFill"]?.["a:blip"];
+  const svgRef = findSvgBlipRef(blip);
+  const rasterRef = blip?.["@_r:embed"];
+  const blipRef = svgRef ?? rasterRef;
   if (!blipRef) return toUnknown(pic, "p:pic", ctx, outer);
 
   const mediaPath = ctx.slideRels.byId.get(blipRef)?.target;
@@ -644,6 +858,21 @@ async function parsePic(
     ...(hasCrop ? { crop } : {}),
   };
   return image;
+}
+
+/**
+ * Pull the SVG blip rId from a:blip/a:extLst/a:ext/asvg:svgBlip if present.
+ * Returns undefined when the picture is raster-only.
+ */
+function findSvgBlipRef(blip: any): string | undefined {
+  if (!blip) return undefined;
+  const exts = asArray(blip?.["a:extLst"]?.["a:ext"]);
+  for (const ext of exts) {
+    const svg = ext?.["asvg:svgBlip"];
+    const ref = svg?.["@_r:embed"];
+    if (ref) return ref;
+  }
+  return undefined;
 }
 
 function parseCxn(
@@ -1159,11 +1388,149 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
   return undefined;
 }
 
-function extractBackgroundColor(bg: any, theme: ThemeColors): string | undefined {
-  return (
-    resolveColor(bg?.["p:bgPr"]?.["a:solidFill"], theme) ??
-    (bg?.["p:bgPr"]?.["a:noFill"] !== undefined ? "transparent" : undefined)
-  );
+function extractBackground(bg: any, ctx: ParseContext): string | undefined {
+  if (!bg) return undefined;
+  const bgPr = bg["p:bgPr"];
+  if (bgPr) {
+    if (bgPr["a:noFill"] !== undefined) return "transparent";
+    const solid = resolveColor(bgPr["a:solidFill"], ctx.theme);
+    if (solid) return solid;
+    const grad = extractShapeFill({ "a:gradFill": bgPr["a:gradFill"] }, ctx.theme);
+    if (grad) return grad;
+    // blipFill bg → render as the embedded image via CSS background. Falls
+    // through to undefined for now; tracked for a follow-up.
+  }
+  const bgRef = bg["p:bgRef"];
+  if (bgRef) return resolveBgRef(bgRef, ctx);
+  return undefined;
+}
+
+/**
+ * Resolve <p:bgRef idx="..."> against the theme fill lists. idx 1001..1003
+ * indexes a:bgFillStyleLst; idx 1+ indexes a:fillStyleLst (rarely used for
+ * backgrounds). The <p:bgRef> also carries a color child (e.g. schemeClr) that
+ * fills in any <a:schemeClr val="phClr"> placeholders inside the theme fill.
+ */
+function resolveBgRef(bgRef: any, ctx: ParseContext): string | undefined {
+  const rawIdx = bgRef?.["@_idx"];
+  if (rawIdx === undefined) return undefined;
+  const idx = Number(rawIdx);
+  if (!Number.isFinite(idx)) return undefined;
+  const list = idx >= 1000 ? ctx.themeFills.bg : ctx.themeFills.fg;
+  const entry = list[(idx >= 1000 ? idx - 1001 : idx - 1)];
+  if (!entry) return undefined;
+  const phColor = readBaseHex(bgRef, ctx.theme);
+  if (entry.kind === "solidFill") {
+    const node = substitutePhClr(entry.node, phColor);
+    return resolveColor(node, ctx.theme);
+  }
+  if (entry.kind === "gradFill") {
+    const node = substitutePhClr(entry.node, phColor);
+    return extractShapeFill({ "a:gradFill": node }, ctx.theme);
+  }
+  // blipFill / pattFill / noFill — not modelled as a slide background yet.
+  if (entry.kind === "noFill") return "transparent";
+  return undefined;
+}
+
+/**
+ * Replace <a:schemeClr val="phClr"> placeholders inside a theme fill template
+ * with the caller's actual color, so the modifier chain (lumMod, shade, etc.)
+ * still applies. Returns a shallow-cloned tree.
+ */
+function substitutePhClr(node: any, phHex: string | undefined): any {
+  if (!phHex) return node;
+  const replacement = phHex.startsWith("#") ? phHex.slice(1) : phHex;
+  const walk = (n: any): any => {
+    if (n == null || typeof n !== "object") return n;
+    if (Array.isArray(n)) return n.map(walk);
+    const out: any = {};
+    for (const k of Object.keys(n)) {
+      if (k === "a:schemeClr" && n[k]?.["@_val"] === "phClr") {
+        const mods: any = { ...n[k] };
+        delete mods["@_val"];
+        out["a:srgbClr"] = { ...mods, "@_val": replacement };
+      } else {
+        out[k] = walk(n[k]);
+      }
+    }
+    return out;
+  };
+  return walk(node);
+}
+
+function extractThemeFills(themeXml: any, themeRaw: string): ThemeFills {
+  const fmt = themeXml?.["a:theme"]?.["a:themeElements"]?.["a:fmtScheme"];
+  if (!fmt) return { bg: [], fg: [] };
+  const build = (blockTag: string, parsed: any): ThemeFill[] => {
+    const kinds = extractDirectChildOrder(themeRaw, blockTag);
+    if (!kinds.length || !parsed) return [];
+    const buckets: Record<string, any[]> = {};
+    for (const kind of new Set(kinds)) {
+      buckets[kind] = asArray(parsed[`a:${kind}`]).slice();
+    }
+    const out: ThemeFill[] = [];
+    for (const kind of kinds) {
+      const node = buckets[kind]?.shift();
+      if (node !== undefined) out.push({ kind: kind as ThemeFill["kind"], node });
+    }
+    return out;
+  };
+  return {
+    bg: build("bgFillStyleLst", fmt["a:bgFillStyleLst"]),
+    fg: build("fillStyleLst", fmt["a:fillStyleLst"]),
+  };
+}
+
+/**
+ * Returns the local tag names of direct children of the first <a:{blockTag}>
+ * in document order. Used to recover the cross-tag-type order that
+ * fast-xml-parser drops when it groups by element name.
+ */
+function extractDirectChildOrder(rawXml: string, blockTag: string): string[] {
+  const openRe = new RegExp(`<a:${blockTag}\\b[^>]*>`);
+  const close = `</a:${blockTag}>`;
+  const m = openRe.exec(rawXml);
+  if (!m) return [];
+  const start = m.index + m[0].length;
+  const end = rawXml.indexOf(close, start);
+  if (end < 0) return [];
+  const inner = rawXml.slice(start, end);
+  const tags: string[] = [];
+  let depth = 0;
+  let i = 0;
+  while (i < inner.length) {
+    if (inner[i] !== "<") {
+      i++;
+      continue;
+    }
+    if (inner.startsWith("<!--", i)) {
+      const j = inner.indexOf("-->", i);
+      if (j < 0) break;
+      i = j + 3;
+      continue;
+    }
+    if (inner.startsWith("<?", i)) {
+      const j = inner.indexOf("?>", i);
+      if (j < 0) break;
+      i = j + 2;
+      continue;
+    }
+    const closeBracket = inner.indexOf(">", i);
+    if (closeBracket < 0) break;
+    const tag = inner.slice(i, closeBracket + 1);
+    if (tag.startsWith("</")) {
+      depth--;
+      i = closeBracket + 1;
+      continue;
+    }
+    const isSelfClose = tag.endsWith("/>");
+    const nameMatch = /^<a:([\w]+)/.exec(tag);
+    if (depth === 0 && nameMatch) tags.push(nameMatch[1]);
+    if (!isSelfClose) depth++;
+    i = closeBracket + 1;
+  }
+  return tags;
 }
 
 function readBodyVAlign(bodyPr: any): "top" | "middle" | "bottom" | undefined {
@@ -1437,6 +1804,12 @@ async function readXml(zip: JSZip, path: string): Promise<any | null> {
   if (!file) return null;
   const text = await file.async("string");
   return xmlParser.parse(text);
+}
+
+async function readXmlRaw(zip: JSZip, path: string): Promise<string | null> {
+  const file = zip.file(path);
+  if (!file) return null;
+  return file.async("string");
 }
 
 async function readRels(zip: JSZip, path: string): Promise<Rels> {
