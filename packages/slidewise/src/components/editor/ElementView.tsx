@@ -65,12 +65,12 @@ function TextView({
         : el.vAlign === "middle"
           ? "center"
           : "flex-end",
+    background: el.background,
     cursor: editing ? "text" : "inherit",
   };
   const inner: React.CSSProperties = {
     width: "100%",
     color: el.color,
-    background: el.background,
     fontFamily: withGenericFallback(el.fontFamily),
     fontSize: el.fontSize,
     fontWeight: el.fontWeight,
