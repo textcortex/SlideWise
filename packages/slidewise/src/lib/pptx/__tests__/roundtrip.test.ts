@@ -237,4 +237,87 @@ describe("pptx round-trip", () => {
     expect(colors).toContain("#FFFFFF");
     expect(colors).toContain("#0F1B3D");
   });
+
+  it("preserves UnknownElement OOXML and its rels across a round-trip", async () => {
+    // Build a deck with a single hand-crafted UnknownElement carrying a raw
+    // OOXML fragment that references rId7. parsePptx then attaches a fake
+    // source archive providing that rId; serializeDeck has to renumber the
+    // rId, write the matching <Relationship>, and copy the referenced
+    // media into the output zip so the fragment resolves on re-parse.
+    const JSZip = (await import("jszip")).default;
+    const sourceZip = new JSZip();
+    sourceZip.file(
+      "[Content_Types].xml",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+</Types>`
+    );
+    sourceZip.file(
+      "_rels/.rels",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>`
+    );
+    sourceZip.file(
+      "ppt/_rels/presentation.xml.rels",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>`
+    );
+    sourceZip.file(
+      "ppt/presentation.xml",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>`
+    );
+    sourceZip.file(
+      "ppt/slides/slide1.xml",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:graphicFrame><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rId7"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>`
+    );
+    sourceZip.file(
+      "ppt/slides/_rels/slide1.xml.rels",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/preserved.png"/></Relationships>`
+    );
+    // Smallest valid PNG (1×1 transparent) so JSZip + serializer have real
+    // bytes to copy.
+    const onePxPng = Uint8Array.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+      0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+      0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+      0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+      0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ]);
+    sourceZip.file("ppt/media/preserved.png", onePxPng);
+
+    const sourceBuffer = await sourceZip.generateAsync({ type: "arraybuffer" });
+    const parsed = await parsePptx(sourceBuffer);
+    const unknowns = parsed.slides[0].elements.filter(
+      (e) => e.type === "unknown"
+    );
+    expect(unknowns.length).toBe(1);
+    expect((unknowns[0] as { ooxmlXml: string }).ooxmlXml).toContain(
+      "diagram"
+    );
+    expect((unknowns[0] as { ooxmlXml: string }).ooxmlXml).toMatch(
+      /r:dm="rId7"/
+    );
+
+    const blob = await serializeDeck(parsed);
+    const out = await blob.arrayBuffer();
+    const reZip = await JSZip.loadAsync(out);
+    // The preserved diagram fragment landed in the generated slide1 xml.
+    const slide1 = await reZip.file("ppt/slides/slide1.xml")?.async("string");
+    expect(slide1).toContain("dgm:relIds");
+    // The original rId7 was renumbered; the slide rels now expose the new
+    // rId pointing at a preserved-prefixed media path.
+    const slide1Rels = await reZip
+      .file("ppt/slides/_rels/slide1.xml.rels")
+      ?.async("string");
+    expect(slide1Rels).toMatch(/slidewise_preserved_\d+_preserved\.png/);
+    // The actual PNG bytes were copied into the output archive.
+    const preservedFiles = Object.keys(reZip.files).filter((p) =>
+      /slidewise_preserved_\d+_preserved\.png$/.test(p)
+    );
+    expect(preservedFiles.length).toBe(1);
+  });
 });

@@ -1,4 +1,5 @@
 import pptxgen from "pptxgenjs";
+import JSZip from "jszip";
 import type {
   Deck,
   Slide,
@@ -11,15 +12,25 @@ import type {
   TableElement,
   IconElement,
   EmbedElement,
+  UnknownElement,
 } from "@/lib/types";
 import { pxToInches, pxToPoints } from "./units";
+import { SOURCE_PPTX, SOURCE_SLIDE_PATH } from "./pptxToDeck";
 
 /**
- * Serialize a Slidewise Deck to a real PPTX blob. Round-trips well for the
- * element types Slidewise natively supports (text, shape, image, line,
- * table, icon, embed). UnknownElement and entrance animations are dropped
- * with a warning — proper preservation requires bypassing pptxgenjs and
- * is out of scope for v1.
+ * Serialize a Slidewise Deck to a real PPTX blob.
+ *
+ * Native element types (text, shape, image, line, table, icon, embed)
+ * are written through pptxgenjs. UnknownElement (charts, SmartArt,
+ * group shapes, OLE, math, anything else the importer couldn't model)
+ * is preserved verbatim: we keep the original PPTX bytes on the Deck
+ * during parse, and after pptxgenjs finishes, we post-process the
+ * generated zip to inject the preserved OOXML — plus any media those
+ * fragments referenced — into the matching slides. The fragments
+ * inside an UnknownElement keep their original rIds; we copy the
+ * corresponding rels entries (and media payloads) from the source
+ * zip, renumbering rIds as needed to avoid clashes with what
+ * pptxgenjs already wrote.
  */
 export async function serializeDeck(deck: Deck): Promise<Blob> {
   const pptx = new pptxgen();
@@ -30,9 +41,12 @@ export async function serializeDeck(deck: Deck): Promise<Blob> {
     addSlide(pptx, slide);
   }
 
-  // pptxgenjs returns the requested type; outputType: "blob" → Blob.
-  const result = (await pptx.write({ outputType: "blob" })) as Blob;
-  return result;
+  // Use arraybuffer (universal: works in Node + browser, accepted by JSZip
+  // directly) and wrap to Blob only when we're done post-processing.
+  const generated = (await pptx.write({
+    outputType: "arraybuffer",
+  })) as ArrayBuffer;
+  return preserveUnknowns(generated, deck);
 }
 
 function addSlide(pptx: pptxgen, slide: Slide): void {
@@ -76,9 +90,9 @@ function addElement(s: pptxgen.Slide, el: SlideElement): void {
       addEmbed(s, el);
       return;
     case "unknown":
-      // Lossy: pptxgenjs has no public API for raw OOXML injection.
-      // Future work: post-process the generated zip to re-inject UnknownElement
-      // XML into the appropriate slide files for true round-trip.
+      // Preserved by preserveUnknowns() after pptxgenjs writes the zip.
+      // The post-process step injects el.ooxmlXml into the matching
+      // slide's <p:spTree> and copies any media the fragment referenced.
       return;
   }
 }
@@ -269,6 +283,261 @@ function addEmbed(s: pptxgen.Slide, el: EmbedElement): void {
     }
   );
 }
+
+// -- UnknownElement preservation -------------------------------------------
+
+/**
+ * Post-process the zip pptxgenjs produced: for every slide that carries
+ * UnknownElement payloads, inject the preserved OOXML back into the
+ * generated `<p:spTree>` and pull along the rels + media those fragments
+ * referenced from the original archive.
+ *
+ * No-ops cleanly when the deck has no UnknownElements, when no source
+ * zip is attached (deck wasn't created via parsePptx), or when a slide
+ * the editor added doesn't have a source path.
+ */
+async function preserveUnknowns(
+  generated: ArrayBuffer,
+  deck: Deck
+): Promise<Blob> {
+  const wrapBlob = () => new Blob([generated], { type: PPTX_MIME });
+  const unknownsBySlide = collectUnknowns(deck);
+  if (!unknownsBySlide.size) return wrapBlob();
+  const sourceBuffer = (deck as unknown as Record<string, unknown>)[SOURCE_PPTX];
+  if (!(sourceBuffer instanceof ArrayBuffer)) return wrapBlob();
+
+  const [outZip, srcZip] = await Promise.all([
+    JSZip.loadAsync(generated),
+    JSZip.loadAsync(sourceBuffer),
+  ]);
+
+  for (const [slideIndex, group] of unknownsBySlide) {
+    const generatedSlidePath = `ppt/slides/slide${slideIndex + 1}.xml`;
+    const generatedRelsPath = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
+    if (!outZip.file(generatedSlidePath)) continue;
+    if (!group.sourcePath) continue;
+    const sourceRelsPath = relsPathFor(group.sourcePath);
+
+    await injectUnknownsIntoSlide(
+      outZip,
+      srcZip,
+      generatedSlidePath,
+      generatedRelsPath,
+      sourceRelsPath,
+      group.unknowns
+    );
+  }
+
+  // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
+  return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+}
+
+interface UnknownGroup {
+  unknowns: UnknownElement[];
+  sourcePath: string | undefined;
+}
+
+function collectUnknowns(deck: Deck): Map<number, UnknownGroup> {
+  const out = new Map<number, UnknownGroup>();
+  for (let i = 0; i < deck.slides.length; i++) {
+    const slide = deck.slides[i];
+    const unknowns = slide.elements.filter(
+      (e): e is UnknownElement => e.type === "unknown" && !!e.ooxmlXml
+    );
+    if (!unknowns.length) continue;
+    const sourcePath = (slide as unknown as Record<string, unknown>)[
+      SOURCE_SLIDE_PATH
+    ];
+    out.set(i, {
+      unknowns,
+      sourcePath: typeof sourcePath === "string" ? sourcePath : undefined,
+    });
+  }
+  return out;
+}
+
+/**
+ * For one slide: rewrite the preserved fragments so their rIds don't
+ * collide with whatever pptxgenjs already allocated, copy the
+ * referenced rels + media from the source zip, and splice the
+ * fragments in before the closing `</p:spTree>`.
+ */
+async function injectUnknownsIntoSlide(
+  outZip: JSZip,
+  srcZip: JSZip,
+  generatedSlidePath: string,
+  generatedRelsPath: string,
+  sourceRelsPath: string,
+  unknowns: UnknownElement[]
+): Promise<void> {
+  const slideXml = await outZip.file(generatedSlidePath)!.async("string");
+  const closeIdx = slideXml.lastIndexOf("</p:spTree>");
+  if (closeIdx < 0) return;
+
+  const srcRelsXml = (await srcZip.file(sourceRelsPath)?.async("string")) ?? null;
+  const outRelsXml =
+    (await outZip.file(generatedRelsPath)?.async("string")) ??
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+
+  const srcRels = parseRels(srcRelsXml);
+  const outRels = parseRels(outRelsXml);
+  let nextRid = highestRid(outRels) + 1;
+  const newRelLines: string[] = [];
+  const ridMap = new Map<string, string>();
+  // Source slide's directory (used to resolve relative rel targets like
+  // "../media/imageN.png" against the source archive).
+  const sourceSlidePath = sourceRelsPath.replace(/_rels\/([^/]+)\.rels$/, "$1");
+  const sourceDir = dirOf(sourceSlidePath);
+  const outDir = dirOf(generatedSlidePath);
+  const rewritten: string[] = [];
+
+  for (const u of unknowns) {
+    // Every r:id / r:embed / r:link inside the preserved fragment refers
+    // to a relationship in the SOURCE slide's rels. Renumber to fresh
+    // rIds, copy the matching source rel into the generated rels, and
+    // copy the media payload into the generated zip (at a fresh path so
+    // pptxgenjs-allocated media doesn't clash with the preserved media).
+    // Match every `r:*="rIdN"` attribute. The relationship-namespaced
+    // attribute names depend on the schema: `r:id` / `r:embed` / `r:link`
+    // for slides + drawings, but charts use `r:id`, SmartArt uses `r:dm`
+    // (data model) / `r:cs` (colors) / `r:qs` (quick styles) / `r:lo`
+    // (layout), and embedded objects use `r:id`/`r:image`. Restricting to
+    // the value pattern `rId\d+` keeps unrelated `r:*` attributes
+    // untouched.
+    const xml = u.ooxmlXml.replace(
+      /\b(r:[a-zA-Z]+)="(rId\d+)"/g,
+      (_match, attr, srcRid) => {
+        const cached = ridMap.get(srcRid);
+        if (cached) return `${attr}="${cached}"`;
+        const srcRel = srcRels.get(srcRid);
+        if (!srcRel) return `${attr}="${srcRid}"`;
+
+        const newRid = `rId${nextRid++}`;
+        ridMap.set(srcRid, newRid);
+
+        let target = srcRel.target;
+        const isExternal = /^https?:\/\//i.test(target);
+        const isInternalPart = !isExternal && !target.startsWith("/");
+        if (isInternalPart) {
+          const srcFullTarget = normalisePath(target, sourceDir);
+          const srcFile = srcZip.file(srcFullTarget);
+          if (srcFile) {
+            // Always copy to a uniquely-prefixed path so we never collide
+            // with media pptxgenjs already wrote.
+            const newTarget = uniqueTarget(target, outZip, outDir);
+            const newFullTarget = normalisePath(newTarget, outDir);
+            outZip.file(newFullTarget, srcFile.async("uint8array"), {
+              binary: true,
+            });
+            target = newTarget;
+          }
+        }
+
+        newRelLines.push(buildRelXml(newRid, srcRel.type, target));
+        return `${attr}="${newRid}"`;
+      }
+    );
+    rewritten.push(xml);
+  }
+
+  if (rewritten.length) {
+    const inject = rewritten.join("");
+    const updatedSlide = slideXml.slice(0, closeIdx) + inject + slideXml.slice(closeIdx);
+    outZip.file(generatedSlidePath, updatedSlide);
+  }
+
+  if (newRelLines.length) {
+    const insertAt = outRelsXml.lastIndexOf("</Relationships>");
+    const updatedRels =
+      insertAt >= 0
+        ? outRelsXml.slice(0, insertAt) +
+          newRelLines.join("") +
+          outRelsXml.slice(insertAt)
+        : outRelsXml.replace(
+            /<Relationships[^>]*>/,
+            (m) => `${m}${newRelLines.join("")}`
+          );
+    outZip.file(generatedRelsPath, updatedRels);
+  }
+}
+
+function parseRels(xml: string | null): Map<string, { type: string; target: string }> {
+  const map = new Map<string, { type: string; target: string }>();
+  if (!xml) return map;
+  // Match each <Relationship .../> tag. Use a non-greedy scan up to the
+  // self-closing `/>` rather than a `[^/]` class — relationship targets
+  // routinely contain `/` (e.g. `Target="../charts/chart1.xml"`).
+  const re = /<Relationship\b([\s\S]*?)\/>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml))) {
+    const attrs = m[1];
+    const id = /\bId="([^"]+)"/.exec(attrs)?.[1];
+    const type = /\bType="([^"]+)"/.exec(attrs)?.[1];
+    const target = /\bTarget="([^"]+)"/.exec(attrs)?.[1];
+    if (id && type && target) map.set(id, { type, target });
+  }
+  return map;
+}
+
+function highestRid(rels: Map<string, unknown>): number {
+  let max = 0;
+  for (const id of rels.keys()) {
+    const m = /^rId(\d+)$/.exec(id);
+    if (m) {
+      const n = Number(m[1]);
+      if (n > max) max = n;
+    }
+  }
+  return max;
+}
+
+function buildRelXml(id: string, type: string, target: string): string {
+  return `<Relationship Id="${id}" Type="${type}" Target="${target}"/>`;
+}
+
+function relsPathFor(xmlPath: string): string {
+  return xmlPath.replace(/([^/]+)\.xml$/, "_rels/$1.xml.rels");
+}
+
+/**
+ * Pick a target path that doesn't collide with anything pptxgenjs already
+ * wrote into the zip. We keep the original target's directory and
+ * extension so the file stays in `ppt/media/`, `ppt/charts/`, etc., but
+ * prefix the basename with `slidewise_preserved_N_` until the resolved
+ * full path is unique.
+ */
+function uniqueTarget(originalTarget: string, outZip: JSZip, baseDir: string): string {
+  const slash = originalTarget.lastIndexOf("/");
+  const dir = slash >= 0 ? originalTarget.slice(0, slash + 1) : "";
+  const file = slash >= 0 ? originalTarget.slice(slash + 1) : originalTarget;
+  let i = 0;
+  let candidate = `${dir}slidewise_preserved_${i}_${file}`;
+  while (outZip.file(normalisePath(candidate, baseDir))) {
+    i++;
+    candidate = `${dir}slidewise_preserved_${i}_${file}`;
+  }
+  return candidate;
+}
+
+function dirOf(path: string): string {
+  const i = path.lastIndexOf("/");
+  return i >= 0 ? path.slice(0, i) : "";
+}
+
+function normalisePath(target: string, base: string): string {
+  if (/^https?:\/\//i.test(target)) return target;
+  if (target.startsWith("/")) return target.slice(1);
+  let t = target;
+  const segments = base.split("/").filter(Boolean);
+  while (t.startsWith("../")) {
+    segments.pop();
+    t = t.slice(3);
+  }
+  return [...segments, t].filter(Boolean).join("/");
+}
+
+const PPTX_MIME =
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
 // -- helpers ----------------------------------------------------------------
 
