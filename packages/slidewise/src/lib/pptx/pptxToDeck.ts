@@ -49,6 +49,13 @@ interface ThemeColors {
   accent6: string;
   hlink: string;
   folHlink: string;
+  // bg1/bg2/tx1/tx2 are *token* names rather than colour scheme entries —
+  // their resolved hexes come from the master's <p:clrMap>. Slidewise bakes
+  // those into the theme so resolveSchemeToken stays a flat lookup.
+  bg1: string;
+  bg2: string;
+  tx1: string;
+  tx2: string;
 }
 
 interface PlaceholderInfo {
@@ -80,6 +87,7 @@ interface ParseContext {
   fit: Fit;
   theme: ThemeColors;
   themeFills: ThemeFills;
+  themeFonts: ThemeFonts;
   layoutPh: Map<string, PlaceholderInfo>;
   masterPh: Map<string, PlaceholderInfo>;
   masterTextDefaults: MasterTextDefaults;
@@ -100,6 +108,27 @@ interface ThemeFills {
   bg: ThemeFill[];
   fg: ThemeFill[];
 }
+
+interface ThemeFonts {
+  /** Major (heading) Latin typeface — referenced via `+mj-lt`. */
+  majorLatin?: string;
+  /** Minor (body) Latin typeface — referenced via `+mn-lt`. */
+  minorLatin?: string;
+}
+
+/**
+ * Maps generic colour tokens used by slides (`bg1`, `tx1`, `bg2`, `tx2`) onto
+ * actual theme entries (`lt1`, `dk1`, …). Defined on the slide master via
+ * `<p:clrMap>`; individual slides may override via `<p:clrMapOvr>`.
+ */
+interface ClrMap {
+  bg1: keyof ThemeColors;
+  bg2: keyof ThemeColors;
+  tx1: keyof ThemeColors;
+  tx2: keyof ThemeColors;
+}
+
+const DEFAULT_CLR_MAP: ClrMap = { bg1: "lt1", bg2: "lt2", tx1: "dk1", tx2: "dk2" };
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -127,6 +156,7 @@ const ARRAY_TAGS = new Set([
   "p:grpSp",
   "a:p",
   "a:r",
+  "a:br",
   "a:tr",
   "a:tc",
   "Relationship",
@@ -145,6 +175,11 @@ const DEFAULT_THEME: ThemeColors = {
   accent6: "#F79646",
   hlink: "#0000FF",
   folHlink: "#800080",
+  // Default clrMap (bg1→lt1, tx1→dk1, …).
+  bg1: "#FFFFFF",
+  bg2: "#EEECE1",
+  tx1: "#000000",
+  tx2: "#1F497D",
 };
 
 /**
@@ -242,11 +277,28 @@ async function parseSlide(
       : null;
   const themeXml = themePath ? await readXml(zip, themePath) : null;
   const themeRaw = themePath ? await readXmlRaw(zip, themePath) : null;
-  const theme = themeXml ? extractTheme(themeXml) : DEFAULT_THEME;
+  const baseTheme = themeXml ? extractTheme(themeXml) : DEFAULT_THEME;
   const themeFills =
     themeXml && themeRaw
       ? extractThemeFills(themeXml, themeRaw)
       : { bg: [], fg: [] };
+  const themeFonts = themeXml ? extractThemeFonts(themeXml) : {};
+  // <p:clrMap> lives on the master; <p:clrMapOvr><a:overrideClrMapping/> on
+  // the slide can override individual mappings. Slides commonly only declare
+  // <a:masterClrMapping/> which means "inherit the master's map verbatim".
+  const masterClrMap = masterXml
+    ? extractClrMap(masterXml?.["p:sldMaster"]?.["p:clrMap"])
+    : DEFAULT_CLR_MAP;
+  const clrMapOvr = xml["p:sld"]?.["p:clrMapOvr"]?.["a:overrideClrMapping"];
+  const clrMap = clrMapOvr ? extractClrMap(clrMapOvr) : masterClrMap;
+  // Bake the clrMap into the theme so bg1/bg2/tx1/tx2 stay flat lookups.
+  const theme: ThemeColors = {
+    ...baseTheme,
+    bg1: baseTheme[clrMap.bg1],
+    bg2: baseTheme[clrMap.bg2],
+    tx1: baseTheme[clrMap.tx1],
+    tx2: baseTheme[clrMap.tx2],
+  };
 
   const layoutPh = layoutXml ? extractPlaceholders(layoutXml) : new Map();
   const masterPh = masterXml ? extractPlaceholders(masterXml) : new Map();
@@ -262,6 +314,7 @@ async function parseSlide(
     fit,
     theme,
     themeFills,
+    themeFonts,
     layoutPh,
     masterPh,
     masterTextDefaults,
@@ -701,8 +754,11 @@ function makeTextElement(
         ? ctx.masterTextDefaults.body
         : ctx.masterTextDefaults.other;
 
-  // Accumulate inheritance: slide < layout < master < masterDefaults.
-  const fallbackRPr = mergeFirst(
+  // Accumulate inheritance: slide < layout < master < masterDefaults. Each
+  // level can specify just a subset of fields (the layout might set the
+  // typeface while only the master defines the colour), so merge field by
+  // field with earlier candidates winning.
+  const fallbackRPr = mergeRPrChain(
     layoutPh?.rPr,
     masterPh?.rPr,
     masterDef?.["a:defRPr"]
@@ -714,7 +770,13 @@ function makeTextElement(
   );
   const fallbackBodyPr = mergeFirst(layoutPh?.bodyPr, masterPh?.bodyPr);
 
-  const text = extractRuns(effectiveTxBody, ctx.theme, fallbackRPr, fallbackPPr);
+  const text = extractRuns(
+    effectiveTxBody,
+    ctx.theme,
+    fallbackRPr,
+    fallbackPPr,
+    ctx.themeFonts
+  );
   const first = text.runs[0];
   const align = text.align ?? readAlign(fallbackPPr) ?? "left";
   const valign =
@@ -728,7 +790,10 @@ function makeTextElement(
     : Math.round(defaultFontSizePx(phType, ctx) * scale);
   const fontFamily =
     first?.fontFamily ??
-    fallbackRPr?.["a:latin"]?.["@_typeface"] ??
+    resolveFontFamily(
+      fallbackRPr?.["a:latin"]?.["@_typeface"],
+      ctx.themeFonts
+    ) ??
     "Inter";
   const fontWeight = first?.bold ? 700 : 400;
   const color =
@@ -975,7 +1040,7 @@ function parseTable(
       }
       const txBody = tc["a:txBody"];
       const text = txBody
-        ? extractRuns(txBody, ctx.theme)
+        ? extractRuns(txBody, ctx.theme, undefined, undefined, ctx.themeFonts)
         : { plain: "", runs: [] as RunInfo[] };
       cells.push(text.plain);
 
@@ -1112,20 +1177,59 @@ function extractPlaceholders(rootXml: any): Map<string, PlaceholderInfo> {
     const paragraphs = asArray(txBody?.["a:p"]);
     const firstP = paragraphs[0];
     const firstR = asArray(firstP?.["a:r"])[0];
+    // Default run/paragraph properties live on the placeholder's
+    // <a:lstStyle><a:lvl1pPr> (font, size, colour, etc). A stub <a:r><a:rPr/>
+    // with just `lang` carries no real style — prefer the lstStyle defaults
+    // over an empty inline rPr so the layout's typography reaches the slide.
+    const lvl1 = txBody?.["a:lstStyle"]?.["a:lvl1pPr"];
+    const stubRPr = firstR?.["a:rPr"];
     const info: PlaceholderInfo = {
       rawX: off ? emuToPx(Number(off["@_x"] ?? 0)) : undefined,
       rawY: off ? emuToPx(Number(off["@_y"] ?? 0)) : undefined,
       rawW: ext ? emuToPx(Number(ext["@_cx"] ?? 0)) : undefined,
       rawH: ext ? emuToPx(Number(ext["@_cy"] ?? 0)) : undefined,
       rotation: xfrm?.["@_rot"] ? Number(xfrm["@_rot"]) / 60000 : 0,
-      rPr: firstR?.["a:rPr"] ?? firstP?.["a:pPr"]?.["a:defRPr"],
-      pPr: firstP?.["a:pPr"],
+      rPr: pickMeaningful(
+        stubRPr,
+        lvl1?.["a:defRPr"],
+        firstP?.["a:pPr"]?.["a:defRPr"]
+      ),
+      pPr: lvl1 ?? firstP?.["a:pPr"],
       bodyPr: txBody?.["a:bodyPr"],
       paragraphs: hasAnyText(txBody) ? paragraphs : undefined,
     };
     out.set(placeholderKey(ph), info);
   }
   return out;
+}
+
+/**
+ * Return the first candidate that carries actual style fields (font, size,
+ * colour, weight, italic, underline). An empty `<a:rPr lang="en-GB"/>` looks
+ * truthy but contributes nothing, so it shouldn't shadow a meaningful
+ * lstStyle/defRPr further down the chain.
+ */
+function pickMeaningful(...candidates: any[]): any {
+  for (const c of candidates) {
+    if (!c) continue;
+    if (rPrHasStyle(c)) return c;
+  }
+  // Fall back to the first defined value, even if otherwise empty, so we
+  // never regress callers that depend on truthiness.
+  return candidates.find((c) => c !== undefined && c !== null);
+}
+
+function rPrHasStyle(rPr: any): boolean {
+  if (!rPr || typeof rPr !== "object") return false;
+  return (
+    rPr["@_sz"] !== undefined ||
+    rPr["@_b"] !== undefined ||
+    rPr["@_i"] !== undefined ||
+    rPr["@_u"] !== undefined ||
+    rPr["@_spc"] !== undefined ||
+    rPr["a:latin"] !== undefined ||
+    rPr["a:solidFill"] !== undefined
+  );
 }
 
 function extractMasterTextDefaults(masterXml: any): MasterTextDefaults {
@@ -1141,6 +1245,66 @@ function extractMasterTextDefaults(masterXml: any): MasterTextDefaults {
 // ---------------------------------------------------------------------------
 // theme
 // ---------------------------------------------------------------------------
+
+function extractThemeFonts(themeXml: any): ThemeFonts {
+  const fs = themeXml?.["a:theme"]?.["a:themeElements"]?.["a:fontScheme"];
+  return {
+    majorLatin: fs?.["a:majorFont"]?.["a:latin"]?.["@_typeface"] || undefined,
+    minorLatin: fs?.["a:minorFont"]?.["a:latin"]?.["@_typeface"] || undefined,
+  };
+}
+
+function extractClrMap(node: any): ClrMap {
+  if (!node) return DEFAULT_CLR_MAP;
+  const pick = (attr: string, fallback: ClrMap[keyof ClrMap]) => {
+    const v = node[`@_${attr}`];
+    return isThemeKey(v) ? (v as ClrMap[keyof ClrMap]) : fallback;
+  };
+  return {
+    bg1: pick("bg1", DEFAULT_CLR_MAP.bg1),
+    bg2: pick("bg2", DEFAULT_CLR_MAP.bg2),
+    tx1: pick("tx1", DEFAULT_CLR_MAP.tx1),
+    tx2: pick("tx2", DEFAULT_CLR_MAP.tx2),
+  };
+}
+
+const THEME_KEYS = new Set([
+  "dk1",
+  "lt1",
+  "dk2",
+  "lt2",
+  "accent1",
+  "accent2",
+  "accent3",
+  "accent4",
+  "accent5",
+  "accent6",
+  "hlink",
+  "folHlink",
+]);
+
+function isThemeKey(v: unknown): v is keyof ThemeColors {
+  return typeof v === "string" && THEME_KEYS.has(v);
+}
+
+/**
+ * Resolve OOXML major/minor font tokens (`+mj-lt`, `+mn-lt`, …) against the
+ * theme's font scheme. Returns the original value when it isn't a token, and
+ * `undefined` when the token can't be resolved.
+ */
+function resolveFontFamily(
+  raw: string | undefined,
+  fonts: ThemeFonts
+): string | undefined {
+  if (!raw) return undefined;
+  if (raw === "+mj-lt" || raw === "+mj-ea" || raw === "+mj-cs") {
+    return fonts.majorLatin;
+  }
+  if (raw === "+mn-lt" || raw === "+mn-ea" || raw === "+mn-cs") {
+    return fonts.minorLatin;
+  }
+  return raw;
+}
 
 function extractTheme(themeXml: any): ThemeColors {
   const scheme =
@@ -1249,23 +1413,13 @@ function readBaseHex(node: any, theme: ThemeColors): string | undefined {
 }
 
 function resolveSchemeToken(token: string, theme: ThemeColors): string {
-  switch (token) {
-    case "bg1":
-      return theme.lt1;
-    case "bg2":
-      return theme.lt2;
-    case "tx1":
-      return theme.dk1;
-    case "tx2":
-      return theme.dk2;
-    case "phClr":
-      // Placeholder color sentinel — best-effort fallback.
-      return theme.dk1;
-    default: {
-      const v = (theme as unknown as Record<string, string>)[token];
-      return v ?? "#000000";
-    }
+  if (token === "phClr") {
+    // Placeholder colour sentinel — caller (substitutePhClr) should already
+    // have replaced this; surface a sensible fallback if it didn't.
+    return theme.dk1;
   }
+  const v = (theme as unknown as Record<string, string>)[token];
+  return v ?? "#000000";
 }
 
 function resolvePresetColor(name: string): string {
@@ -1565,7 +1719,8 @@ function extractRuns(
   txBody: any,
   theme: ThemeColors,
   fallbackRPr?: any,
-  fallbackPPr?: any
+  fallbackPPr?: any,
+  themeFonts: ThemeFonts = {}
 ): {
   runs: RunInfo[];
   plain: string;
@@ -1592,41 +1747,31 @@ function extractRuns(
     }
     const rs = asArray(p?.["a:r"]);
     const paragraphText: string[] = [];
-    for (const r of rs) {
-      const t = r?.["a:t"];
-      const rPr = r?.["a:rPr"] ?? {};
-      const text = typeof t === "string" ? t : t?.["#text"] ?? "";
-      paragraphText.push(text);
-      const spcRaw = rPr?.["@_spc"] ?? fallbackRPr?.["@_spc"];
-      const letterSpacing =
-        spcRaw !== undefined && spcRaw !== ""
-          ? pointsToPx(Number(spcRaw) / 100)
-          : undefined;
-      const fontSize =
-        rPr?.["@_sz"] ?? fallbackRPr?.["@_sz"]
-          ? pointsToPx(Number(rPr?.["@_sz"] ?? fallbackRPr?.["@_sz"]) / 100)
-          : undefined;
-      const fontFamily =
-        rPr?.["a:latin"]?.["@_typeface"] ??
-        fallbackRPr?.["a:latin"]?.["@_typeface"];
-      const color =
-        resolveColor(rPr?.["a:solidFill"], theme) ??
-        resolveColor(fallbackRPr?.["a:solidFill"], theme);
-      const boldVal = rPr?.["@_b"] ?? fallbackRPr?.["@_b"];
-      const italicVal = rPr?.["@_i"] ?? fallbackRPr?.["@_i"];
-      const underlineVal = rPr?.["@_u"] ?? fallbackRPr?.["@_u"];
-      const strikeVal = rPr?.["@_strike"] ?? fallbackRPr?.["@_strike"];
-      runs.push({
-        text,
-        fontFamily,
-        fontSize,
-        bold: boldVal === "1" || boldVal === 1,
-        italic: italicVal === "1" || italicVal === 1,
-        underline: underlineVal && underlineVal !== "none",
-        strike: strikeVal === "sngStrike",
-        color,
-        letterSpacing,
-      });
+    // <a:br/> hard line breaks are siblings of <a:r>; when present, walk the
+    // paragraph children in document order so the break lands between the
+    // correct runs. Otherwise stay on the fast path.
+    if (p?.["a:br"]) {
+      const order = paragraphChildOrder(p);
+      for (const entry of order) {
+        if (entry.kind === "br") {
+          // Attach the break to the previous run's text rather than emitting
+          // a synthetic empty run, so styling round-trips cleanly.
+          if (runs.length) runs[runs.length - 1].text += "\n";
+          paragraphText.push("\n");
+          continue;
+        }
+        const r = rs[entry.index];
+        if (!r) continue;
+        const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+        runs.push(built.run);
+        paragraphText.push(built.text);
+      }
+    } else {
+      for (const r of rs) {
+        const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+        runs.push(built.run);
+        paragraphText.push(built.text);
+      }
     }
     pieces.push(paragraphText.join(""));
   }
@@ -1636,6 +1781,109 @@ function extractRuns(
     align,
     lineHeightPct,
   };
+}
+
+function buildRunInfo(
+  r: any,
+  theme: ThemeColors,
+  themeFonts: ThemeFonts,
+  fallbackRPr: any
+): { run: RunInfo; text: string } {
+  const t = r?.["a:t"];
+  const rPr = r?.["a:rPr"] ?? {};
+  const text = typeof t === "string" ? t : t?.["#text"] ?? "";
+  const spcRaw = rPr?.["@_spc"] ?? fallbackRPr?.["@_spc"];
+  const letterSpacing =
+    spcRaw !== undefined && spcRaw !== ""
+      ? pointsToPx(Number(spcRaw) / 100)
+      : undefined;
+  const fontSize =
+    rPr?.["@_sz"] ?? fallbackRPr?.["@_sz"]
+      ? pointsToPx(Number(rPr?.["@_sz"] ?? fallbackRPr?.["@_sz"]) / 100)
+      : undefined;
+  const rawFontFamily =
+    rPr?.["a:latin"]?.["@_typeface"] ??
+    fallbackRPr?.["a:latin"]?.["@_typeface"];
+  const fontFamily = resolveFontFamily(rawFontFamily, themeFonts);
+  const color =
+    resolveColor(rPr?.["a:solidFill"], theme) ??
+    resolveColor(fallbackRPr?.["a:solidFill"], theme);
+  const boldVal = rPr?.["@_b"] ?? fallbackRPr?.["@_b"];
+  const italicVal = rPr?.["@_i"] ?? fallbackRPr?.["@_i"];
+  const underlineVal = rPr?.["@_u"] ?? fallbackRPr?.["@_u"];
+  const strikeVal = rPr?.["@_strike"] ?? fallbackRPr?.["@_strike"];
+  return {
+    text,
+    run: {
+      text,
+      fontFamily,
+      fontSize,
+      bold: boldVal === "1" || boldVal === 1,
+      italic: italicVal === "1" || italicVal === 1,
+      underline: !!(underlineVal && underlineVal !== "none"),
+      strike: strikeVal === "sngStrike",
+      color,
+      letterSpacing,
+    },
+  };
+}
+
+/**
+ * Returns the ordered list of <a:r>/<a:br> direct children of a paragraph
+ * with each entry's running index into the corresponding array on the parsed
+ * paragraph. The order is recovered from the paragraph's raw XML (attached
+ * during readXml) because fast-xml-parser groups children by tag name.
+ */
+function paragraphChildOrder(p: any): { kind: "r" | "br"; index: number }[] {
+  const raw = (p as any)?._rawSrc as string | undefined;
+  if (!raw) return [];
+  const tagEnd = raw.indexOf(">");
+  const closeIdx = raw.lastIndexOf("</a:p>");
+  if (tagEnd < 0 || closeIdx < 0) return [];
+  const inner = raw.slice(tagEnd + 1, closeIdx);
+  const out: { kind: "r" | "br"; index: number }[] = [];
+  let depth = 0;
+  let rIdx = 0;
+  let brIdx = 0;
+  let i = 0;
+  while (i < inner.length) {
+    if (inner[i] !== "<") {
+      i++;
+      continue;
+    }
+    if (inner.startsWith("</", i)) {
+      depth--;
+      const end = inner.indexOf(">", i);
+      if (end < 0) break;
+      i = end + 1;
+      continue;
+    }
+    if (inner.startsWith("<!--", i)) {
+      const end = inner.indexOf("-->", i);
+      if (end < 0) break;
+      i = end + 3;
+      continue;
+    }
+    if (inner.startsWith("<?", i)) {
+      const end = inner.indexOf("?>", i);
+      if (end < 0) break;
+      i = end + 2;
+      continue;
+    }
+    const close = inner.indexOf(">", i);
+    if (close < 0) break;
+    const tag = inner.slice(i, close + 1);
+    const isSelfClose = tag.endsWith("/>");
+    const nameMatch = /^<(a:[\w]+)/.exec(tag);
+    if (depth === 0 && nameMatch) {
+      const name = nameMatch[1];
+      if (name === "a:r") out.push({ kind: "r", index: rIdx++ });
+      else if (name === "a:br") out.push({ kind: "br", index: brIdx++ });
+    }
+    if (!isSelfClose) depth++;
+    i = close + 1;
+  }
+  return out;
 }
 
 function hasAnyText(txBody: any): boolean {
@@ -1656,6 +1904,27 @@ function mergeFirst<T>(...candidates: (T | undefined)[]): T | undefined {
     if (c !== undefined && c !== null) return c;
   }
   return undefined;
+}
+
+/**
+ * Per-field rPr merge: earlier candidates win for each individual attribute
+ * (font typeface, size, colour, weight, italic, …). Used to flatten the
+ * layout→master→txStyles inheritance chain into a single fallback rPr for
+ * the run extractor.
+ */
+function mergeRPrChain(...candidates: (any | undefined)[]): any | undefined {
+  const out: any = {};
+  let touched = false;
+  for (const c of candidates) {
+    if (!c || typeof c !== "object") continue;
+    for (const k of Object.keys(c)) {
+      if (out[k] === undefined) {
+        out[k] = c[k];
+        touched = true;
+      }
+    }
+  }
+  return touched ? out : undefined;
 }
 
 /**
@@ -1803,7 +2072,73 @@ async function readXml(zip: JSZip, path: string): Promise<any | null> {
   const file = zip.file(path);
   if (!file) return null;
   const text = await file.async("string");
-  return xmlParser.parse(text);
+  const parsed = xmlParser.parse(text);
+  // fast-xml-parser groups children by tag name, so <a:r>/<a:br> document
+  // order inside a paragraph is lost. Attach the paragraph's raw XML when
+  // it contains a break so we can recover the order at render time.
+  annotateParagraphRawSrc(parsed, text);
+  return parsed;
+}
+
+function annotateParagraphRawSrc(parsed: any, rawText: string): void {
+  if (!rawText.includes("<a:br")) return;
+  const blocks = findAllParagraphRawBlocks(rawText);
+  if (!blocks.length) return;
+  const parsedPs: any[] = [];
+  collectParagraphsDfs(parsed, parsedPs);
+  const n = Math.min(blocks.length, parsedPs.length);
+  for (let i = 0; i < n; i++) {
+    if (blocks[i].includes("<a:br")) {
+      Object.defineProperty(parsedPs[i], "_rawSrc", {
+        value: blocks[i],
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  }
+}
+
+function findAllParagraphRawBlocks(raw: string): string[] {
+  const blocks: string[] = [];
+  let i = 0;
+  while (i < raw.length) {
+    const a = raw.indexOf("<a:p>", i);
+    const b = raw.indexOf("<a:p ", i);
+    let start: number;
+    if (a < 0 && b < 0) break;
+    if (a < 0) start = b;
+    else if (b < 0) start = a;
+    else start = Math.min(a, b);
+    const tagEnd = raw.indexOf(">", start);
+    if (tagEnd < 0) break;
+    if (raw[tagEnd - 1] === "/") {
+      blocks.push(raw.slice(start, tagEnd + 1));
+      i = tagEnd + 1;
+      continue;
+    }
+    // <a:p> never nests inside another <a:p>, so the first </a:p> is ours.
+    const close = raw.indexOf("</a:p>", tagEnd + 1);
+    if (close < 0) break;
+    blocks.push(raw.slice(start, close + "</a:p>".length));
+    i = close + "</a:p>".length;
+  }
+  return blocks;
+}
+
+function collectParagraphsDfs(node: any, acc: any[]): void {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const n of node) collectParagraphsDfs(n, acc);
+    return;
+  }
+  for (const k of Object.keys(node)) {
+    if (k.startsWith("@_") || k === "#text") continue;
+    if (k === "a:p") {
+      for (const p of asArray(node[k])) acc.push(p);
+    } else {
+      collectParagraphsDfs(node[k], acc);
+    }
+  }
 }
 
 async function readXmlRaw(zip: JSZip, path: string): Promise<string | null> {
