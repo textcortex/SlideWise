@@ -67,6 +67,34 @@ export interface TextElement extends BaseElement {
   lineHeight: number;
   letterSpacing: number;
   /**
+   * Optional CSS background applied behind the text box. PPTX importers set
+   * this from the layout placeholder's fill when the slide overrides the
+   * placeholder (e.g. a tinted body box hosting slide-supplied text). Stays
+   * with the text element so it sits at the same z as the text — important
+   * when the slide also has a full-bleed image that would otherwise cover
+   * the fill if rendered as a separate underlay shape.
+   */
+  background?: string;
+  /**
+   * Optional vector glyph drawn behind the text. Set by the PPTX importer
+   * when the layout placeholder carried an `<a:custGeom>` (typically a
+   * brand logo plate) — the path fills the text box, the text spans render
+   * on top. Same renderer contract as ShapeElement.path.
+   */
+  backingPath?: {
+    d: string;
+    viewW: number;
+    viewH: number;
+    fill: string;
+    fillRule?: "nonzero" | "evenodd";
+  };
+  /**
+   * Optional inner padding (in canvas pixels) for the text box. The PPTX
+   * importer fills this from `<a:bodyPr lIns/tIns/rIns/bIns>` so tinted
+   * placeholder boxes don't render with text flush to their edges.
+   */
+  padding?: { l: number; t: number; r: number; b: number };
+  /**
    * Optional rich-text breakdown. When present, the renderer and PPTX writer
    * use these per-run styles; the flat fields above act as defaults for any
    * field a run leaves unset. Editing the text via the contentEditable surface
@@ -90,6 +118,24 @@ export interface ShapeElement extends BaseElement {
   stroke?: string;
   strokeWidth?: number;
   radius?: number;
+  /**
+   * Optional vector path, set when the shape was imported from a PPTX
+   * `<a:custGeom>` (logos, brand marks, hand-drawn shapes). The renderer
+   * draws this as an SVG `<path>` filling the shape's bounding box; the
+   * `shape` field remains as a sensible fallback for older renderers.
+   */
+  path?: ShapePath;
+}
+
+export interface ShapePath {
+  /** SVG path `d` attribute. */
+  d: string;
+  /** Path coordinate-system width (mapped onto the element's bounding box). */
+  viewW: number;
+  /** Path coordinate-system height. */
+  viewH: number;
+  /** SVG `fill-rule` to apply — defaults to `nonzero`. */
+  fillRule?: "nonzero" | "evenodd";
 }
 
 export interface ImageElement extends BaseElement {
@@ -122,6 +168,12 @@ export interface TableElement extends BaseElement {
   rowFill: string;
   textColor: string;
   fontSize: number;
+  /**
+   * Optional cell border colour (CSS). PPTX tables typically draw thin
+   * dividers between cells; we render them as a 1px border around each
+   * cell. Defaults to a faint grey when omitted.
+   */
+  borderColor?: string;
 }
 
 export interface IconElement extends BaseElement {

@@ -9,6 +9,7 @@ import type {
   TextRun,
   ShapeElement,
   ShapeKind,
+  ShapePath,
   ImageElement,
   LineElement,
   TableElement,
@@ -69,14 +70,18 @@ interface PlaceholderInfo {
   rPr?: any;
   pPr?: any;
   bodyPr?: any;
+  /** Per-level paragraph defaults from <a:lstStyle><a:lvlNpPr>. */
+  lvlPPr?: (any | undefined)[];
   /** Fallback paragraphs (used when the slide placeholder has no text). */
   paragraphs?: any[];
+  /** Raw spPr (used to resolve the placeholder's own fill / stroke). */
+  spPr?: any;
 }
 
 interface MasterTextDefaults {
-  title?: any; // a:lvl1pPr (and friends) — we only use lvl1.
-  body?: any;
-  other?: any;
+  title?: (any | undefined)[]; // titleStyle lvl1..lvl9 pPr
+  body?: (any | undefined)[]; // bodyStyle lvl1..lvl9 pPr
+  other?: (any | undefined)[];
 }
 
 interface ParseContext {
@@ -157,6 +162,7 @@ const ARRAY_TAGS = new Set([
   "a:p",
   "a:r",
   "a:br",
+  "a:fld",
   "a:tr",
   "a:tc",
   "Relationship",
@@ -322,17 +328,26 @@ async function parseSlide(
 
   const sld = xml["p:sld"];
   const cSld = sld?.["p:cSld"];
-  const slideBg = extractBackground(cSld?.["p:bg"], ctx);
+  const slideBg = await extractBackground(
+    cSld?.["p:bg"],
+    ctx,
+    slideRels,
+    slidePath
+  );
   const layoutBg = layoutXml
-    ? extractBackground(
+    ? await extractBackground(
         layoutXml?.["p:sldLayout"]?.["p:cSld"]?.["p:bg"],
-        ctx
+        ctx,
+        layoutRels,
+        layoutPath!
       )
     : undefined;
   const masterBg = masterXml
-    ? extractBackground(
+    ? await extractBackground(
         masterXml?.["p:sldMaster"]?.["p:cSld"]?.["p:bg"],
-        ctx
+        ctx,
+        masterRels,
+        masterPath!
       )
     : undefined;
   const background = slideBg ?? layoutBg ?? masterBg ?? "#FFFFFF";
@@ -418,13 +433,18 @@ async function walkUnderlay(
     if (isHiddenNode(sp, "p:nvSpPr")) continue;
     const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
     if (ph) {
-      // Picture placeholders are "Insert Picture" prompts in PowerPoint; when
-      // the slide supplies an actual image, the prompt panel must hide.
       const isPicPrompt = ph["@_type"] === "pic";
-      if (isPicPrompt && slidePhKeys.has(placeholderKey(ph))) continue;
-      // For other placeholders (tinted body boxes, numbered chips, etc.) the
-      // slide owns the text but the layout owns the fill — emit a fill-only
-      // backing rect behind it.
+      const isOverridden = slidePhKeys.has(placeholderKey(ph));
+      // Picture placeholders are "Insert Picture" prompts; when the slide
+      // supplies an actual image, the prompt panel must hide.
+      if (isPicPrompt && isOverridden) continue;
+      // When the slide hosts this placeholder, its fill rides on the
+      // slide's text element (TextElement.background) so it stays at the
+      // text's z-index — important when the slide also has a full-bleed
+      // image that would otherwise cover an underlay-emitted backing.
+      if (isOverridden) continue;
+      // Unreferenced placeholders: emit a fill-only backing so coloured
+      // boxes (numbered chips, decorative panels) appear.
       const filler = await placeholderFillUnderlay(sp, ctx, outer);
       if (filler) out.push(filler);
       continue;
@@ -541,26 +561,49 @@ async function parseSpTree(
   outer: GroupTransform
 ): Promise<SlideElement[]> {
   const out: SlideElement[] = [];
-  for (const sp of asArray(spTree["p:sp"])) {
-    const el = await parseSpOrText(sp, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const pic of asArray(spTree["p:pic"])) {
-    const el = await parsePic(pic, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const cxn of asArray(spTree["p:cxnSp"])) {
-    const el = parseCxn(cxn, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const gf of asArray(spTree["p:graphicFrame"])) {
-    const el = parseGraphicFrame(gf, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const grp of asArray(spTree["p:grpSp"])) {
-    const inner = composeGroupTransform(grp, outer);
-    const children = await parseSpTree(grp, ctx, inner);
-    out.push(...children);
+  // Cursor per tag — we pop from each parsed array as we encounter its tag
+  // in the document-order list, so the same elements get visited in the
+  // order they appeared in the source XML (which determines z-index).
+  const cursors: Record<string, number> = {
+    "p:sp": 0,
+    "p:pic": 0,
+    "p:cxnSp": 0,
+    "p:graphicFrame": 0,
+    "p:grpSp": 0,
+  };
+  const order: string[] = (spTree as any)?._childOrder ?? [
+    // Fall back to legacy tag-grouped order when raw isn't attached
+    // (e.g. tests that build a parsed structure by hand).
+    ...asArray(spTree["p:sp"]).map(() => "p:sp"),
+    ...asArray(spTree["p:pic"]).map(() => "p:pic"),
+    ...asArray(spTree["p:cxnSp"]).map(() => "p:cxnSp"),
+    ...asArray(spTree["p:graphicFrame"]).map(() => "p:graphicFrame"),
+    ...asArray(spTree["p:grpSp"]).map(() => "p:grpSp"),
+  ];
+
+  for (const tag of order) {
+    if (!(tag in cursors)) continue;
+    const arr = asArray((spTree as any)[tag]);
+    const idx = cursors[tag]++;
+    const node = arr[idx];
+    if (!node) continue;
+    if (tag === "p:sp") {
+      const el = await parseSpOrText(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:pic") {
+      const el = await parsePic(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:cxnSp") {
+      const el = parseCxn(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:graphicFrame") {
+      const el = parseGraphicFrame(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:grpSp") {
+      const inner = composeGroupTransform(node, outer);
+      const children = await parseSpTree(node, ctx, inner);
+      out.push(...children);
+    }
   }
   return out;
 }
@@ -631,6 +674,8 @@ async function parseSpOrText(
   const txBody = sp["p:txBody"];
   const prstGeom = sp?.["p:spPr"]?.["a:prstGeom"];
   const presetName = prstGeom?.["@_prst"];
+  const custGeom = sp?.["p:spPr"]?.["a:custGeom"];
+  const customPath = custGeom ? parseCustGeomPath(custGeom) : undefined;
 
   // Lines are sometimes authored as <p:sp prst="line">.
   if (presetName === "line" || presetName === "straightConnector1") {
@@ -646,14 +691,13 @@ async function parseSpOrText(
   const phType = ph?.["@_type"];
   const isPlaceholderTextHost = !!ph && phType !== "pic";
   const hasText = !!txBody && hasAnyText(txBody);
-  // Underlay shapes come from layout/master decoration; the slide's own
-  // placeholder will host the text, so don't promote an empty txBody to a
-  // text element (that would drop the shape's fill).
-  const isText = opts.underlay
-    ? hasText
-    : hasText ||
-      (isPlaceholderTextHost && !presetName) ||
-      (!!txBody && (!presetName || presetName === "rect"));
+  // Treat as text when the element actually carries text OR when it's a
+  // placeholder text host with no preset geometry override. A
+  // non-placeholder shape with an empty <p:txBody> (commonly authored
+  // around <a:custGeom> graphics like brand icons) is a SHAPE — promoting
+  // it to a text element would drop the silhouette and fill.
+  const isText = hasText || (isPlaceholderTextHost && !presetName);
+  void opts;
 
   if (isText) {
     return makeTextElement(sp, txBody, geom, ctx, ph, layoutPh, masterPh);
@@ -679,7 +723,9 @@ async function parseSpOrText(
   if (!kind) {
     // Fall back to a rect with the shape's fill so it remains visible at the
     // correct position rather than dropping to an opaque "Imported content"
-    // tile.
+    // tile. When the source carried a <a:custGeom> path we attach it so the
+    // renderer draws the actual silhouette (logos, brand marks) instead of
+    // the rectangle stand-in.
     const fallback: ShapeElement = {
       id: nanoid(8),
       type: "shape",
@@ -691,6 +737,7 @@ async function parseSpOrText(
       strokeWidth: strokeWidthEmu
         ? Math.max(1, Math.round(emuToPx(strokeWidthEmu) * ctx.fit.scale))
         : undefined,
+      ...(customPath ? { path: customPath } : {}),
     };
     return fallback;
   }
@@ -725,7 +772,7 @@ async function parseSpOrText(
 }
 
 function makeTextElement(
-  _sp: any,
+  sp: any,
   txBody: any,
   geom: { x: number; y: number; w: number; h: number; rotation: number },
   ctx: ParseContext,
@@ -745,14 +792,16 @@ function makeTextElement(
         ? { "a:bodyPr": masterPh.bodyPr, "a:p": masterPh.paragraphs }
         : txBody;
 
-  // Master defaults for the placeholder type (title vs body vs other).
+  // Master defaults for the placeholder type (title vs body vs other), as
+  // an array of lvl1..lvl9 paragraph properties.
   const phType = ph?.["@_type"];
-  const masterDef =
+  const masterLevels: (any | undefined)[] =
     phType === "title" || phType === "ctrTitle"
-      ? ctx.masterTextDefaults.title
+      ? (ctx.masterTextDefaults.title ?? [])
       : phType === "body" || phType === "subTitle"
-        ? ctx.masterTextDefaults.body
-        : ctx.masterTextDefaults.other;
+        ? (ctx.masterTextDefaults.body ?? [])
+        : (ctx.masterTextDefaults.other ?? []);
+  const masterLvl1 = masterLevels[0];
 
   // Accumulate inheritance: slide < layout < master < masterDefaults. Each
   // level can specify just a subset of fields (the layout might set the
@@ -761,24 +810,56 @@ function makeTextElement(
   const fallbackRPr = mergeRPrChain(
     layoutPh?.rPr,
     masterPh?.rPr,
-    masterDef?.["a:defRPr"]
+    masterLvl1?.["a:defRPr"]
   );
   const fallbackPPr = mergeFirst(
     layoutPh?.pPr,
     masterPh?.pPr,
-    masterDef
+    masterLvl1
   );
   const fallbackBodyPr = mergeFirst(layoutPh?.bodyPr, masterPh?.bodyPr);
+
+  // Resolve a per-level [layoutLvl, masterPhLvl, masterTxStyleLvl] chain so
+  // bullet/alignment/lineSpacing each fall through independently when an
+  // earlier layer is silent on that particular field.
+  const listStyle: (any | undefined)[][] = [];
+  for (let i = 0; i < 9; i++) {
+    const chain = [
+      layoutPh?.lvlPPr?.[i],
+      masterPh?.lvlPPr?.[i],
+      masterLevels[i],
+    ].filter(Boolean);
+    listStyle.push(chain);
+  }
+
+  // <a:bodyPr><a:normAutofit fontScale="..." lnSpcReduction="..."/> shrinks
+  // text that overflowed when authored — apply so wraps don't push runs off
+  // the slide.
+  const autoFit = readNormAutofit(
+    effectiveTxBody?.["a:bodyPr"] ?? fallbackBodyPr
+  );
 
   const text = extractRuns(
     effectiveTxBody,
     ctx.theme,
     fallbackRPr,
     fallbackPPr,
-    ctx.themeFonts
+    ctx.themeFonts,
+    listStyle,
+    autoFit
   );
   const first = text.runs[0];
-  const align = text.align ?? readAlign(fallbackPPr) ?? "left";
+  // Each layer of the inheritance chain may set @algn independently — a
+  // layout placeholder can override geometry without touching alignment,
+  // expecting the master's algn="r" (slide-number, page-footer right-edge
+  // style) to still apply. mergeFirst would lock onto the layout's whole
+  // pPr and hide the master's algn, so check each layer in turn.
+  const align =
+    text.align ??
+    readAlign(layoutPh?.pPr) ??
+    readAlign(masterPh?.pPr) ??
+    readAlign(masterLvl1) ??
+    "left";
   const valign =
     readBodyVAlign(effectiveTxBody?.["a:bodyPr"]) ??
     readBodyVAlign(fallbackBodyPr) ??
@@ -849,6 +930,65 @@ function makeTextElement(
       : 0,
     ...(hasMixedFormatting ? { runs } : {}),
   };
+  // Inner padding from <a:bodyPr lIns/tIns/rIns/bIns>. PowerPoint applies
+  // these as text-box insets (the typographic equivalent of CSS padding).
+  // Default values in OOXML are 91440 / 45720 / 91440 / 45720 EMU. The
+  // slide often carries an empty <a:bodyPr/> that should silently inherit
+  // each attribute from the layout/master, so we read per-field rather
+  // than swap whole bodyPr objects.
+  const slideBp = effectiveTxBody?.["a:bodyPr"];
+  const layoutBp = layoutPh?.bodyPr;
+  const masterBp = masterPh?.bodyPr;
+  const readIns = (key: string, fallback: number): number => {
+    const v =
+      slideBp?.[`@_${key}`] ??
+      layoutBp?.[`@_${key}`] ??
+      masterBp?.[`@_${key}`];
+    return v !== undefined ? Number(v) : fallback;
+  };
+  const lIns = readIns("lIns", 91440);
+  const tIns = readIns("tIns", 45720);
+  const rIns = readIns("rIns", 91440);
+  const bIns = readIns("bIns", 45720);
+  const padding = {
+    l: Math.round(emuToPx(lIns) * ctx.fit.scale),
+    t: Math.round(emuToPx(tIns) * ctx.fit.scale),
+    r: Math.round(emuToPx(rIns) * ctx.fit.scale),
+    b: Math.round(emuToPx(bIns) * ctx.fit.scale),
+  };
+  if (padding.l || padding.t || padding.r || padding.b) {
+    el.padding = padding;
+  }
+
+  // Layout placeholders often supply a fill (e.g. a tinted body box) or a
+  // <a:custGeom> path (a white brand-logo plate) that should sit
+  // *immediately* behind the slide's hosted text — at the same z, not in
+  // the underlay. Otherwise a full-bleed image on the slide will cover the
+  // backing. The slide's own <p:spPr> can also override the fill on a
+  // per-element basis (e.g. one chip in a roadmap is the "active" red
+  // tile) — read the slide's spPr first and fall back to the layout's.
+  const slideSpPr = sp?.["p:spPr"];
+  const layoutSpPr = layoutPh?.spPr;
+  const slideFill = slideSpPr ? extractShapeFill(slideSpPr, ctx.theme) : undefined;
+  const layoutFill = layoutSpPr ? extractShapeFill(layoutSpPr, ctx.theme) : undefined;
+  const phFill = slideFill ?? layoutFill;
+  const phSpPr = layoutSpPr;
+  const phPath = phSpPr?.["a:custGeom"]
+    ? parseCustGeomPath(phSpPr["a:custGeom"])
+    : undefined;
+  if (phPath && phFill && phFill !== "transparent") {
+    // custGeom defines the actual rendered silhouette; the fill applies to
+    // it. Skip the flat background and render the glyph as a backing path.
+    el.backingPath = {
+      d: phPath.d,
+      viewW: phPath.viewW,
+      viewH: phPath.viewH,
+      fill: phFill,
+      fillRule: phPath.fillRule,
+    };
+  } else if (phFill && phFill !== "transparent") {
+    el.background = phFill;
+  }
   return el;
 }
 
@@ -893,8 +1033,20 @@ async function parsePic(
   const file = ctx.zip.file(fullPath);
   if (!file) return toUnknown(pic, "p:pic", ctx, outer);
 
-  const base64 = await file.async("base64");
   const ext = (fullPath.split(".").pop() || "png").toLowerCase();
+  // EMF / WMF are Microsoft vector formats that browsers can't render
+  // natively. Skip them with a diagnostic — emitting them as
+  // <img src="data:application/octet-stream…"> surfaces a broken-image
+  // icon, and synthesising a fake placeholder only hides the gap.
+  // Consumers needing fidelity should pre-rasterise the metafiles before
+  // import; a true EMF→SVG path needs a dedicated JS decoder (separate PR).
+  if (ext === "emf" || ext === "wmf") {
+    ctx.diagnostics.warnings.push(
+      `Skipped ${ext.toUpperCase()} image at ${fullPath} — vector metafiles aren't supported in the browser.`
+    );
+    return null;
+  }
+  const base64 = await file.async("base64");
   const mime = mimeForExt(ext);
 
   const blipFill = pic?.["p:blipFill"];
@@ -1138,9 +1290,22 @@ function lookupPlaceholder(
     map.get(`${type}|${idx}`) ??
     map.get(`|${idx}`) ??
     map.get(`${type}|`) ??
-    (type === "ctrTitle" ? map.get("title|") : undefined) ??
-    (type === "subTitle" ? map.get("body|") : undefined)
+    findByType(map, type) ??
+    (type === "ctrTitle" ? findByType(map, "title") : undefined) ??
+    (type === "subTitle" ? findByType(map, "body") : undefined)
   );
+}
+
+function findByType(
+  map: Map<string, PlaceholderInfo>,
+  type: string
+): PlaceholderInfo | undefined {
+  if (!type) return undefined;
+  const prefix = `${type}|`;
+  for (const [key, value] of map) {
+    if (key.startsWith(prefix)) return value;
+  }
+  return undefined;
 }
 
 function placeholderGeometry(
@@ -1181,7 +1346,9 @@ function extractPlaceholders(rootXml: any): Map<string, PlaceholderInfo> {
     // <a:lstStyle><a:lvl1pPr> (font, size, colour, etc). A stub <a:r><a:rPr/>
     // with just `lang` carries no real style — prefer the lstStyle defaults
     // over an empty inline rPr so the layout's typography reaches the slide.
-    const lvl1 = txBody?.["a:lstStyle"]?.["a:lvl1pPr"];
+    const lstStyle = txBody?.["a:lstStyle"];
+    const lvl1 = lstStyle?.["a:lvl1pPr"];
+    const lvlPPr = collectLevelPPrs(lstStyle);
     const stubRPr = firstR?.["a:rPr"];
     const info: PlaceholderInfo = {
       rawX: off ? emuToPx(Number(off["@_x"] ?? 0)) : undefined,
@@ -1196,7 +1363,9 @@ function extractPlaceholders(rootXml: any): Map<string, PlaceholderInfo> {
       ),
       pPr: lvl1 ?? firstP?.["a:pPr"],
       bodyPr: txBody?.["a:bodyPr"],
+      lvlPPr: lvlPPr.some(Boolean) ? lvlPPr : undefined,
       paragraphs: hasAnyText(txBody) ? paragraphs : undefined,
+      spPr: sp?.["p:spPr"],
     };
     out.set(placeholderKey(ph), info);
   }
@@ -1236,10 +1405,19 @@ function extractMasterTextDefaults(masterXml: any): MasterTextDefaults {
   const txStyles = masterXml?.["p:sldMaster"]?.["p:txStyles"];
   if (!txStyles) return {};
   return {
-    title: txStyles?.["p:titleStyle"]?.["a:lvl1pPr"],
-    body: txStyles?.["p:bodyStyle"]?.["a:lvl1pPr"],
-    other: txStyles?.["p:otherStyle"]?.["a:lvl1pPr"],
+    title: collectLevelPPrs(txStyles?.["p:titleStyle"]),
+    body: collectLevelPPrs(txStyles?.["p:bodyStyle"]),
+    other: collectLevelPPrs(txStyles?.["p:otherStyle"]),
   };
+}
+
+function collectLevelPPrs(style: any): (any | undefined)[] {
+  if (!style) return [];
+  const out: (any | undefined)[] = [];
+  for (let lvl = 1; lvl <= 9; lvl++) {
+    out.push(style[`a:lvl${lvl}pPr`]);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,6 +1711,33 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
       (s) => s.color.length === 9 && s.color.endsWith("00")
     );
     if (allTransparent) return "transparent";
+    // Radial / path gradient: <a:path path="circle|rect|shape"> with
+    // <a:fillToRect> giving the focus rectangle. l/t/r/b are percentage
+    // insets from each edge of the shape; the rect's centre is the focus
+    // point. OOXML radial stops use the SAME convention as CSS — pos=0 at
+    // the centre, pos=100% at the outer boundary — so we keep the stop
+    // positions verbatim. The visual blob lands where fillToRect sits;
+    // on a tall, narrow panel the same radial reads almost vertical, on a
+    // 16:9 slide it reads as the expected red orb fading to purple.
+    const pathNode = gf["a:path"];
+    if (pathNode) {
+      const pathType = pathNode["@_path"];
+      const ftr = pathNode["a:fillToRect"];
+      const lIn = Number(ftr?.["@_l"] ?? 0) / 1000;
+      const tIn = Number(ftr?.["@_t"] ?? 0) / 1000;
+      const rIn = Number(ftr?.["@_r"] ?? 0) / 1000;
+      const bIn = Number(ftr?.["@_b"] ?? 0) / 1000;
+      const focusX = clampPct((lIn + (100 - rIn)) / 2);
+      const focusY = clampPct((tIn + (100 - bIn)) / 2);
+      // path="circle" — a true geometric circle in CSS terms (so the blob
+      // stays round on rectangular shapes); path="rect" — anisotropic
+      // ellipse stretched with the shape's aspect ratio.
+      const shape = pathType === "circle" ? "circle" : "ellipse";
+      const stopsCss = stops
+        .map((s) => `${s.color} ${s.pos.toFixed(2)}%`)
+        .join(", ");
+      return `radial-gradient(${shape} at ${focusX.toFixed(2)}% ${focusY.toFixed(2)}%, ${stopsCss})`;
+    }
     const angDeg = gf["a:lin"]?.["@_ang"]
       ? (Number(gf["a:lin"]["@_ang"]) / 60000 + 90) % 360
       : 90;
@@ -1542,7 +1747,19 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
   return undefined;
 }
 
-function extractBackground(bg: any, ctx: ParseContext): string | undefined {
+function clampPct(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  if (v < 0) return 0;
+  if (v > 100) return 100;
+  return v;
+}
+
+async function extractBackground(
+  bg: any,
+  ctx: ParseContext,
+  rels: Rels,
+  basePath: string
+): Promise<string | undefined> {
   if (!bg) return undefined;
   const bgPr = bg["p:bgPr"];
   if (bgPr) {
@@ -1551,12 +1768,36 @@ function extractBackground(bg: any, ctx: ParseContext): string | undefined {
     if (solid) return solid;
     const grad = extractShapeFill({ "a:gradFill": bgPr["a:gradFill"] }, ctx.theme);
     if (grad) return grad;
-    // blipFill bg → render as the embedded image via CSS background. Falls
-    // through to undefined for now; tracked for a follow-up.
+    const blip = bgPr["a:blipFill"]?.["a:blip"];
+    if (blip) {
+      const url = await blipDataUrl(blip, ctx, rels, basePath);
+      if (url) return `center / cover no-repeat url("${url}")`;
+    }
   }
   const bgRef = bg["p:bgRef"];
   if (bgRef) return resolveBgRef(bgRef, ctx);
   return undefined;
+}
+
+async function blipDataUrl(
+  blip: any,
+  ctx: ParseContext,
+  rels: Rels,
+  basePath: string
+): Promise<string | undefined> {
+  // Prefer the vector embed when present (dual-blip SVG pattern); fall
+  // back to the raster.
+  const svgRef = findSvgBlipRef(blip);
+  const rid = svgRef ?? blip?.["@_r:embed"];
+  if (!rid) return undefined;
+  const target = rels.byId.get(rid)?.target;
+  if (!target) return undefined;
+  const full = normalisePath(target, dirOf(basePath));
+  const file = ctx.zip.file(full);
+  if (!file) return undefined;
+  const base64 = await file.async("base64");
+  const ext = (full.split(".").pop() || "png").toLowerCase();
+  return `data:${mimeForExt(ext)};base64,${base64}`;
 }
 
 /**
@@ -1720,7 +1961,9 @@ function extractRuns(
   theme: ThemeColors,
   fallbackRPr?: any,
   fallbackPPr?: any,
-  themeFonts: ThemeFonts = {}
+  themeFonts: ThemeFonts = {},
+  listStyle: (any | undefined)[][] = [],
+  autoFit?: AutoFit
 ): {
   runs: RunInfo[];
   plain: string;
@@ -1732,47 +1975,92 @@ function extractRuns(
   let lineHeightPct: number | undefined;
   const paragraphs = asArray(txBody?.["a:p"]);
   const pieces: string[] = [];
+  const autoNumCounters = new Map<number, number>();
+  let prevAutoKey: string | undefined;
 
   for (let pi = 0; pi < paragraphs.length; pi++) {
     const p = paragraphs[pi];
     const pPr = p?.["a:pPr"];
+    const lvl = clampLevel(Number(pPr?.["@_lvl"] ?? 0));
+    const levelChain = listStyle[lvl] ?? [];
+    const findLevel = (k: string): any =>
+      [pPr, ...levelChain, fallbackPPr].find((s) => s?.[k] !== undefined);
     if (!align) {
-      align = readAlign(pPr) ?? readAlign(fallbackPPr);
+      align =
+        readAlign(pPr) ??
+        readAlign(levelChain.find((s) => s?.["@_algn"])) ??
+        readAlign(fallbackPPr);
     }
     if (lineHeightPct === undefined) {
-      const lnPct =
-        pPr?.["a:lnSpc"]?.["a:spcPct"]?.["@_val"] ??
-        fallbackPPr?.["a:lnSpc"]?.["a:spcPct"]?.["@_val"];
-      if (lnPct) lineHeightPct = Number(lnPct) / 100000;
+      const src = findLevel("a:lnSpc");
+      const lnPct = src?.["a:lnSpc"]?.["a:spcPct"]?.["@_val"];
+      if (lnPct) {
+        const base = Number(lnPct) / 100000;
+        const reduction = autoFit?.lnSpcReduction ?? 0;
+        lineHeightPct = base * (1 - reduction);
+      }
     }
+
+    // Resolve bullet across the inheritance chain (slide pPr > layout > master
+    // placeholder > master txStyles). Each layer can specify just the bullet
+    // without overriding everything else.
+    const bullet = resolveBullet([pPr, ...levelChain]);
+    const prefix = computeBulletPrefix(
+      bullet,
+      lvl,
+      autoNumCounters,
+      prevAutoKey
+    );
+    prevAutoKey = prefix.autoKey;
+
     const rs = asArray(p?.["a:r"]);
+    const flds = asArray(p?.["a:fld"]);
+    const paraStart = runs.length;
     const paragraphText: string[] = [];
-    // <a:br/> hard line breaks are siblings of <a:r>; when present, walk the
-    // paragraph children in document order so the break lands between the
-    // correct runs. Otherwise stay on the fast path.
-    if (p?.["a:br"]) {
+    if (prefix.text) paragraphText.push(prefix.text);
+
+    const onRun = (r: any) => {
+      const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+      if (autoFit?.fontScale && built.run.fontSize) {
+        built.run.fontSize *= autoFit.fontScale;
+      }
+      runs.push(built.run);
+      paragraphText.push(built.text);
+    };
+
+    // <a:br/> hard line breaks AND <a:fld> field placeholders (e.g.
+    // datetime1, slidenum) are siblings of <a:r>; when any are present
+    // walk the paragraph children in document order so they land in the
+    // right place. Otherwise stay on the fast path.
+    if (p?.["a:br"] || p?.["a:fld"]) {
       const order = paragraphChildOrder(p);
       for (const entry of order) {
         if (entry.kind === "br") {
-          // Attach the break to the previous run's text rather than emitting
-          // a synthetic empty run, so styling round-trips cleanly.
           if (runs.length) runs[runs.length - 1].text += "\n";
           paragraphText.push("\n");
           continue;
         }
-        const r = rs[entry.index];
-        if (!r) continue;
-        const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
-        runs.push(built.run);
-        paragraphText.push(built.text);
+        const source = entry.kind === "r" ? rs : flds;
+        const r = source[entry.index];
+        if (r) onRun(r);
       }
     } else {
-      for (const r of rs) {
-        const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
-        runs.push(built.run);
-        paragraphText.push(built.text);
-      }
+      for (const r of rs) onRun(r);
     }
+
+    // Prepend the bullet prefix to the first run of this paragraph so it
+    // survives renderers that walk `runs` instead of the joined `plain` text.
+    if (prefix.text && runs.length > paraStart) {
+      runs[paraStart].text = prefix.text + runs[paraStart].text;
+    }
+
+    // Carry the inter-paragraph break onto the last run we just emitted —
+    // renderers that walk `runs` (mixed-formatting path) would otherwise
+    // concatenate paragraphs into one long line.
+    if (pi < paragraphs.length - 1 && runs.length > 0) {
+      runs[runs.length - 1].text += "\n";
+    }
+
     pieces.push(paragraphText.join(""));
   }
   return {
@@ -1781,6 +2069,149 @@ function extractRuns(
     align,
     lineHeightPct,
   };
+}
+
+interface AutoFit {
+  fontScale?: number; // 0..1
+  lnSpcReduction?: number; // 0..1
+}
+
+function readNormAutofit(bodyPr: any): AutoFit | undefined {
+  const af = bodyPr?.["a:normAutofit"];
+  if (!af) return undefined;
+  const fontScale = af["@_fontScale"] ? Number(af["@_fontScale"]) / 100000 : undefined;
+  const lnSpcReduction = af["@_lnSpcReduction"]
+    ? Number(af["@_lnSpcReduction"]) / 100000
+    : undefined;
+  if (fontScale === undefined && lnSpcReduction === undefined) return undefined;
+  return { fontScale, lnSpcReduction };
+}
+
+interface ResolvedBullet {
+  kind: "none" | "char" | "auto";
+  char?: string;
+  autoType?: string;
+  autoStartAt?: number;
+}
+
+function resolveBullet(sources: (any | undefined)[]): ResolvedBullet {
+  // First source that defines any of buNone/buChar/buAutoNum wins.
+  for (const src of sources) {
+    if (!src) continue;
+    if (src["a:buNone"] !== undefined) return { kind: "none" };
+    if (src["a:buChar"]?.["@_char"])
+      return { kind: "char", char: String(src["a:buChar"]["@_char"]) };
+    if (src["a:buAutoNum"]) {
+      return {
+        kind: "auto",
+        autoType: src["a:buAutoNum"]["@_type"] ?? "arabicPeriod",
+        autoStartAt: src["a:buAutoNum"]["@_startAt"]
+          ? Number(src["a:buAutoNum"]["@_startAt"])
+          : 1,
+      };
+    }
+  }
+  return { kind: "none" };
+}
+
+function computeBulletPrefix(
+  bullet: ResolvedBullet,
+  level: number,
+  counters: Map<number, number>,
+  prevAutoKey: string | undefined
+): { text: string; autoKey: string | undefined } {
+  const indent = "  ".repeat(level);
+  if (bullet.kind === "none") {
+    // Drop the counter so a later run of <a:buAutoNum> restarts at 1 even at
+    // the same level.
+    counters.delete(level);
+    return { text: "", autoKey: undefined };
+  }
+  if (bullet.kind === "char") {
+    counters.delete(level);
+    return {
+      text: `${indent}${bullet.char ?? "•"}  `,
+      autoKey: undefined,
+    };
+  }
+  const key = `auto|${level}|${bullet.autoType ?? "arabicPeriod"}`;
+  const continuing = key === prevAutoKey;
+  const next = continuing
+    ? (counters.get(level) ?? bullet.autoStartAt ?? 1) + 1
+    : bullet.autoStartAt ?? 1;
+  counters.set(level, next);
+  return {
+    text: `${indent}${formatAutoNum(next, bullet.autoType ?? "arabicPeriod")}  `,
+    autoKey: key,
+  };
+}
+
+function formatAutoNum(n: number, type: string): string {
+  switch (type) {
+    case "arabicPlain":
+      return `${n}`;
+    case "arabicParenR":
+      return `${n})`;
+    case "arabicParenBoth":
+      return `(${n})`;
+    case "arabicPeriod":
+      return `${n}.`;
+    case "alphaUcPeriod":
+      return `${toAlpha(n).toUpperCase()}.`;
+    case "alphaLcPeriod":
+      return `${toAlpha(n)}.`;
+    case "romanUcPeriod":
+      return `${toRoman(n).toUpperCase()}.`;
+    case "romanLcPeriod":
+      return `${toRoman(n)}.`;
+    default:
+      return `${n}.`;
+  }
+}
+
+function toAlpha(n: number): string {
+  let s = "";
+  let v = n;
+  while (v > 0) {
+    const r = (v - 1) % 26;
+    s = String.fromCharCode(97 + r) + s;
+    v = Math.floor((v - 1) / 26);
+  }
+  return s || "a";
+}
+
+function toRoman(n: number): string {
+  if (n <= 0) return "";
+  const pairs: [number, string][] = [
+    [1000, "m"],
+    [900, "cm"],
+    [500, "d"],
+    [400, "cd"],
+    [100, "c"],
+    [90, "xc"],
+    [50, "l"],
+    [40, "xl"],
+    [10, "x"],
+    [9, "ix"],
+    [5, "v"],
+    [4, "iv"],
+    [1, "i"],
+  ];
+  let out = "";
+  let v = n;
+  for (const [val, sym] of pairs) {
+    while (v >= val) {
+      out += sym;
+      v -= val;
+    }
+  }
+  return out;
+}
+
+function clampLevel(n: number): number {
+  if (!Number.isFinite(n) || n < 0) return 0;
+  if (n > 8) return 8;
+  return Math.floor(n);
 }
 
 function buildRunInfo(
@@ -1834,17 +2265,179 @@ function buildRunInfo(
  * paragraph. The order is recovered from the paragraph's raw XML (attached
  * during readXml) because fast-xml-parser groups children by tag name.
  */
-function paragraphChildOrder(p: any): { kind: "r" | "br"; index: number }[] {
+function paragraphChildOrder(
+  p: any
+): { kind: "r" | "br" | "fld"; index: number }[] {
   const raw = (p as any)?._rawSrc as string | undefined;
-  if (!raw) return [];
+  if (raw) return paragraphChildOrderFromRaw(raw);
+  // No raw available (paragraph has no <a:br/> and pre-PR-2 readXml didn't
+  // attach it). Fall back to the order implied by the parsed arrays: all
+  // runs, then all fields. Document order across these tag types is lost
+  // by fast-xml-parser, but the typical PPTX paragraph has either runs or
+  // a field, not both, so this matches reality in practice.
+  const out: { kind: "r" | "br" | "fld"; index: number }[] = [];
+  asArray(p?.["a:r"]).forEach((_, i) => out.push({ kind: "r", index: i }));
+  asArray(p?.["a:fld"]).forEach((_, i) => out.push({ kind: "fld", index: i }));
+  return out;
+}
+
+/**
+ * Convert a PPTX `<a:custGeom>` (custom geometry — used for logos, brand
+ * marks, hand-drawn shapes) into an SVG path. Reads command order from the
+ * raw XML attached during readXml, since fast-xml-parser groups children by
+ * tag name and drops cross-tag document order. Supports moveTo, lnTo,
+ * cubicBezTo, quadBezTo, and close; arcTo and formula-based guide
+ * references aren't translated yet (they degrade to a flat-fill rect).
+ */
+function parseCustGeomPath(custGeom: any): ShapePath | undefined {
+  const raw = (custGeom as any)?._rawSrc as string | undefined;
+  if (!raw) return undefined;
+  // Each <a:path w="…" h="…"> defines its own coordinate system; the SVG
+  // viewBox uses the FIRST path's dimensions and subsequent paths inherit
+  // it. In practice almost every custGeom in real decks uses one viewbox
+  // across all sub-paths.
+  const paths = findAllElementRawBlocks(raw, "path");
+  if (!paths.length) return undefined;
+  let viewW = 0;
+  let viewH = 0;
+  let d = "";
+  for (const block of paths) {
+    const headerEnd = block.indexOf(">");
+    if (headerEnd < 0) continue;
+    const header = block.slice(0, headerEnd + 1);
+    const w = Number(/\bw="(\d+)"/.exec(header)?.[1] ?? 0);
+    const h = Number(/\bh="(\d+)"/.exec(header)?.[1] ?? 0);
+    if (w > viewW) viewW = w;
+    if (h > viewH) viewH = h;
+    d += (d ? " " : "") + custGeomBodyToSvgD(block);
+  }
+  if (!d || viewW <= 0 || viewH <= 0) return undefined;
+  // OOXML composite paths (multiple subpaths with internal holes — letters
+  // like the "e" and "o" in the eon wordmark) render with even-odd winding
+  // by default; the nonzero default of SVG would fill the holes.
+  return { d, viewW, viewH, fillRule: "evenodd" };
+}
+
+function custGeomBodyToSvgD(pathBlock: string): string {
+  const headerEnd = pathBlock.indexOf(">");
+  const closeIdx = pathBlock.lastIndexOf("</a:path>");
+  const inner =
+    closeIdx > headerEnd
+      ? pathBlock.slice(headerEnd + 1, closeIdx)
+      : pathBlock.slice(headerEnd + 1);
+  let out = "";
+  let i = 0;
+  let depth = 0;
+  // Track the current pen position so <a:arcTo> (which doesn't carry an
+  // explicit end point) can compute its SVG `A` endpoint from start +
+  // sweep angle, just like PowerPoint does at render time.
+  let penX = 0;
+  let penY = 0;
+  while (i < inner.length) {
+    if (inner[i] !== "<") {
+      i++;
+      continue;
+    }
+    if (inner.startsWith("</", i)) {
+      depth--;
+      const end = inner.indexOf(">", i);
+      if (end < 0) break;
+      i = end + 1;
+      continue;
+    }
+    if (inner.startsWith("<!--", i)) {
+      const end = inner.indexOf("-->", i);
+      if (end < 0) break;
+      i = end + 3;
+      continue;
+    }
+    const close = inner.indexOf(">", i);
+    if (close < 0) break;
+    const tag = inner.slice(i, close + 1);
+    const nameMatch = /^<a:([\w]+)/.exec(tag);
+    const isSelfClose = tag.endsWith("/>");
+    if (depth === 0 && nameMatch) {
+      const name = nameMatch[1];
+      if (name === "close") {
+        out += " Z";
+      } else if (
+        name === "moveTo" ||
+        name === "lnTo" ||
+        name === "cubicBezTo" ||
+        name === "quadBezTo"
+      ) {
+        const cmdClose = inner.indexOf(`</a:${name}>`, close + 1);
+        if (cmdClose < 0) break;
+        const body = inner.slice(close + 1, cmdClose);
+        const pts: Array<[number, number]> = [];
+        const ptRe = /<a:pt\s+x="(-?\d+)"\s+y="(-?\d+)"\s*\/>/g;
+        let m: RegExpExecArray | null;
+        while ((m = ptRe.exec(body))) {
+          pts.push([Number(m[1]), Number(m[2])]);
+        }
+        if (pts.length) {
+          const letter =
+            name === "moveTo"
+              ? "M"
+              : name === "lnTo"
+                ? "L"
+                : name === "cubicBezTo"
+                  ? "C"
+                  : "Q";
+          out += ` ${letter} ${pts.map(([x, y]) => `${x} ${y}`).join(" ")}`;
+          const last = pts[pts.length - 1];
+          penX = last[0];
+          penY = last[1];
+        }
+        i = cmdClose + `</a:${name}>`.length;
+        continue;
+      } else if (name === "arcTo") {
+        // <a:arcTo wR="" hR="" stAng="" swAng="" /> — elliptical arc
+        // starting at the current pen position. wR/hR are the axis radii;
+        // stAng/swAng are start/sweep angles measured in 60000ths of a
+        // degree (OOXML convention). The start point on the ellipse is
+        // (centre.x + wR·cos(stAng), centre.y + hR·sin(stAng)); the
+        // centre is therefore (pen.x − wR·cos(stAng), pen.y − hR·sin(stAng)).
+        // SVG `A` takes the END point instead of an angle, so we compute
+        // the end from start + swAng.
+        const wR = Number(/\bwR="(-?\d+)"/.exec(tag)?.[1] ?? 0);
+        const hR = Number(/\bhR="(-?\d+)"/.exec(tag)?.[1] ?? 0);
+        const stAng = Number(/\bstAng="(-?\d+)"/.exec(tag)?.[1] ?? 0) / 60000;
+        const swAng = Number(/\bswAng="(-?\d+)"/.exec(tag)?.[1] ?? 0) / 60000;
+        if (wR > 0 && hR > 0) {
+          const rad = (deg: number) => (deg * Math.PI) / 180;
+          const cx = penX - wR * Math.cos(rad(stAng));
+          const cy = penY - hR * Math.sin(rad(stAng));
+          const endAng = stAng + swAng;
+          const ex = cx + wR * Math.cos(rad(endAng));
+          const ey = cy + hR * Math.sin(rad(endAng));
+          const largeArc = Math.abs(swAng) > 180 ? 1 : 0;
+          const sweep = swAng > 0 ? 1 : 0;
+          out += ` A ${wR} ${hR} 0 ${largeArc} ${sweep} ${ex.toFixed(2)} ${ey.toFixed(2)}`;
+          penX = ex;
+          penY = ey;
+        }
+      }
+      // Unknown commands are skipped — the rest of the path stays valid.
+    }
+    if (!isSelfClose) depth++;
+    i = close + 1;
+  }
+  return out.trim();
+}
+
+function paragraphChildOrderFromRaw(
+  raw: string
+): { kind: "r" | "br" | "fld"; index: number }[] {
   const tagEnd = raw.indexOf(">");
   const closeIdx = raw.lastIndexOf("</a:p>");
   if (tagEnd < 0 || closeIdx < 0) return [];
   const inner = raw.slice(tagEnd + 1, closeIdx);
-  const out: { kind: "r" | "br"; index: number }[] = [];
+  const out: { kind: "r" | "br" | "fld"; index: number }[] = [];
   let depth = 0;
   let rIdx = 0;
   let brIdx = 0;
+  let fldIdx = 0;
   let i = 0;
   while (i < inner.length) {
     if (inner[i] !== "<") {
@@ -1879,6 +2472,7 @@ function paragraphChildOrder(p: any): { kind: "r" | "br"; index: number }[] {
       const name = nameMatch[1];
       if (name === "a:r") out.push({ kind: "r", index: rIdx++ });
       else if (name === "a:br") out.push({ kind: "br", index: brIdx++ });
+      else if (name === "a:fld") out.push({ kind: "fld", index: fldIdx++ });
     }
     if (!isSelfClose) depth++;
     i = close + 1;
@@ -1889,8 +2483,7 @@ function paragraphChildOrder(p: any): { kind: "r" | "br"; index: number }[] {
 function hasAnyText(txBody: any): boolean {
   const ps = asArray(txBody?.["a:p"]);
   for (const p of ps) {
-    const rs = asArray(p?.["a:r"]);
-    for (const r of rs) {
+    for (const r of [...asArray(p?.["a:r"]), ...asArray(p?.["a:fld"])]) {
       const t = r?.["a:t"];
       const text = typeof t === "string" ? t : t?.["#text"] ?? "";
       if (text && String(text).length > 0) return true;
@@ -2073,29 +2666,224 @@ async function readXml(zip: JSZip, path: string): Promise<any | null> {
   if (!file) return null;
   const text = await file.async("string");
   const parsed = xmlParser.parse(text);
-  // fast-xml-parser groups children by tag name, so <a:r>/<a:br> document
-  // order inside a paragraph is lost. Attach the paragraph's raw XML when
-  // it contains a break so we can recover the order at render time.
-  annotateParagraphRawSrc(parsed, text);
+  // fast-xml-parser groups children by tag name and drops cross-tag
+  // document order. Attach raw fragments for paragraphs (run/br/fld
+  // interleaving), custGeom path commands, and spTree/grpSp children
+  // (which carry z-index via source order).
+  annotateRawOrder(parsed, text);
   return parsed;
 }
 
-function annotateParagraphRawSrc(parsed: any, rawText: string): void {
-  if (!rawText.includes("<a:br")) return;
-  const blocks = findAllParagraphRawBlocks(rawText);
-  if (!blocks.length) return;
-  const parsedPs: any[] = [];
-  collectParagraphsDfs(parsed, parsedPs);
-  const n = Math.min(blocks.length, parsedPs.length);
-  for (let i = 0; i < n; i++) {
-    if (blocks[i].includes("<a:br")) {
-      Object.defineProperty(parsedPs[i], "_rawSrc", {
-        value: blocks[i],
+function annotateRawOrder(parsed: any, rawText: string): void {
+  annotateParagraphRawSrc(parsed, rawText);
+  annotateSpTreeChildOrder(parsed, rawText);
+}
+
+/**
+ * Attach `_childOrder: string[]` to every parsed `<p:spTree>` and
+ * `<p:grpSp>` so callers can iterate children (sp, pic, cxnSp,
+ * graphicFrame, grpSp) in document order. PPTX z-index follows source
+ * order — a slide that lists `<p:pic>` before `<p:sp>` means the picture
+ * sits behind the text — but fast-xml-parser groups children by tag name
+ * and drops cross-tag ordering.
+ */
+function annotateSpTreeChildOrder(parsed: any, rawText: string): void {
+  if (!rawText.includes("<p:spTree") && !rawText.includes("<p:grpSp")) return;
+  for (const tag of ["p:spTree", "p:grpSp"] as const) {
+    if (!rawText.includes(`<${tag}`)) continue;
+    const blocks = findAllRawBlocks(rawText, tag);
+    if (!blocks.length) continue;
+    const nodes: any[] = [];
+    collectNamedDfs(parsed, tag, nodes);
+    const n = Math.min(blocks.length, nodes.length);
+    for (let i = 0; i < n; i++) {
+      const order = extractTopLevelChildNames(blocks[i]);
+      Object.defineProperty(nodes[i], "_childOrder", {
+        value: order,
         enumerable: false,
         configurable: true,
       });
     }
   }
+}
+
+function extractTopLevelChildNames(blockXml: string): string[] {
+  const tagEnd = blockXml.indexOf(">");
+  const close = blockXml.lastIndexOf("<");
+  if (tagEnd < 0 || close <= tagEnd) return [];
+  const inner = blockXml.slice(tagEnd + 1, close);
+  const out: string[] = [];
+  let depth = 0;
+  let i = 0;
+  while (i < inner.length) {
+    if (inner[i] !== "<") {
+      i++;
+      continue;
+    }
+    if (inner.startsWith("</", i)) {
+      depth--;
+      const end = inner.indexOf(">", i);
+      if (end < 0) break;
+      i = end + 1;
+      continue;
+    }
+    if (inner.startsWith("<!--", i)) {
+      const end = inner.indexOf("-->", i);
+      if (end < 0) break;
+      i = end + 3;
+      continue;
+    }
+    const end = inner.indexOf(">", i);
+    if (end < 0) break;
+    const tag = inner.slice(i, end + 1);
+    const selfClose = tag.endsWith("/>");
+    const nameMatch = /^<([\w:]+)/.exec(tag);
+    if (depth === 0 && nameMatch) out.push(nameMatch[1]);
+    if (!selfClose) depth++;
+    i = end + 1;
+  }
+  return out;
+}
+
+function findAllRawBlocks(raw: string, fullName: string): string[] {
+  const blocks: string[] = [];
+  // Depth-aware scan so self-nesting tags (e.g. `<p:grpSp>` inside another
+  // `<p:grpSp>`) match their correct closing tag instead of the first inner
+  // one we encounter.
+  const openRe = new RegExp(`<${fullName}\\b[^>]*?(/?)>`, "g");
+  const closeTag = `</${fullName}>`;
+  let i = 0;
+  while (i < raw.length) {
+    openRe.lastIndex = i;
+    const m = openRe.exec(raw);
+    if (!m) break;
+    const start = m.index;
+    const tagEnd = openRe.lastIndex;
+    if (m[1] === "/") {
+      blocks.push(raw.slice(start, tagEnd));
+      i = tagEnd;
+      continue;
+    }
+    let depth = 1;
+    let scan = tagEnd;
+    const innerOpenRe = new RegExp(`<${fullName}\\b[^>]*?(/?)>`, "g");
+    while (depth > 0 && scan < raw.length) {
+      innerOpenRe.lastIndex = scan;
+      const nextOpen = innerOpenRe.exec(raw);
+      const nextClose = raw.indexOf(closeTag, scan);
+      if (nextClose < 0) {
+        depth = -1;
+        break;
+      }
+      if (nextOpen && nextOpen.index < nextClose) {
+        // Self-closing opens don't change depth.
+        if (nextOpen[1] !== "/") depth++;
+        scan = innerOpenRe.lastIndex;
+      } else {
+        depth--;
+        scan = nextClose + closeTag.length;
+      }
+    }
+    if (depth !== 0) break;
+    blocks.push(raw.slice(start, scan));
+    i = scan;
+  }
+  return blocks;
+}
+
+function annotateParagraphRawSrc(parsed: any, rawText: string): void {
+  // Cross-tag document order matters when a paragraph mixes <a:r>, <a:br>,
+  // and <a:fld>. fast-xml-parser groups by tag name, so we keep the raw
+  // XML for any paragraph that contains a break or a field.
+  if (rawText.includes("<a:br") || rawText.includes("<a:fld")) {
+    const blocks = findAllParagraphRawBlocks(rawText);
+    if (blocks.length) {
+      const parsedPs: any[] = [];
+      collectParagraphsDfs(parsed, parsedPs);
+      const n = Math.min(blocks.length, parsedPs.length);
+      for (let i = 0; i < n; i++) {
+        const block = blocks[i];
+        if (block.includes("<a:br") || block.includes("<a:fld")) {
+          Object.defineProperty(parsedPs[i], "_rawSrc", {
+            value: block,
+            enumerable: false,
+            configurable: true,
+          });
+        }
+      }
+    }
+  }
+  // <a:custGeom> path commands (moveTo, lnTo, cubicBezTo, …) are siblings,
+  // and their cross-tag order defines the silhouette of brand logos and
+  // hand-drawn shapes. Same fast-xml-parser issue, same fix: attach raw.
+  if (rawText.includes("<a:custGeom")) {
+    const blocks = findAllElementRawBlocks(rawText, "custGeom");
+    if (blocks.length) {
+      const parsedCustGeoms: any[] = [];
+      collectNamedDfs(parsed, "a:custGeom", parsedCustGeoms);
+      const n = Math.min(blocks.length, parsedCustGeoms.length);
+      for (let i = 0; i < n; i++) {
+        Object.defineProperty(parsedCustGeoms[i], "_rawSrc", {
+          value: blocks[i],
+          enumerable: false,
+          configurable: true,
+        });
+      }
+    }
+  }
+}
+
+function collectNamedDfs(node: any, key: string, acc: any[]): void {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const n of node) collectNamedDfs(n, key, acc);
+    return;
+  }
+  for (const k of Object.keys(node)) {
+    if (k.startsWith("@_") || k === "#text") continue;
+    if (k === key) {
+      for (const v of asArray(node[k])) acc.push(v);
+    } else {
+      collectNamedDfs(node[k], key, acc);
+    }
+  }
+}
+
+function findAllElementRawBlocks(raw: string, localName: string): string[] {
+  const blocks: string[] = [];
+  const openSelfClose = new RegExp(`<a:${localName}\\b[^>]*/>`);
+  const openTag = new RegExp(`<a:${localName}\\b[^>]*>`);
+  const close = `</a:${localName}>`;
+  let cursor = 0;
+  while (cursor < raw.length) {
+    const slice = raw.slice(cursor);
+    const sc = openSelfClose.exec(slice);
+    const ot = openTag.exec(slice);
+    // Pick whichever comes first (and only if it isn't a self-close that was
+    // also matched by openTag).
+    let start = -1;
+    let selfClose = false;
+    if (sc && (!ot || sc.index <= ot.index)) {
+      start = cursor + sc.index;
+      selfClose = true;
+    } else if (ot) {
+      start = cursor + ot.index;
+      selfClose = ot[0].endsWith("/>");
+    }
+    if (start < 0) break;
+    if (selfClose) {
+      const end = raw.indexOf(">", start);
+      blocks.push(raw.slice(start, end + 1));
+      cursor = end + 1;
+      continue;
+    }
+    const tagEnd = raw.indexOf(">", start);
+    const closeIdx = raw.indexOf(close, tagEnd + 1);
+    if (closeIdx < 0) break;
+    blocks.push(raw.slice(start, closeIdx + close.length));
+    cursor = closeIdx + close.length;
+  }
+  return blocks;
 }
 
 function findAllParagraphRawBlocks(raw: string): string[] {

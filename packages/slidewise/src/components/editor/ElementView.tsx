@@ -65,12 +65,17 @@ function TextView({
         : el.vAlign === "middle"
           ? "center"
           : "flex-end",
+    background: el.background,
+    padding: el.padding
+      ? `${el.padding.t}px ${el.padding.r}px ${el.padding.b}px ${el.padding.l}px`
+      : undefined,
+    boxSizing: el.padding ? "border-box" : undefined,
     cursor: editing ? "text" : "inherit",
   };
   const inner: React.CSSProperties = {
     width: "100%",
     color: el.color,
-    fontFamily: el.fontFamily,
+    fontFamily: withGenericFallback(el.fontFamily),
     fontSize: el.fontSize,
     fontWeight: el.fontWeight,
     fontStyle: el.italic ? "italic" : "normal",
@@ -85,11 +90,40 @@ function TextView({
     outline: "none",
   };
 
+  const backingPath = el.backingPath;
+  const positionedOuter: React.CSSProperties = backingPath
+    ? { ...outer, position: "relative" }
+    : outer;
+  const innerStacked: React.CSSProperties = backingPath
+    ? { ...inner, position: "relative", zIndex: 1 }
+    : inner;
+  const backingSvg = backingPath ? (
+    <svg
+      viewBox={`0 0 ${backingPath.viewW} ${backingPath.viewH}`}
+      preserveAspectRatio="none"
+      style={{
+        position: "absolute",
+        inset: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+        zIndex: 0,
+      }}
+    >
+      <path
+        d={backingPath.d}
+        fill={backingPath.fill}
+        fillRule={backingPath.fillRule ?? "nonzero"}
+      />
+    </svg>
+  ) : null;
+
   if (editing) {
     return (
-      <div style={outer}>
+      <div style={positionedOuter}>
+        {backingSvg}
         <EditableText
-          style={inner}
+          style={innerStacked}
           initialText={el.text}
           initialRuns={el.runs}
           onCommit={(t, r) => onCommit?.(t, r)}
@@ -100,8 +134,9 @@ function TextView({
 
   if (el.runs && el.runs.length) {
     return (
-      <div style={outer}>
-        <div style={inner}>
+      <div style={positionedOuter}>
+        {backingSvg}
+        <div style={innerStacked}>
           {el.runs.map((r, i) => (
             <span key={i} style={runCssStyle(r)}>
               {r.text}
@@ -113,15 +148,40 @@ function TextView({
   }
 
   return (
-    <div style={outer}>
-      <div style={inner}>{el.text}</div>
+    <div style={positionedOuter}>
+      {backingSvg}
+      <div style={innerStacked}>{el.text}</div>
     </div>
   );
 }
 
+/**
+ * Append a `sans-serif` generic so brand families imported from PPTX
+ * (e.g. "EON Office Head") degrade gracefully when the typeface isn't
+ * installed locally — without the generic the browser silently picks
+ * its default serif. Already-qualified stacks (containing a comma) and
+ * plain generics ("serif"/"monospace") pass through untouched.
+ */
+function withGenericFallback(family: string | undefined): string | undefined {
+  if (!family) return family;
+  if (family.includes(",")) return family;
+  const lower = family.trim().toLowerCase();
+  if (
+    lower === "serif" ||
+    lower === "sans-serif" ||
+    lower === "monospace" ||
+    lower === "cursive" ||
+    lower === "fantasy" ||
+    lower === "system-ui"
+  ) {
+    return family;
+  }
+  return `${family}, sans-serif`;
+}
+
 function runCssStyle(r: TextRun): React.CSSProperties {
   const s: React.CSSProperties = {};
-  if (r.fontFamily) s.fontFamily = r.fontFamily;
+  if (r.fontFamily) s.fontFamily = withGenericFallback(r.fontFamily);
   if (r.fontSize) s.fontSize = r.fontSize;
   if (r.fontWeight) s.fontWeight = r.fontWeight;
   if (r.color) s.color = r.color;
@@ -315,6 +375,27 @@ function sameStyle(a: TextRun, b: TextRun): boolean {
 function ShapeView({ el }: { el: ShapeElement }) {
   const stroke = el.stroke ?? "transparent";
   const sw = el.strokeWidth ?? 0;
+  // Custom vector path (PPTX <a:custGeom>) takes precedence over the preset
+  // kind — the path coordinates already encode the actual silhouette.
+  if (el.path) {
+    return (
+      <svg
+        viewBox={`0 0 ${el.path.viewW} ${el.path.viewH}`}
+        preserveAspectRatio="none"
+        width="100%"
+        height="100%"
+      >
+        <path
+          d={el.path.d}
+          fill={el.fill}
+          fillRule={el.path.fillRule ?? "nonzero"}
+          stroke={stroke}
+          strokeWidth={sw || undefined}
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    );
+  }
   if (el.shape === "rect" || el.shape === "rounded") {
     return (
       <div
@@ -474,7 +555,9 @@ function LineView({ el }: { el: LineElement }) {
 function TableView({ el }: { el: TableElement }) {
   const cols = el.rows[0]?.length ?? 1;
   // PPTX-faithful: contiguous cells, no inter-cell gap, no rounded corners.
-  // Earlier "card grid" styling drifted too far from the source look.
+  // Cells share their dividers via inset box-shadows so we draw a single
+  // grid line between adjacent cells instead of doubling-up borders.
+  const stroke = el.borderColor ?? "rgba(0, 0, 0, 0.12)";
   return (
     <div
       style={{
@@ -485,6 +568,7 @@ function TableView({ el }: { el: TableElement }) {
         height: "100%",
         gap: 0,
         background: "transparent",
+        boxShadow: `inset 0 0 0 1px ${stroke}`,
       }}
     >
       {el.rows.flatMap((row, ri) =>
@@ -504,6 +588,10 @@ function TableView({ el }: { el: TableElement }) {
               minHeight: 0,
               overflow: "hidden",
               wordBreak: "break-word",
+              borderRight:
+                ci < cols - 1 ? `1px solid ${stroke}` : undefined,
+              borderBottom:
+                ri < el.rows.length - 1 ? `1px solid ${stroke}` : undefined,
             }}
           >
             {cell}
