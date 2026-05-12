@@ -67,6 +67,15 @@ export interface TextElement extends BaseElement {
   lineHeight: number;
   letterSpacing: number;
   /**
+   * Optional CSS background applied behind the text box. PPTX importers set
+   * this from the layout placeholder's fill when the slide overrides the
+   * placeholder (e.g. a tinted body box hosting slide-supplied text). Stays
+   * with the text element so it sits at the same z as the text — important
+   * when the slide also has a full-bleed image that would otherwise cover
+   * the fill if rendered as a separate underlay shape.
+   */
+  background?: string;
+  /**
    * Optional rich-text breakdown. When present, the renderer and PPTX writer
    * use these per-run styles; the flat fields above act as defaults for any
    * field a run leaves unset. Editing the text via the contentEditable surface

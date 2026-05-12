@@ -74,6 +74,8 @@ interface PlaceholderInfo {
   lvlPPr?: (any | undefined)[];
   /** Fallback paragraphs (used when the slide placeholder has no text). */
   paragraphs?: any[];
+  /** Raw spPr (used to resolve the placeholder's own fill / stroke). */
+  spPr?: any;
 }
 
 interface MasterTextDefaults {
@@ -422,13 +424,18 @@ async function walkUnderlay(
     if (isHiddenNode(sp, "p:nvSpPr")) continue;
     const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
     if (ph) {
-      // Picture placeholders are "Insert Picture" prompts in PowerPoint; when
-      // the slide supplies an actual image, the prompt panel must hide.
       const isPicPrompt = ph["@_type"] === "pic";
-      if (isPicPrompt && slidePhKeys.has(placeholderKey(ph))) continue;
-      // For other placeholders (tinted body boxes, numbered chips, etc.) the
-      // slide owns the text but the layout owns the fill — emit a fill-only
-      // backing rect behind it.
+      const isOverridden = slidePhKeys.has(placeholderKey(ph));
+      // Picture placeholders are "Insert Picture" prompts; when the slide
+      // supplies an actual image, the prompt panel must hide.
+      if (isPicPrompt && isOverridden) continue;
+      // When the slide hosts this placeholder, its fill rides on the
+      // slide's text element (TextElement.background) so it stays at the
+      // text's z-index — important when the slide also has a full-bleed
+      // image that would otherwise cover an underlay-emitted backing.
+      if (isOverridden) continue;
+      // Unreferenced placeholders: emit a fill-only backing so coloured
+      // boxes (numbered chips, decorative panels) appear.
       const filler = await placeholderFillUnderlay(sp, ctx, outer);
       if (filler) out.push(filler);
       continue;
@@ -545,26 +552,49 @@ async function parseSpTree(
   outer: GroupTransform
 ): Promise<SlideElement[]> {
   const out: SlideElement[] = [];
-  for (const sp of asArray(spTree["p:sp"])) {
-    const el = await parseSpOrText(sp, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const pic of asArray(spTree["p:pic"])) {
-    const el = await parsePic(pic, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const cxn of asArray(spTree["p:cxnSp"])) {
-    const el = parseCxn(cxn, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const gf of asArray(spTree["p:graphicFrame"])) {
-    const el = parseGraphicFrame(gf, ctx, outer);
-    if (el) out.push(el);
-  }
-  for (const grp of asArray(spTree["p:grpSp"])) {
-    const inner = composeGroupTransform(grp, outer);
-    const children = await parseSpTree(grp, ctx, inner);
-    out.push(...children);
+  // Cursor per tag — we pop from each parsed array as we encounter its tag
+  // in the document-order list, so the same elements get visited in the
+  // order they appeared in the source XML (which determines z-index).
+  const cursors: Record<string, number> = {
+    "p:sp": 0,
+    "p:pic": 0,
+    "p:cxnSp": 0,
+    "p:graphicFrame": 0,
+    "p:grpSp": 0,
+  };
+  const order: string[] = (spTree as any)?._childOrder ?? [
+    // Fall back to legacy tag-grouped order when raw isn't attached
+    // (e.g. tests that build a parsed structure by hand).
+    ...asArray(spTree["p:sp"]).map(() => "p:sp"),
+    ...asArray(spTree["p:pic"]).map(() => "p:pic"),
+    ...asArray(spTree["p:cxnSp"]).map(() => "p:cxnSp"),
+    ...asArray(spTree["p:graphicFrame"]).map(() => "p:graphicFrame"),
+    ...asArray(spTree["p:grpSp"]).map(() => "p:grpSp"),
+  ];
+
+  for (const tag of order) {
+    if (!(tag in cursors)) continue;
+    const arr = asArray((spTree as any)[tag]);
+    const idx = cursors[tag]++;
+    const node = arr[idx];
+    if (!node) continue;
+    if (tag === "p:sp") {
+      const el = await parseSpOrText(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:pic") {
+      const el = await parsePic(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:cxnSp") {
+      const el = parseCxn(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:graphicFrame") {
+      const el = parseGraphicFrame(node, ctx, outer);
+      if (el) out.push(el);
+    } else if (tag === "p:grpSp") {
+      const inner = composeGroupTransform(node, outer);
+      const children = await parseSpTree(node, ctx, inner);
+      out.push(...children);
+    }
   }
   return out;
 }
@@ -882,6 +912,16 @@ function makeTextElement(
       : 0,
     ...(hasMixedFormatting ? { runs } : {}),
   };
+  // Layout placeholders often supply a fill (e.g. a tinted body box, a
+  // white logo plate) that should sit *immediately* behind the slide's
+  // hosted text — at the same z, not in the underlay. Otherwise a
+  // full-bleed image on the slide will cover the fill.
+  const phFill = layoutPh?.spPr
+    ? extractShapeFill(layoutPh.spPr, ctx.theme)
+    : undefined;
+  if (phFill && phFill !== "transparent") {
+    el.background = phFill;
+  }
   return el;
 }
 
@@ -1233,6 +1273,7 @@ function extractPlaceholders(rootXml: any): Map<string, PlaceholderInfo> {
       bodyPr: txBody?.["a:bodyPr"],
       lvlPPr: lvlPPr.some(Boolean) ? lvlPPr : undefined,
       paragraphs: hasAnyText(txBody) ? paragraphs : undefined,
+      spPr: sp?.["p:spPr"],
     };
     out.set(placeholderKey(ph), info);
   }
@@ -2434,11 +2475,129 @@ async function readXml(zip: JSZip, path: string): Promise<any | null> {
   if (!file) return null;
   const text = await file.async("string");
   const parsed = xmlParser.parse(text);
-  // fast-xml-parser groups children by tag name, so <a:r>/<a:br> document
-  // order inside a paragraph is lost. Attach the paragraph's raw XML when
-  // it contains a break so we can recover the order at render time.
-  annotateParagraphRawSrc(parsed, text);
+  // fast-xml-parser groups children by tag name and drops cross-tag
+  // document order. Attach raw fragments for paragraphs (run/br/fld
+  // interleaving), custGeom path commands, and spTree/grpSp children
+  // (which carry z-index via source order).
+  annotateRawOrder(parsed, text);
   return parsed;
+}
+
+function annotateRawOrder(parsed: any, rawText: string): void {
+  annotateParagraphRawSrc(parsed, rawText);
+  annotateSpTreeChildOrder(parsed, rawText);
+}
+
+/**
+ * Attach `_childOrder: string[]` to every parsed `<p:spTree>` and
+ * `<p:grpSp>` so callers can iterate children (sp, pic, cxnSp,
+ * graphicFrame, grpSp) in document order. PPTX z-index follows source
+ * order — a slide that lists `<p:pic>` before `<p:sp>` means the picture
+ * sits behind the text — but fast-xml-parser groups children by tag name
+ * and drops cross-tag ordering.
+ */
+function annotateSpTreeChildOrder(parsed: any, rawText: string): void {
+  if (!rawText.includes("<p:spTree") && !rawText.includes("<p:grpSp")) return;
+  for (const tag of ["p:spTree", "p:grpSp"] as const) {
+    if (!rawText.includes(`<${tag}`)) continue;
+    const blocks = findAllRawBlocks(rawText, tag);
+    if (!blocks.length) continue;
+    const nodes: any[] = [];
+    collectNamedDfs(parsed, tag, nodes);
+    const n = Math.min(blocks.length, nodes.length);
+    for (let i = 0; i < n; i++) {
+      const order = extractTopLevelChildNames(blocks[i]);
+      Object.defineProperty(nodes[i], "_childOrder", {
+        value: order,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  }
+}
+
+function extractTopLevelChildNames(blockXml: string): string[] {
+  const tagEnd = blockXml.indexOf(">");
+  const close = blockXml.lastIndexOf("<");
+  if (tagEnd < 0 || close <= tagEnd) return [];
+  const inner = blockXml.slice(tagEnd + 1, close);
+  const out: string[] = [];
+  let depth = 0;
+  let i = 0;
+  while (i < inner.length) {
+    if (inner[i] !== "<") {
+      i++;
+      continue;
+    }
+    if (inner.startsWith("</", i)) {
+      depth--;
+      const end = inner.indexOf(">", i);
+      if (end < 0) break;
+      i = end + 1;
+      continue;
+    }
+    if (inner.startsWith("<!--", i)) {
+      const end = inner.indexOf("-->", i);
+      if (end < 0) break;
+      i = end + 3;
+      continue;
+    }
+    const end = inner.indexOf(">", i);
+    if (end < 0) break;
+    const tag = inner.slice(i, end + 1);
+    const selfClose = tag.endsWith("/>");
+    const nameMatch = /^<([\w:]+)/.exec(tag);
+    if (depth === 0 && nameMatch) out.push(nameMatch[1]);
+    if (!selfClose) depth++;
+    i = end + 1;
+  }
+  return out;
+}
+
+function findAllRawBlocks(raw: string, fullName: string): string[] {
+  const blocks: string[] = [];
+  // Depth-aware scan so self-nesting tags (e.g. `<p:grpSp>` inside another
+  // `<p:grpSp>`) match their correct closing tag instead of the first inner
+  // one we encounter.
+  const openRe = new RegExp(`<${fullName}\\b[^>]*?(/?)>`, "g");
+  const closeTag = `</${fullName}>`;
+  let i = 0;
+  while (i < raw.length) {
+    openRe.lastIndex = i;
+    const m = openRe.exec(raw);
+    if (!m) break;
+    const start = m.index;
+    const tagEnd = openRe.lastIndex;
+    if (m[1] === "/") {
+      blocks.push(raw.slice(start, tagEnd));
+      i = tagEnd;
+      continue;
+    }
+    let depth = 1;
+    let scan = tagEnd;
+    const innerOpenRe = new RegExp(`<${fullName}\\b[^>]*?(/?)>`, "g");
+    while (depth > 0 && scan < raw.length) {
+      innerOpenRe.lastIndex = scan;
+      const nextOpen = innerOpenRe.exec(raw);
+      const nextClose = raw.indexOf(closeTag, scan);
+      if (nextClose < 0) {
+        depth = -1;
+        break;
+      }
+      if (nextOpen && nextOpen.index < nextClose) {
+        // Self-closing opens don't change depth.
+        if (nextOpen[1] !== "/") depth++;
+        scan = innerOpenRe.lastIndex;
+      } else {
+        depth--;
+        scan = nextClose + closeTag.length;
+      }
+    }
+    if (depth !== 0) break;
+    blocks.push(raw.slice(start, scan));
+    i = scan;
+  }
+  return blocks;
 }
 
 function annotateParagraphRawSrc(parsed: any, rawText: string): void {

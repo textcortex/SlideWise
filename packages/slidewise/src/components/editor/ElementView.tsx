@@ -70,6 +70,7 @@ function TextView({
   const inner: React.CSSProperties = {
     width: "100%",
     color: el.color,
+    background: el.background,
     fontFamily: withGenericFallback(el.fontFamily),
     fontSize: el.fontSize,
     fontWeight: el.fontWeight,
