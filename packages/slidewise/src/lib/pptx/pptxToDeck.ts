@@ -69,14 +69,16 @@ interface PlaceholderInfo {
   rPr?: any;
   pPr?: any;
   bodyPr?: any;
+  /** Per-level paragraph defaults from <a:lstStyle><a:lvlNpPr>. */
+  lvlPPr?: (any | undefined)[];
   /** Fallback paragraphs (used when the slide placeholder has no text). */
   paragraphs?: any[];
 }
 
 interface MasterTextDefaults {
-  title?: any; // a:lvl1pPr (and friends) — we only use lvl1.
-  body?: any;
-  other?: any;
+  title?: (any | undefined)[]; // titleStyle lvl1..lvl9 pPr
+  body?: (any | undefined)[]; // bodyStyle lvl1..lvl9 pPr
+  other?: (any | undefined)[];
 }
 
 interface ParseContext {
@@ -745,14 +747,16 @@ function makeTextElement(
         ? { "a:bodyPr": masterPh.bodyPr, "a:p": masterPh.paragraphs }
         : txBody;
 
-  // Master defaults for the placeholder type (title vs body vs other).
+  // Master defaults for the placeholder type (title vs body vs other), as
+  // an array of lvl1..lvl9 paragraph properties.
   const phType = ph?.["@_type"];
-  const masterDef =
+  const masterLevels: (any | undefined)[] =
     phType === "title" || phType === "ctrTitle"
-      ? ctx.masterTextDefaults.title
+      ? (ctx.masterTextDefaults.title ?? [])
       : phType === "body" || phType === "subTitle"
-        ? ctx.masterTextDefaults.body
-        : ctx.masterTextDefaults.other;
+        ? (ctx.masterTextDefaults.body ?? [])
+        : (ctx.masterTextDefaults.other ?? []);
+  const masterLvl1 = masterLevels[0];
 
   // Accumulate inheritance: slide < layout < master < masterDefaults. Each
   // level can specify just a subset of fields (the layout might set the
@@ -761,21 +765,43 @@ function makeTextElement(
   const fallbackRPr = mergeRPrChain(
     layoutPh?.rPr,
     masterPh?.rPr,
-    masterDef?.["a:defRPr"]
+    masterLvl1?.["a:defRPr"]
   );
   const fallbackPPr = mergeFirst(
     layoutPh?.pPr,
     masterPh?.pPr,
-    masterDef
+    masterLvl1
   );
   const fallbackBodyPr = mergeFirst(layoutPh?.bodyPr, masterPh?.bodyPr);
+
+  // Resolve a per-level [layoutLvl, masterPhLvl, masterTxStyleLvl] chain so
+  // bullet/alignment/lineSpacing each fall through independently when an
+  // earlier layer is silent on that particular field.
+  const listStyle: (any | undefined)[][] = [];
+  for (let i = 0; i < 9; i++) {
+    const chain = [
+      layoutPh?.lvlPPr?.[i],
+      masterPh?.lvlPPr?.[i],
+      masterLevels[i],
+    ].filter(Boolean);
+    listStyle.push(chain);
+  }
+
+  // <a:bodyPr><a:normAutofit fontScale="..." lnSpcReduction="..."/> shrinks
+  // text that overflowed when authored — apply so wraps don't push runs off
+  // the slide.
+  const autoFit = readNormAutofit(
+    effectiveTxBody?.["a:bodyPr"] ?? fallbackBodyPr
+  );
 
   const text = extractRuns(
     effectiveTxBody,
     ctx.theme,
     fallbackRPr,
     fallbackPPr,
-    ctx.themeFonts
+    ctx.themeFonts,
+    listStyle,
+    autoFit
   );
   const first = text.runs[0];
   const align = text.align ?? readAlign(fallbackPPr) ?? "left";
@@ -1181,7 +1207,9 @@ function extractPlaceholders(rootXml: any): Map<string, PlaceholderInfo> {
     // <a:lstStyle><a:lvl1pPr> (font, size, colour, etc). A stub <a:r><a:rPr/>
     // with just `lang` carries no real style — prefer the lstStyle defaults
     // over an empty inline rPr so the layout's typography reaches the slide.
-    const lvl1 = txBody?.["a:lstStyle"]?.["a:lvl1pPr"];
+    const lstStyle = txBody?.["a:lstStyle"];
+    const lvl1 = lstStyle?.["a:lvl1pPr"];
+    const lvlPPr = collectLevelPPrs(lstStyle);
     const stubRPr = firstR?.["a:rPr"];
     const info: PlaceholderInfo = {
       rawX: off ? emuToPx(Number(off["@_x"] ?? 0)) : undefined,
@@ -1196,6 +1224,7 @@ function extractPlaceholders(rootXml: any): Map<string, PlaceholderInfo> {
       ),
       pPr: lvl1 ?? firstP?.["a:pPr"],
       bodyPr: txBody?.["a:bodyPr"],
+      lvlPPr: lvlPPr.some(Boolean) ? lvlPPr : undefined,
       paragraphs: hasAnyText(txBody) ? paragraphs : undefined,
     };
     out.set(placeholderKey(ph), info);
@@ -1236,10 +1265,19 @@ function extractMasterTextDefaults(masterXml: any): MasterTextDefaults {
   const txStyles = masterXml?.["p:sldMaster"]?.["p:txStyles"];
   if (!txStyles) return {};
   return {
-    title: txStyles?.["p:titleStyle"]?.["a:lvl1pPr"],
-    body: txStyles?.["p:bodyStyle"]?.["a:lvl1pPr"],
-    other: txStyles?.["p:otherStyle"]?.["a:lvl1pPr"],
+    title: collectLevelPPrs(txStyles?.["p:titleStyle"]),
+    body: collectLevelPPrs(txStyles?.["p:bodyStyle"]),
+    other: collectLevelPPrs(txStyles?.["p:otherStyle"]),
   };
+}
+
+function collectLevelPPrs(style: any): (any | undefined)[] {
+  if (!style) return [];
+  const out: (any | undefined)[] = [];
+  for (let lvl = 1; lvl <= 9; lvl++) {
+    out.push(style[`a:lvl${lvl}pPr`]);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,7 +1758,9 @@ function extractRuns(
   theme: ThemeColors,
   fallbackRPr?: any,
   fallbackPPr?: any,
-  themeFonts: ThemeFonts = {}
+  themeFonts: ThemeFonts = {},
+  listStyle: (any | undefined)[][] = [],
+  autoFit?: AutoFit
 ): {
   runs: RunInfo[];
   plain: string;
@@ -1732,21 +1772,58 @@ function extractRuns(
   let lineHeightPct: number | undefined;
   const paragraphs = asArray(txBody?.["a:p"]);
   const pieces: string[] = [];
+  const autoNumCounters = new Map<number, number>();
+  let prevAutoKey: string | undefined;
 
   for (let pi = 0; pi < paragraphs.length; pi++) {
     const p = paragraphs[pi];
     const pPr = p?.["a:pPr"];
+    const lvl = clampLevel(Number(pPr?.["@_lvl"] ?? 0));
+    const levelChain = listStyle[lvl] ?? [];
+    const findLevel = (k: string): any =>
+      [pPr, ...levelChain, fallbackPPr].find((s) => s?.[k] !== undefined);
     if (!align) {
-      align = readAlign(pPr) ?? readAlign(fallbackPPr);
+      align =
+        readAlign(pPr) ??
+        readAlign(levelChain.find((s) => s?.["@_algn"])) ??
+        readAlign(fallbackPPr);
     }
     if (lineHeightPct === undefined) {
-      const lnPct =
-        pPr?.["a:lnSpc"]?.["a:spcPct"]?.["@_val"] ??
-        fallbackPPr?.["a:lnSpc"]?.["a:spcPct"]?.["@_val"];
-      if (lnPct) lineHeightPct = Number(lnPct) / 100000;
+      const src = findLevel("a:lnSpc");
+      const lnPct = src?.["a:lnSpc"]?.["a:spcPct"]?.["@_val"];
+      if (lnPct) {
+        const base = Number(lnPct) / 100000;
+        const reduction = autoFit?.lnSpcReduction ?? 0;
+        lineHeightPct = base * (1 - reduction);
+      }
     }
+
+    // Resolve bullet across the inheritance chain (slide pPr > layout > master
+    // placeholder > master txStyles). Each layer can specify just the bullet
+    // without overriding everything else.
+    const bullet = resolveBullet([pPr, ...levelChain]);
+    const prefix = computeBulletPrefix(
+      bullet,
+      lvl,
+      autoNumCounters,
+      prevAutoKey
+    );
+    prevAutoKey = prefix.autoKey;
+
     const rs = asArray(p?.["a:r"]);
+    const paraStart = runs.length;
     const paragraphText: string[] = [];
+    if (prefix.text) paragraphText.push(prefix.text);
+
+    const onRun = (r: any) => {
+      const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+      if (autoFit?.fontScale && built.run.fontSize) {
+        built.run.fontSize *= autoFit.fontScale;
+      }
+      runs.push(built.run);
+      paragraphText.push(built.text);
+    };
+
     // <a:br/> hard line breaks are siblings of <a:r>; when present, walk the
     // paragraph children in document order so the break lands between the
     // correct runs. Otherwise stay on the fast path.
@@ -1754,25 +1831,23 @@ function extractRuns(
       const order = paragraphChildOrder(p);
       for (const entry of order) {
         if (entry.kind === "br") {
-          // Attach the break to the previous run's text rather than emitting
-          // a synthetic empty run, so styling round-trips cleanly.
           if (runs.length) runs[runs.length - 1].text += "\n";
           paragraphText.push("\n");
           continue;
         }
         const r = rs[entry.index];
-        if (!r) continue;
-        const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
-        runs.push(built.run);
-        paragraphText.push(built.text);
+        if (r) onRun(r);
       }
     } else {
-      for (const r of rs) {
-        const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
-        runs.push(built.run);
-        paragraphText.push(built.text);
-      }
+      for (const r of rs) onRun(r);
     }
+
+    // Prepend the bullet prefix to the first run of this paragraph so it
+    // survives renderers that walk `runs` instead of the joined `plain` text.
+    if (prefix.text && runs.length > paraStart) {
+      runs[paraStart].text = prefix.text + runs[paraStart].text;
+    }
+
     pieces.push(paragraphText.join(""));
   }
   return {
@@ -1781,6 +1856,149 @@ function extractRuns(
     align,
     lineHeightPct,
   };
+}
+
+interface AutoFit {
+  fontScale?: number; // 0..1
+  lnSpcReduction?: number; // 0..1
+}
+
+function readNormAutofit(bodyPr: any): AutoFit | undefined {
+  const af = bodyPr?.["a:normAutofit"];
+  if (!af) return undefined;
+  const fontScale = af["@_fontScale"] ? Number(af["@_fontScale"]) / 100000 : undefined;
+  const lnSpcReduction = af["@_lnSpcReduction"]
+    ? Number(af["@_lnSpcReduction"]) / 100000
+    : undefined;
+  if (fontScale === undefined && lnSpcReduction === undefined) return undefined;
+  return { fontScale, lnSpcReduction };
+}
+
+interface ResolvedBullet {
+  kind: "none" | "char" | "auto";
+  char?: string;
+  autoType?: string;
+  autoStartAt?: number;
+}
+
+function resolveBullet(sources: (any | undefined)[]): ResolvedBullet {
+  // First source that defines any of buNone/buChar/buAutoNum wins.
+  for (const src of sources) {
+    if (!src) continue;
+    if (src["a:buNone"] !== undefined) return { kind: "none" };
+    if (src["a:buChar"]?.["@_char"])
+      return { kind: "char", char: String(src["a:buChar"]["@_char"]) };
+    if (src["a:buAutoNum"]) {
+      return {
+        kind: "auto",
+        autoType: src["a:buAutoNum"]["@_type"] ?? "arabicPeriod",
+        autoStartAt: src["a:buAutoNum"]["@_startAt"]
+          ? Number(src["a:buAutoNum"]["@_startAt"])
+          : 1,
+      };
+    }
+  }
+  return { kind: "none" };
+}
+
+function computeBulletPrefix(
+  bullet: ResolvedBullet,
+  level: number,
+  counters: Map<number, number>,
+  prevAutoKey: string | undefined
+): { text: string; autoKey: string | undefined } {
+  const indent = "  ".repeat(level);
+  if (bullet.kind === "none") {
+    // Drop the counter so a later run of <a:buAutoNum> restarts at 1 even at
+    // the same level.
+    counters.delete(level);
+    return { text: "", autoKey: undefined };
+  }
+  if (bullet.kind === "char") {
+    counters.delete(level);
+    return {
+      text: `${indent}${bullet.char ?? "•"}  `,
+      autoKey: undefined,
+    };
+  }
+  const key = `auto|${level}|${bullet.autoType ?? "arabicPeriod"}`;
+  const continuing = key === prevAutoKey;
+  const next = continuing
+    ? (counters.get(level) ?? bullet.autoStartAt ?? 1) + 1
+    : bullet.autoStartAt ?? 1;
+  counters.set(level, next);
+  return {
+    text: `${indent}${formatAutoNum(next, bullet.autoType ?? "arabicPeriod")}  `,
+    autoKey: key,
+  };
+}
+
+function formatAutoNum(n: number, type: string): string {
+  switch (type) {
+    case "arabicPlain":
+      return `${n}`;
+    case "arabicParenR":
+      return `${n})`;
+    case "arabicParenBoth":
+      return `(${n})`;
+    case "arabicPeriod":
+      return `${n}.`;
+    case "alphaUcPeriod":
+      return `${toAlpha(n).toUpperCase()}.`;
+    case "alphaLcPeriod":
+      return `${toAlpha(n)}.`;
+    case "romanUcPeriod":
+      return `${toRoman(n).toUpperCase()}.`;
+    case "romanLcPeriod":
+      return `${toRoman(n)}.`;
+    default:
+      return `${n}.`;
+  }
+}
+
+function toAlpha(n: number): string {
+  let s = "";
+  let v = n;
+  while (v > 0) {
+    const r = (v - 1) % 26;
+    s = String.fromCharCode(97 + r) + s;
+    v = Math.floor((v - 1) / 26);
+  }
+  return s || "a";
+}
+
+function toRoman(n: number): string {
+  if (n <= 0) return "";
+  const pairs: [number, string][] = [
+    [1000, "m"],
+    [900, "cm"],
+    [500, "d"],
+    [400, "cd"],
+    [100, "c"],
+    [90, "xc"],
+    [50, "l"],
+    [40, "xl"],
+    [10, "x"],
+    [9, "ix"],
+    [5, "v"],
+    [4, "iv"],
+    [1, "i"],
+  ];
+  let out = "";
+  let v = n;
+  for (const [val, sym] of pairs) {
+    while (v >= val) {
+      out += sym;
+      v -= val;
+    }
+  }
+  return out;
+}
+
+function clampLevel(n: number): number {
+  if (!Number.isFinite(n) || n < 0) return 0;
+  if (n > 8) return 8;
+  return Math.floor(n);
 }
 
 function buildRunInfo(
