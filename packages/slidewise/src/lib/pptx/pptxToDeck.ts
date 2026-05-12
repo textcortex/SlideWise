@@ -328,17 +328,26 @@ async function parseSlide(
 
   const sld = xml["p:sld"];
   const cSld = sld?.["p:cSld"];
-  const slideBg = extractBackground(cSld?.["p:bg"], ctx);
+  const slideBg = await extractBackground(
+    cSld?.["p:bg"],
+    ctx,
+    slideRels,
+    slidePath
+  );
   const layoutBg = layoutXml
-    ? extractBackground(
+    ? await extractBackground(
         layoutXml?.["p:sldLayout"]?.["p:cSld"]?.["p:bg"],
-        ctx
+        ctx,
+        layoutRels,
+        layoutPath!
       )
     : undefined;
   const masterBg = masterXml
-    ? extractBackground(
+    ? await extractBackground(
         masterXml?.["p:sldMaster"]?.["p:cSld"]?.["p:bg"],
-        ctx
+        ctx,
+        masterRels,
+        masterPath!
       )
     : undefined;
   const background = slideBg ?? layoutBg ?? masterBg ?? "#FFFFFF";
@@ -1733,7 +1742,12 @@ function clampPct(v: number): number {
   return v;
 }
 
-function extractBackground(bg: any, ctx: ParseContext): string | undefined {
+async function extractBackground(
+  bg: any,
+  ctx: ParseContext,
+  rels: Rels,
+  basePath: string
+): Promise<string | undefined> {
   if (!bg) return undefined;
   const bgPr = bg["p:bgPr"];
   if (bgPr) {
@@ -1742,12 +1756,36 @@ function extractBackground(bg: any, ctx: ParseContext): string | undefined {
     if (solid) return solid;
     const grad = extractShapeFill({ "a:gradFill": bgPr["a:gradFill"] }, ctx.theme);
     if (grad) return grad;
-    // blipFill bg → render as the embedded image via CSS background. Falls
-    // through to undefined for now; tracked for a follow-up.
+    const blip = bgPr["a:blipFill"]?.["a:blip"];
+    if (blip) {
+      const url = await blipDataUrl(blip, ctx, rels, basePath);
+      if (url) return `center / cover no-repeat url("${url}")`;
+    }
   }
   const bgRef = bg["p:bgRef"];
   if (bgRef) return resolveBgRef(bgRef, ctx);
   return undefined;
+}
+
+async function blipDataUrl(
+  blip: any,
+  ctx: ParseContext,
+  rels: Rels,
+  basePath: string
+): Promise<string | undefined> {
+  // Prefer the vector embed when present (dual-blip SVG pattern); fall
+  // back to the raster.
+  const svgRef = findSvgBlipRef(blip);
+  const rid = svgRef ?? blip?.["@_r:embed"];
+  if (!rid) return undefined;
+  const target = rels.byId.get(rid)?.target;
+  if (!target) return undefined;
+  const full = normalisePath(target, dirOf(basePath));
+  const file = ctx.zip.file(full);
+  if (!file) return undefined;
+  const base64 = await file.async("base64");
+  const ext = (full.split(".").pop() || "png").toLowerCase();
+  return `data:${mimeForExt(ext)};base64,${base64}`;
 }
 
 /**
@@ -2278,6 +2316,11 @@ function custGeomBodyToSvgD(pathBlock: string): string {
   let out = "";
   let i = 0;
   let depth = 0;
+  // Track the current pen position so <a:arcTo> (which doesn't carry an
+  // explicit end point) can compute its SVG `A` endpoint from start +
+  // sweep angle, just like PowerPoint does at render time.
+  let penX = 0;
+  let penY = 0;
   while (i < inner.length) {
     if (inner[i] !== "<") {
       i++;
@@ -2311,21 +2354,16 @@ function custGeomBodyToSvgD(pathBlock: string): string {
         name === "cubicBezTo" ||
         name === "quadBezTo"
       ) {
-        // Each command's <a:pt x="..." y="..."/> children are siblings — pull
-        // them out of the inner block in document order. SVG path commands
-        // take all of their control points after a single letter:
-        // cubicBezTo → "C x1 y1 x2 y2 x3 y3", quadBezTo → "Q x1 y1 x2 y2",
-        // moveTo/lnTo → "M x y" / "L x y".
         const cmdClose = inner.indexOf(`</a:${name}>`, close + 1);
         if (cmdClose < 0) break;
         const body = inner.slice(close + 1, cmdClose);
-        const coords: string[] = [];
+        const pts: Array<[number, number]> = [];
         const ptRe = /<a:pt\s+x="(-?\d+)"\s+y="(-?\d+)"\s*\/>/g;
         let m: RegExpExecArray | null;
         while ((m = ptRe.exec(body))) {
-          coords.push(m[1], m[2]);
+          pts.push([Number(m[1]), Number(m[2])]);
         }
-        if (coords.length) {
+        if (pts.length) {
           const letter =
             name === "moveTo"
               ? "M"
@@ -2334,12 +2372,41 @@ function custGeomBodyToSvgD(pathBlock: string): string {
                 : name === "cubicBezTo"
                   ? "C"
                   : "Q";
-          out += ` ${letter} ${coords.join(" ")}`;
+          out += ` ${letter} ${pts.map(([x, y]) => `${x} ${y}`).join(" ")}`;
+          const last = pts[pts.length - 1];
+          penX = last[0];
+          penY = last[1];
         }
         i = cmdClose + `</a:${name}>`.length;
         continue;
+      } else if (name === "arcTo") {
+        // <a:arcTo wR="" hR="" stAng="" swAng="" /> — elliptical arc
+        // starting at the current pen position. wR/hR are the axis radii;
+        // stAng/swAng are start/sweep angles measured in 60000ths of a
+        // degree (OOXML convention). The start point on the ellipse is
+        // (centre.x + wR·cos(stAng), centre.y + hR·sin(stAng)); the
+        // centre is therefore (pen.x − wR·cos(stAng), pen.y − hR·sin(stAng)).
+        // SVG `A` takes the END point instead of an angle, so we compute
+        // the end from start + swAng.
+        const wR = Number(/\bwR="(-?\d+)"/.exec(tag)?.[1] ?? 0);
+        const hR = Number(/\bhR="(-?\d+)"/.exec(tag)?.[1] ?? 0);
+        const stAng = Number(/\bstAng="(-?\d+)"/.exec(tag)?.[1] ?? 0) / 60000;
+        const swAng = Number(/\bswAng="(-?\d+)"/.exec(tag)?.[1] ?? 0) / 60000;
+        if (wR > 0 && hR > 0) {
+          const rad = (deg: number) => (deg * Math.PI) / 180;
+          const cx = penX - wR * Math.cos(rad(stAng));
+          const cy = penY - hR * Math.sin(rad(stAng));
+          const endAng = stAng + swAng;
+          const ex = cx + wR * Math.cos(rad(endAng));
+          const ey = cy + hR * Math.sin(rad(endAng));
+          const largeArc = Math.abs(swAng) > 180 ? 1 : 0;
+          const sweep = swAng > 0 ? 1 : 0;
+          out += ` A ${wR} ${hR} 0 ${largeArc} ${sweep} ${ex.toFixed(2)} ${ey.toFixed(2)}`;
+          penX = ex;
+          penY = ey;
+        }
       }
-      // arcTo and any unknown command: skip without emitting anything yet.
+      // Unknown commands are skipped — the rest of the path stays valid.
     }
     if (!isSelfClose) depth++;
     i = close + 1;
