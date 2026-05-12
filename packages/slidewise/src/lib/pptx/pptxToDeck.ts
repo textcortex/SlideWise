@@ -1633,9 +1633,10 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
     );
     if (allTransparent) return "transparent";
     // Radial / path gradient: <a:path path="circle|rect|shape"> with
-    // <a:fillToRect> defining the focus point (where pos=100000 lives).
-    // CSS radial-gradient runs the other way (0% = centre, 100% = edge),
-    // so we flip each stop's position.
+    // <a:fillToRect> giving the rectangle the gradient fills *toward*.
+    // The CSS focus sits at the geometric opposite of that rectangle's
+    // centre, so a fillToRect collapsed to the bottom-left corner
+    // (l=0, t=100, r=100, b=0) places the radial centre at the top-right.
     const pathNode = gf["a:path"];
     if (pathNode) {
       const pathType = pathNode["@_path"];
@@ -1644,12 +1645,18 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
       const tIn = Number(ftr?.["@_t"] ?? 0) / 1000;
       const rIn = Number(ftr?.["@_r"] ?? 0) / 1000;
       const bIn = Number(ftr?.["@_b"] ?? 0) / 1000;
-      // Each value is a percentage inset from its respective edge — the
-      // focus point sits at the centre of the resulting (often degenerate)
-      // rectangle. l=0,t=100,r=100,b=0 collapses to the bottom-left corner.
-      const focusX = clampPct((lIn + (100 - rIn)) / 2);
-      const focusY = clampPct((tIn + (100 - bIn)) / 2);
+      // CT_RelativeRect insets: l from left, t from top, r from right, b
+      // from bottom. The rect's centre is at ((l + 100−r) / 2,
+      // (t + 100−b) / 2). The CSS focus is the geometric opposite within
+      // the shape so the gradient peaks where PowerPoint draws it.
+      const ftrCx = (lIn + (100 - rIn)) / 2;
+      const ftrCy = (tIn + (100 - bIn)) / 2;
+      const focusX = clampPct(100 - ftrCx);
+      const focusY = clampPct(100 - ftrCy);
       const shape = pathType === "circle" ? "circle" : "ellipse";
+      // OOXML radial stops ramp outer→focus: pos=0 at the boundary,
+      // pos=100000 at the focus. CSS goes centre→edge, so we flip each
+      // stop's position.
       const flipped = stops
         .map((s) => ({ pos: 100 - s.pos, color: s.color }))
         .sort((a, b) => a.pos - b.pos);
