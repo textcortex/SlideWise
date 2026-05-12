@@ -1691,10 +1691,13 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
     );
     if (allTransparent) return "transparent";
     // Radial / path gradient: <a:path path="circle|rect|shape"> with
-    // <a:fillToRect> giving the rectangle the gradient fills *toward*.
-    // The CSS focus sits at the geometric opposite of that rectangle's
-    // centre, so a fillToRect collapsed to the bottom-left corner
-    // (l=0, t=100, r=100, b=0) places the radial centre at the top-right.
+    // <a:fillToRect> giving the focus rectangle. l/t/r/b are percentage
+    // insets from each edge of the shape; the rect's centre is the focus
+    // point. OOXML radial stops use the SAME convention as CSS — pos=0 at
+    // the centre, pos=100% at the outer boundary — so we keep the stop
+    // positions verbatim. The visual blob lands where fillToRect sits;
+    // on a tall, narrow panel the same radial reads almost vertical, on a
+    // 16:9 slide it reads as the expected red orb fading to purple.
     const pathNode = gf["a:path"];
     if (pathNode) {
       const pathType = pathNode["@_path"];
@@ -1703,49 +1706,16 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
       const tIn = Number(ftr?.["@_t"] ?? 0) / 1000;
       const rIn = Number(ftr?.["@_r"] ?? 0) / 1000;
       const bIn = Number(ftr?.["@_b"] ?? 0) / 1000;
-      // CT_RelativeRect insets: l from left, t from top, r from right, b
-      // from bottom. The rect's centre is at ((l + 100−r) / 2,
-      // (t + 100−b) / 2). The CSS focus is the geometric opposite within
-      // the shape so the gradient peaks where PowerPoint draws it.
-      const ftrCx = (lIn + (100 - rIn)) / 2;
-      const ftrCy = (tIn + (100 - bIn)) / 2;
-      // CSS focus is the geometric opposite of fillToRect's centre — the
-      // gradient fills *toward* fillToRect.
-      const focusX = clampPct(100 - ftrCx);
-      const focusY = clampPct(100 - ftrCy);
-      void pathType;
-      // PowerPoint's `<a:path path="circle">` doesn't render as a strict
-      // geometric circle — combined with the typical `tileRect` extension
-      // and a corner focus, the visible result on real decks is much
-      // closer to a linear ramp along the dominant axis from the focus
-      // toward fillToRect. CSS linear-gradient matches that intent
-      // cleanly (a CSS radial leaves an obvious "blob" at the corner that
-      // PowerPoint doesn't draw).
-      // Direction from the CSS focus toward fillToRect's centre.
-      const dx = (100 - focusX) - focusX;
-      const dy = (100 - focusY) - focusY;
-      // PowerPoint's path-based gradient on a real slide reads as an
-      // axis-aligned ramp, not a diagonal one — the ramp follows whichever
-      // axis fillToRect collapses on. Snap to the dominant axis so the
-      // gradient looks like the source instead of cutting across corners.
-      // Ties (e.g. fillToRect at a single corner) favour the vertical
-      // axis, matching how the eon chapter slides read.
-      let cssAngle: number;
-      if (Math.abs(dy) >= Math.abs(dx)) {
-        cssAngle = dy >= 0 ? 180 : 0; // 180deg = top→bottom, 0deg = bottom→top
-      } else {
-        cssAngle = dx >= 0 ? 90 : 270; // 90deg = left→right, 270deg = right→left
-      }
-      // OOXML stops ramp outer→focus: pos=0 at the boundary (fillToRect),
-      // pos=100000 at the focus. CSS linear goes start→end (0%→100%); we
-      // place the focus colour at 0% (start) and the boundary at 100%.
-      const flipped = stops
-        .map((s) => ({ pos: 100 - s.pos, color: s.color }))
-        .sort((a, b) => a.pos - b.pos);
-      const stopsCss = flipped
+      const focusX = clampPct((lIn + (100 - rIn)) / 2);
+      const focusY = clampPct((tIn + (100 - bIn)) / 2);
+      // path="circle" — a true geometric circle in CSS terms (so the blob
+      // stays round on rectangular shapes); path="rect" — anisotropic
+      // ellipse stretched with the shape's aspect ratio.
+      const shape = pathType === "circle" ? "circle" : "ellipse";
+      const stopsCss = stops
         .map((s) => `${s.color} ${s.pos.toFixed(2)}%`)
         .join(", ");
-      return `linear-gradient(${cssAngle.toFixed(2)}deg, ${stopsCss})`;
+      return `radial-gradient(${shape} at ${focusX.toFixed(2)}% ${focusY.toFixed(2)}%, ${stopsCss})`;
     }
     const angDeg = gf["a:lin"]?.["@_ang"]
       ? (Number(gf["a:lin"]["@_ang"]) / 60000 + 90) % 360
