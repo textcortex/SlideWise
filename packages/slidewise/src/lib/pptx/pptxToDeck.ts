@@ -764,7 +764,7 @@ async function parseSpOrText(
 }
 
 function makeTextElement(
-  _sp: any,
+  sp: any,
   txBody: any,
   geom: { x: number; y: number; w: number; h: number; rotation: number },
   ctx: ParseContext,
@@ -956,9 +956,15 @@ function makeTextElement(
   // <a:custGeom> path (a white brand-logo plate) that should sit
   // *immediately* behind the slide's hosted text — at the same z, not in
   // the underlay. Otherwise a full-bleed image on the slide will cover the
-  // backing.
-  const phSpPr = layoutPh?.spPr;
-  const phFill = phSpPr ? extractShapeFill(phSpPr, ctx.theme) : undefined;
+  // backing. The slide's own <p:spPr> can also override the fill on a
+  // per-element basis (e.g. one chip in a roadmap is the "active" red
+  // tile) — read the slide's spPr first and fall back to the layout's.
+  const slideSpPr = sp?.["p:spPr"];
+  const layoutSpPr = layoutPh?.spPr;
+  const slideFill = slideSpPr ? extractShapeFill(slideSpPr, ctx.theme) : undefined;
+  const layoutFill = layoutSpPr ? extractShapeFill(layoutSpPr, ctx.theme) : undefined;
+  const phFill = slideFill ?? layoutFill;
+  const phSpPr = layoutSpPr;
   const phPath = phSpPr?.["a:custGeom"]
     ? parseCustGeomPath(phSpPr["a:custGeom"])
     : undefined;
