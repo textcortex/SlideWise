@@ -1035,15 +1035,42 @@ async function parsePic(
 
   const ext = (fullPath.split(".").pop() || "png").toLowerCase();
   // EMF / WMF are Microsoft vector formats that browsers can't render
-  // natively — emitting them as <img src="data:application/octet-stream…">
-  // surfaces a broken-image icon. Drop them with a diagnostic so the slide
-  // stays clean; consumers that need fidelity should pre-rasterise these
-  // before import.
+  // natively. Emit a text placeholder at the image's bounds using the
+  // picture's descr/name (often the brand wordmark filename, e.g.
+  // "Dickinson_hoefler_0-100-81-4.eps") so the slide still communicates
+  // what's there — vs. surfacing a broken-image icon. Consumers needing
+  // pixel-perfect fidelity should pre-rasterise the metafiles.
   if (ext === "emf" || ext === "wmf") {
     ctx.diagnostics.warnings.push(
-      `Skipped ${ext.toUpperCase()} image at ${fullPath} — vector metafiles aren't supported in the browser.`
+      `Replaced ${ext.toUpperCase()} image at ${fullPath} with a label — vector metafiles aren't supported in the browser.`
     );
-    return null;
+    const cNvPr = pic?.["p:nvPicPr"]?.["p:cNvPr"];
+    const label = labelFromImageName(
+      cNvPr?.["@_descr"] ?? cNvPr?.["@_name"]
+    );
+    if (!label) return null;
+    const baseSize = Math.max(24, Math.min(geom.h * 0.7, geom.w / 6));
+    return {
+      id: nanoid(8),
+      type: "text",
+      ...geom,
+      z: 0,
+      text: label,
+      fontFamily: "Georgia, serif",
+      fontSize: Math.round(baseSize),
+      fontWeight: 400,
+      italic: false,
+      underline: false,
+      strike: false,
+      // Neutral mid-tone keeps the placeholder visible on either a light
+      // or a dark slide background. Hosts can re-style via their own
+      // editor theme if they want stronger emphasis.
+      color: "#888888",
+      align: "left",
+      vAlign: "middle",
+      lineHeight: 1.1,
+      letterSpacing: 0,
+    } satisfies TextElement;
   }
   const base64 = await file.async("base64");
   const mime = mimeForExt(ext);
@@ -1074,6 +1101,23 @@ async function parsePic(
     ...(hasCrop ? { crop } : {}),
   };
   return image;
+}
+
+/**
+ * Trim a PPTX <p:cNvPr name|descr> value down to its leading brand-style
+ * token: "Dickinson_hoefler_0-100-81-4.eps" → "Dickinson", "Picture 5" →
+ * undefined. The leading token of a descr is usually the brand or asset
+ * name; generic "Picture N" names are skipped to avoid surfacing
+ * scaffolding to the slide.
+ */
+function labelFromImageName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const head = trimmed.split(/[._\-\s]/)[0];
+  if (!head) return undefined;
+  if (/^(picture|image|graphic|object)$/i.test(head)) return undefined;
+  return head;
 }
 
 /**
