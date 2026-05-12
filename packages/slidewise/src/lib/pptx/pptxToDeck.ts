@@ -1663,14 +1663,21 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
       // toward fillToRect. CSS linear-gradient matches that intent
       // cleanly (a CSS radial leaves an obvious "blob" at the corner that
       // PowerPoint doesn't draw).
-      const dx = (100 - focusX) - focusX; // toward fillToRect, horizontal
-      const dy = (100 - focusY) - focusY; // toward fillToRect, vertical
-      // CSS linear-gradient angle: 0deg = bottom→top, 90deg = left→right.
-      // We want the angle whose direction vector points from focus toward
-      // fillToRect's centre (i.e. the "outer" end of the ramp).
-      const angle =
-        (Math.atan2(dx, -dy) * 180) / Math.PI;
-      const cssAngle = ((angle % 360) + 360) % 360;
+      // Direction from the CSS focus toward fillToRect's centre.
+      const dx = (100 - focusX) - focusX;
+      const dy = (100 - focusY) - focusY;
+      // PowerPoint's path-based gradient on a real slide reads as an
+      // axis-aligned ramp, not a diagonal one — the ramp follows whichever
+      // axis fillToRect collapses on. Snap to the dominant axis so the
+      // gradient looks like the source instead of cutting across corners.
+      // Ties (e.g. fillToRect at a single corner) favour the vertical
+      // axis, matching how the eon chapter slides read.
+      let cssAngle: number;
+      if (Math.abs(dy) >= Math.abs(dx)) {
+        cssAngle = dy >= 0 ? 180 : 0; // 180deg = top→bottom, 0deg = bottom→top
+      } else {
+        cssAngle = dx >= 0 ? 90 : 270; // 90deg = left→right, 270deg = right→left
+      }
       // OOXML stops ramp outer→focus: pos=0 at the boundary (fillToRect),
       // pos=100000 at the focus. CSS linear goes start→end (0%→100%); we
       // place the focus colour at 0% (start) and the boundary at 100%.
