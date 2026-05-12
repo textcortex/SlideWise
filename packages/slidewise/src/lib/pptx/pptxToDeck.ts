@@ -682,14 +682,13 @@ async function parseSpOrText(
   const phType = ph?.["@_type"];
   const isPlaceholderTextHost = !!ph && phType !== "pic";
   const hasText = !!txBody && hasAnyText(txBody);
-  // Underlay shapes come from layout/master decoration; the slide's own
-  // placeholder will host the text, so don't promote an empty txBody to a
-  // text element (that would drop the shape's fill).
-  const isText = opts.underlay
-    ? hasText
-    : hasText ||
-      (isPlaceholderTextHost && !presetName) ||
-      (!!txBody && (!presetName || presetName === "rect"));
+  // Treat as text when the element actually carries text OR when it's a
+  // placeholder text host with no preset geometry override. A
+  // non-placeholder shape with an empty <p:txBody> (commonly authored
+  // around <a:custGeom> graphics like brand icons) is a SHAPE — promoting
+  // it to a text element would drop the silhouette and fill.
+  const isText = hasText || (isPlaceholderTextHost && !presetName);
+  void opts;
 
   if (isText) {
     return makeTextElement(sp, txBody, geom, ctx, ph, layoutPh, masterPh);
