@@ -1632,6 +1632,32 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
       (s) => s.color.length === 9 && s.color.endsWith("00")
     );
     if (allTransparent) return "transparent";
+    // Radial / path gradient: <a:path path="circle|rect|shape"> with
+    // <a:fillToRect> defining the focus point (where pos=100000 lives).
+    // CSS radial-gradient runs the other way (0% = centre, 100% = edge),
+    // so we flip each stop's position.
+    const pathNode = gf["a:path"];
+    if (pathNode) {
+      const pathType = pathNode["@_path"];
+      const ftr = pathNode["a:fillToRect"];
+      const lIn = Number(ftr?.["@_l"] ?? 0) / 1000;
+      const tIn = Number(ftr?.["@_t"] ?? 0) / 1000;
+      const rIn = Number(ftr?.["@_r"] ?? 0) / 1000;
+      const bIn = Number(ftr?.["@_b"] ?? 0) / 1000;
+      // Each value is a percentage inset from its respective edge — the
+      // focus point sits at the centre of the resulting (often degenerate)
+      // rectangle. l=0,t=100,r=100,b=0 collapses to the bottom-left corner.
+      const focusX = clampPct((lIn + (100 - rIn)) / 2);
+      const focusY = clampPct((tIn + (100 - bIn)) / 2);
+      const shape = pathType === "circle" ? "circle" : "ellipse";
+      const flipped = stops
+        .map((s) => ({ pos: 100 - s.pos, color: s.color }))
+        .sort((a, b) => a.pos - b.pos);
+      const stopsCss = flipped
+        .map((s) => `${s.color} ${s.pos.toFixed(2)}%`)
+        .join(", ");
+      return `radial-gradient(${shape} at ${focusX.toFixed(2)}% ${focusY.toFixed(2)}%, ${stopsCss})`;
+    }
     const angDeg = gf["a:lin"]?.["@_ang"]
       ? (Number(gf["a:lin"]["@_ang"]) / 60000 + 90) % 360
       : 90;
@@ -1639,6 +1665,13 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
     return `linear-gradient(${angDeg}deg, ${stopsCss})`;
   }
   return undefined;
+}
+
+function clampPct(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  if (v < 0) return 0;
+  if (v > 100) return 100;
+  return v;
 }
 
 function extractBackground(bg: any, ctx: ParseContext): string | undefined {
