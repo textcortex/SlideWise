@@ -204,8 +204,14 @@ const DEFAULT_THEME: ThemeColors = {
  *    UnknownElement carrying its raw OOXML so a save round-trip can re-emit
  *    it without data loss.
  */
-export async function parsePptx(blob: Blob | ArrayBuffer): Promise<Deck> {
-  const zip = await JSZip.loadAsync(blob);
+export async function parsePptx(
+  blob: Blob | ArrayBuffer | Uint8Array
+): Promise<Deck> {
+  // Keep the original archive bytes so serializeDeck can re-inject any
+  // OOXML we couldn't model (UnknownElement) back into the saved file
+  // along with the media it referenced. See SOURCE_PPTX / SOURCE_SLIDE_PATH.
+  const sourceBuffer = await toArrayBuffer(blob);
+  const zip = await JSZip.loadAsync(sourceBuffer);
   const diagnostics: ParseDiagnostics = {
     unknownElementCount: 0,
     droppedAnimations: 0,
@@ -230,7 +236,17 @@ export async function parsePptx(blob: Blob | ArrayBuffer): Promise<Deck> {
   const slides: Slide[] = [];
   for (const slidePath of slidePaths) {
     const slide = await parseSlide(zip, slidePath, diagnostics, fit);
-    if (slide) slides.push(slide);
+    if (slide) {
+      // Tag the slide with the source xml path so the serializer can pick
+      // the right `ppt/slides/slideN.xml.rels` to copy media refs from
+      // when the user adds / reorders / deletes slides in the editor.
+      Object.defineProperty(slide, SOURCE_SLIDE_PATH, {
+        value: slidePath,
+        enumerable: false,
+        configurable: true,
+      });
+      slides.push(slide);
+    }
   }
 
   if (!slides.length) {
@@ -239,10 +255,37 @@ export async function parsePptx(blob: Blob | ArrayBuffer): Promise<Deck> {
   }
 
   const deck: Deck = { version: CURRENT_DECK_VERSION, title, slides };
+  Object.defineProperty(deck, SOURCE_PPTX, {
+    value: sourceBuffer,
+    enumerable: false,
+    configurable: true,
+  });
   if (diagnostics.warnings.length) {
     console.info("[slidewise/pptx] parse diagnostics:", diagnostics);
   }
   return deck;
+}
+
+/** Non-enumerable property keys used to ferry the original archive
+ * bytes from parse to serialize so we can round-trip the OOXML we
+ * couldn't model. Internal — do not depend on these from outside the
+ * package; the contract is enforced at the parse/serialize boundary. */
+export const SOURCE_PPTX = "__slidewiseSourcePptx";
+export const SOURCE_SLIDE_PATH = "__slidewiseSourceSlidePath";
+
+async function toArrayBuffer(
+  input: Blob | ArrayBuffer | Uint8Array
+): Promise<ArrayBuffer> {
+  if (input instanceof ArrayBuffer) return input;
+  // Node Buffer is a Uint8Array subclass; honour it explicitly so the
+  // server-side `serializeDeck → arrayBuffer → parsePptx` round-trip
+  // works without the caller having to allocate a Blob.
+  if (input instanceof Uint8Array) {
+    const copy = new ArrayBuffer(input.byteLength);
+    new Uint8Array(copy).set(input);
+    return copy;
+  }
+  return input.arrayBuffer();
 }
 
 async function parseSlide(
