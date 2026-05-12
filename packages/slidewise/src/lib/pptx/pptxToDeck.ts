@@ -841,7 +841,17 @@ function makeTextElement(
     autoFit
   );
   const first = text.runs[0];
-  const align = text.align ?? readAlign(fallbackPPr) ?? "left";
+  // Each layer of the inheritance chain may set @algn independently — a
+  // layout placeholder can override geometry without touching alignment,
+  // expecting the master's algn="r" (slide-number, page-footer right-edge
+  // style) to still apply. mergeFirst would lock onto the layout's whole
+  // pPr and hide the master's algn, so check each layer in turn.
+  const align =
+    text.align ??
+    readAlign(layoutPh?.pPr) ??
+    readAlign(masterPh?.pPr) ??
+    readAlign(masterLvl1) ??
+    "left";
   const valign =
     readBodyVAlign(effectiveTxBody?.["a:bodyPr"]) ??
     readBodyVAlign(fallbackBodyPr) ??
@@ -1224,9 +1234,22 @@ function lookupPlaceholder(
     map.get(`${type}|${idx}`) ??
     map.get(`|${idx}`) ??
     map.get(`${type}|`) ??
-    (type === "ctrTitle" ? map.get("title|") : undefined) ??
-    (type === "subTitle" ? map.get("body|") : undefined)
+    findByType(map, type) ??
+    (type === "ctrTitle" ? findByType(map, "title") : undefined) ??
+    (type === "subTitle" ? findByType(map, "body") : undefined)
   );
+}
+
+function findByType(
+  map: Map<string, PlaceholderInfo>,
+  type: string
+): PlaceholderInfo | undefined {
+  if (!type) return undefined;
+  const prefix = `${type}|`;
+  for (const [key, value] of map) {
+    if (key.startsWith(prefix)) return value;
+  }
+  return undefined;
 }
 
 function placeholderGeometry(
