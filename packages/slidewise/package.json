@@ -1,6 +1,6 @@
 {
   "name": "@textcortex/slidewise",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "Embeddable React PPTX editor.",
   "license": "MIT",
   "type": "module",
