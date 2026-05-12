@@ -1045,27 +1045,29 @@ async function parsePic(
       `Replaced ${ext.toUpperCase()} image at ${fullPath} with a label — vector metafiles aren't supported in the browser.`
     );
     const cNvPr = pic?.["p:nvPicPr"]?.["p:cNvPr"];
-    const label = labelFromImageName(
-      cNvPr?.["@_descr"] ?? cNvPr?.["@_name"]
-    );
-    if (!label) return null;
-    const baseSize = Math.max(24, Math.min(geom.h * 0.7, geom.w / 6));
+    const hint =
+      labelFromImageName(cNvPr?.["@_descr"]) ??
+      labelFromImageName(cNvPr?.["@_name"]);
+    if (!hint) return null;
+    // Size the placeholder to fill the picture's bounds — height drives
+    // glyph size, the width acts as a ceiling for very tall narrow boxes.
+    const baseSize = Math.max(24, Math.min(geom.h * 0.85, geom.w / 4));
     return {
       id: nanoid(8),
       type: "text",
       ...geom,
       z: 0,
-      text: label,
-      fontFamily: "Georgia, serif",
+      text: hint.label,
+      fontFamily: hint.fontFamily ?? "Georgia, serif",
       fontSize: Math.round(baseSize),
       fontWeight: 400,
       italic: false,
       underline: false,
       strike: false,
-      // Neutral mid-tone keeps the placeholder visible on either a light
-      // or a dark slide background. Hosts can re-style via their own
-      // editor theme if they want stronger emphasis.
-      color: "#888888",
+      // Use the brand colour parsed from the filename when present;
+      // otherwise a neutral mid-tone keeps the placeholder readable on
+      // both light and dark slide backgrounds.
+      color: hint.color ?? "#888888",
       align: "left",
       vAlign: "middle",
       lineHeight: 1.1,
@@ -1104,20 +1106,90 @@ async function parsePic(
 }
 
 /**
- * Trim a PPTX <p:cNvPr name|descr> value down to its leading brand-style
- * token: "Dickinson_hoefler_0-100-81-4.eps" → "Dickinson", "Picture 5" →
- * undefined. The leading token of a descr is usually the brand or asset
- * name; generic "Picture N" names are skipped to avoid surfacing
- * scaffolding to the slide.
+ * Decode a PPTX picture name/descr into a styled text placeholder.
+ *
+ * Designers commonly export brand assets with filenames that encode both
+ * the typeface and the brand color, e.g. "Dickinson_hoefler_0-100-81-4.eps"
+ * → name "Dickinson", font hint "hoefler", CMYK 0/100/81/4. We harvest
+ * that information so the EMF/WMF fallback at least carries the original
+ * silhouette's font family and brand colour, instead of a flat
+ * mid-grey block.
  */
-function labelFromImageName(value: unknown): string | undefined {
+interface ImageLabelHint {
+  label: string;
+  fontFamily?: string;
+  color?: string;
+}
+
+function labelFromImageName(value: unknown): ImageLabelHint | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   if (!trimmed) return undefined;
-  const head = trimmed.split(/[._\-\s]/)[0];
-  if (!head) return undefined;
-  if (/^(picture|image|graphic|object)$/i.test(head)) return undefined;
-  return head;
+  const tokens = trimmed.split(/[._\-\s]+/).filter(Boolean);
+  if (!tokens.length) return undefined;
+  const head = tokens[0];
+  if (/^(picture|image|graphic|object|logo)$/i.test(head)) return undefined;
+  let fontFamily: string | undefined;
+  for (const t of tokens.slice(1)) {
+    const fam = brandFontGuess(t);
+    if (fam) {
+      fontFamily = fam;
+      break;
+    }
+  }
+  let color: string | undefined;
+  const cmyk = /(?:^|[^\d])(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})(?:$|[^\d])/.exec(
+    trimmed
+  );
+  if (cmyk) {
+    color = cmykToHex(
+      Number(cmyk[1]),
+      Number(cmyk[2]),
+      Number(cmyk[3]),
+      Number(cmyk[4])
+    );
+  }
+  return { label: head, fontFamily, color };
+}
+
+function brandFontGuess(token: string): string | undefined {
+  switch (token.toLowerCase()) {
+    case "hoefler":
+      return "'Hoefler Text', 'Cormorant Garamond', Georgia, serif";
+    case "didot":
+      return "'GFS Didot', 'Bodoni 72', Didot, serif";
+    case "bodoni":
+      return "'Bodoni 72', 'Playfair Display', Didot, serif";
+    case "garamond":
+      return "'EB Garamond', Garamond, Georgia, serif";
+    case "times":
+      return "'Times New Roman', Times, serif";
+    case "futura":
+      return "Futura, 'Avenir Next', 'Helvetica Neue', sans-serif";
+    case "helvetica":
+      return "'Helvetica Neue', Helvetica, Arial, sans-serif";
+    case "gotham":
+      return "'Gotham', 'Montserrat', 'Helvetica Neue', sans-serif";
+    case "avenir":
+      return "'Avenir Next', Avenir, 'Helvetica Neue', sans-serif";
+    case "univers":
+      return "Univers, 'Helvetica Neue', Helvetica, sans-serif";
+    default:
+      return undefined;
+  }
+}
+
+function cmykToHex(c: number, m: number, y: number, k: number): string {
+  const clamp = (n: number) => Math.max(0, Math.min(100, n));
+  const cn = clamp(c) / 100;
+  const mn = clamp(m) / 100;
+  const yn = clamp(y) / 100;
+  const kn = clamp(k) / 100;
+  const r = Math.round(255 * (1 - cn) * (1 - kn));
+  const g = Math.round(255 * (1 - mn) * (1 - kn));
+  const b = Math.round(255 * (1 - yn) * (1 - kn));
+  const hex = (n: number) => n.toString(16).padStart(2, "0").toUpperCase();
+  return `#${hex(r)}${hex(g)}${hex(b)}`;
 }
 
 /**
