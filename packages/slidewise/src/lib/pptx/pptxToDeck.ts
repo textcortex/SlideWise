@@ -1999,6 +1999,13 @@ function extractRuns(
       runs[paraStart].text = prefix.text + runs[paraStart].text;
     }
 
+    // Carry the inter-paragraph break onto the last run we just emitted —
+    // renderers that walk `runs` (mixed-formatting path) would otherwise
+    // concatenate paragraphs into one long line.
+    if (pi < paragraphs.length - 1 && runs.length > 0) {
+      runs[runs.length - 1].text += "\n";
+    }
+
     pieces.push(paragraphText.join(""));
   }
   return {
