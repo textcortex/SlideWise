@@ -9,6 +9,7 @@ import type {
   TextRun,
   ShapeElement,
   ShapeKind,
+  ShapePath,
   ImageElement,
   LineElement,
   TableElement,
@@ -159,6 +160,7 @@ const ARRAY_TAGS = new Set([
   "a:p",
   "a:r",
   "a:br",
+  "a:fld",
   "a:tr",
   "a:tc",
   "Relationship",
@@ -633,6 +635,8 @@ async function parseSpOrText(
   const txBody = sp["p:txBody"];
   const prstGeom = sp?.["p:spPr"]?.["a:prstGeom"];
   const presetName = prstGeom?.["@_prst"];
+  const custGeom = sp?.["p:spPr"]?.["a:custGeom"];
+  const customPath = custGeom ? parseCustGeomPath(custGeom) : undefined;
 
   // Lines are sometimes authored as <p:sp prst="line">.
   if (presetName === "line" || presetName === "straightConnector1") {
@@ -681,7 +685,9 @@ async function parseSpOrText(
   if (!kind) {
     // Fall back to a rect with the shape's fill so it remains visible at the
     // correct position rather than dropping to an opaque "Imported content"
-    // tile.
+    // tile. When the source carried a <a:custGeom> path we attach it so the
+    // renderer draws the actual silhouette (logos, brand marks) instead of
+    // the rectangle stand-in.
     const fallback: ShapeElement = {
       id: nanoid(8),
       type: "shape",
@@ -693,6 +699,7 @@ async function parseSpOrText(
       strokeWidth: strokeWidthEmu
         ? Math.max(1, Math.round(emuToPx(strokeWidthEmu) * ctx.fit.scale))
         : undefined,
+      ...(customPath ? { path: customPath } : {}),
     };
     return fallback;
   }
@@ -1811,6 +1818,7 @@ function extractRuns(
     prevAutoKey = prefix.autoKey;
 
     const rs = asArray(p?.["a:r"]);
+    const flds = asArray(p?.["a:fld"]);
     const paraStart = runs.length;
     const paragraphText: string[] = [];
     if (prefix.text) paragraphText.push(prefix.text);
@@ -1824,10 +1832,11 @@ function extractRuns(
       paragraphText.push(built.text);
     };
 
-    // <a:br/> hard line breaks are siblings of <a:r>; when present, walk the
-    // paragraph children in document order so the break lands between the
-    // correct runs. Otherwise stay on the fast path.
-    if (p?.["a:br"]) {
+    // <a:br/> hard line breaks AND <a:fld> field placeholders (e.g.
+    // datetime1, slidenum) are siblings of <a:r>; when any are present
+    // walk the paragraph children in document order so they land in the
+    // right place. Otherwise stay on the fast path.
+    if (p?.["a:br"] || p?.["a:fld"]) {
       const order = paragraphChildOrder(p);
       for (const entry of order) {
         if (entry.kind === "br") {
@@ -1835,7 +1844,8 @@ function extractRuns(
           paragraphText.push("\n");
           continue;
         }
-        const r = rs[entry.index];
+        const source = entry.kind === "r" ? rs : flds;
+        const r = source[entry.index];
         if (r) onRun(r);
       }
     } else {
@@ -2052,17 +2062,150 @@ function buildRunInfo(
  * paragraph. The order is recovered from the paragraph's raw XML (attached
  * during readXml) because fast-xml-parser groups children by tag name.
  */
-function paragraphChildOrder(p: any): { kind: "r" | "br"; index: number }[] {
+function paragraphChildOrder(
+  p: any
+): { kind: "r" | "br" | "fld"; index: number }[] {
   const raw = (p as any)?._rawSrc as string | undefined;
-  if (!raw) return [];
+  if (raw) return paragraphChildOrderFromRaw(raw);
+  // No raw available (paragraph has no <a:br/> and pre-PR-2 readXml didn't
+  // attach it). Fall back to the order implied by the parsed arrays: all
+  // runs, then all fields. Document order across these tag types is lost
+  // by fast-xml-parser, but the typical PPTX paragraph has either runs or
+  // a field, not both, so this matches reality in practice.
+  const out: { kind: "r" | "br" | "fld"; index: number }[] = [];
+  asArray(p?.["a:r"]).forEach((_, i) => out.push({ kind: "r", index: i }));
+  asArray(p?.["a:fld"]).forEach((_, i) => out.push({ kind: "fld", index: i }));
+  return out;
+}
+
+/**
+ * Convert a PPTX `<a:custGeom>` (custom geometry — used for logos, brand
+ * marks, hand-drawn shapes) into an SVG path. Reads command order from the
+ * raw XML attached during readXml, since fast-xml-parser groups children by
+ * tag name and drops cross-tag document order. Supports moveTo, lnTo,
+ * cubicBezTo, quadBezTo, and close; arcTo and formula-based guide
+ * references aren't translated yet (they degrade to a flat-fill rect).
+ */
+function parseCustGeomPath(custGeom: any): ShapePath | undefined {
+  const raw = (custGeom as any)?._rawSrc as string | undefined;
+  if (!raw) return undefined;
+  // Each <a:path w="…" h="…"> defines its own coordinate system; the SVG
+  // viewBox uses the FIRST path's dimensions and subsequent paths inherit
+  // it. In practice almost every custGeom in real decks uses one viewbox
+  // across all sub-paths.
+  const paths = findAllElementRawBlocks(raw, "path");
+  if (!paths.length) return undefined;
+  let viewW = 0;
+  let viewH = 0;
+  let d = "";
+  for (const block of paths) {
+    const headerEnd = block.indexOf(">");
+    if (headerEnd < 0) continue;
+    const header = block.slice(0, headerEnd + 1);
+    const w = Number(/\bw="(\d+)"/.exec(header)?.[1] ?? 0);
+    const h = Number(/\bh="(\d+)"/.exec(header)?.[1] ?? 0);
+    if (w > viewW) viewW = w;
+    if (h > viewH) viewH = h;
+    d += (d ? " " : "") + custGeomBodyToSvgD(block);
+  }
+  if (!d || viewW <= 0 || viewH <= 0) return undefined;
+  // OOXML composite paths (multiple subpaths with internal holes — letters
+  // like the "e" and "o" in the eon wordmark) render with even-odd winding
+  // by default; the nonzero default of SVG would fill the holes.
+  return { d, viewW, viewH, fillRule: "evenodd" };
+}
+
+function custGeomBodyToSvgD(pathBlock: string): string {
+  const headerEnd = pathBlock.indexOf(">");
+  const closeIdx = pathBlock.lastIndexOf("</a:path>");
+  const inner =
+    closeIdx > headerEnd
+      ? pathBlock.slice(headerEnd + 1, closeIdx)
+      : pathBlock.slice(headerEnd + 1);
+  let out = "";
+  let i = 0;
+  let depth = 0;
+  while (i < inner.length) {
+    if (inner[i] !== "<") {
+      i++;
+      continue;
+    }
+    if (inner.startsWith("</", i)) {
+      depth--;
+      const end = inner.indexOf(">", i);
+      if (end < 0) break;
+      i = end + 1;
+      continue;
+    }
+    if (inner.startsWith("<!--", i)) {
+      const end = inner.indexOf("-->", i);
+      if (end < 0) break;
+      i = end + 3;
+      continue;
+    }
+    const close = inner.indexOf(">", i);
+    if (close < 0) break;
+    const tag = inner.slice(i, close + 1);
+    const nameMatch = /^<a:([\w]+)/.exec(tag);
+    const isSelfClose = tag.endsWith("/>");
+    if (depth === 0 && nameMatch) {
+      const name = nameMatch[1];
+      if (name === "close") {
+        out += " Z";
+      } else if (
+        name === "moveTo" ||
+        name === "lnTo" ||
+        name === "cubicBezTo" ||
+        name === "quadBezTo"
+      ) {
+        // Each command's <a:pt x="..." y="..."/> children are siblings — pull
+        // them out of the inner block in document order. SVG path commands
+        // take all of their control points after a single letter:
+        // cubicBezTo → "C x1 y1 x2 y2 x3 y3", quadBezTo → "Q x1 y1 x2 y2",
+        // moveTo/lnTo → "M x y" / "L x y".
+        const cmdClose = inner.indexOf(`</a:${name}>`, close + 1);
+        if (cmdClose < 0) break;
+        const body = inner.slice(close + 1, cmdClose);
+        const coords: string[] = [];
+        const ptRe = /<a:pt\s+x="(-?\d+)"\s+y="(-?\d+)"\s*\/>/g;
+        let m: RegExpExecArray | null;
+        while ((m = ptRe.exec(body))) {
+          coords.push(m[1], m[2]);
+        }
+        if (coords.length) {
+          const letter =
+            name === "moveTo"
+              ? "M"
+              : name === "lnTo"
+                ? "L"
+                : name === "cubicBezTo"
+                  ? "C"
+                  : "Q";
+          out += ` ${letter} ${coords.join(" ")}`;
+        }
+        i = cmdClose + `</a:${name}>`.length;
+        continue;
+      }
+      // arcTo and any unknown command: skip without emitting anything yet.
+    }
+    if (!isSelfClose) depth++;
+    i = close + 1;
+  }
+  return out.trim();
+}
+
+function paragraphChildOrderFromRaw(
+  raw: string
+): { kind: "r" | "br" | "fld"; index: number }[] {
   const tagEnd = raw.indexOf(">");
   const closeIdx = raw.lastIndexOf("</a:p>");
   if (tagEnd < 0 || closeIdx < 0) return [];
   const inner = raw.slice(tagEnd + 1, closeIdx);
-  const out: { kind: "r" | "br"; index: number }[] = [];
+  const out: { kind: "r" | "br" | "fld"; index: number }[] = [];
   let depth = 0;
   let rIdx = 0;
   let brIdx = 0;
+  let fldIdx = 0;
   let i = 0;
   while (i < inner.length) {
     if (inner[i] !== "<") {
@@ -2097,6 +2240,7 @@ function paragraphChildOrder(p: any): { kind: "r" | "br"; index: number }[] {
       const name = nameMatch[1];
       if (name === "a:r") out.push({ kind: "r", index: rIdx++ });
       else if (name === "a:br") out.push({ kind: "br", index: brIdx++ });
+      else if (name === "a:fld") out.push({ kind: "fld", index: fldIdx++ });
     }
     if (!isSelfClose) depth++;
     i = close + 1;
@@ -2107,8 +2251,7 @@ function paragraphChildOrder(p: any): { kind: "r" | "br"; index: number }[] {
 function hasAnyText(txBody: any): boolean {
   const ps = asArray(txBody?.["a:p"]);
   for (const p of ps) {
-    const rs = asArray(p?.["a:r"]);
-    for (const r of rs) {
+    for (const r of [...asArray(p?.["a:r"]), ...asArray(p?.["a:fld"])]) {
       const t = r?.["a:t"];
       const text = typeof t === "string" ? t : t?.["#text"] ?? "";
       if (text && String(text).length > 0) return true;
@@ -2299,21 +2442,98 @@ async function readXml(zip: JSZip, path: string): Promise<any | null> {
 }
 
 function annotateParagraphRawSrc(parsed: any, rawText: string): void {
-  if (!rawText.includes("<a:br")) return;
-  const blocks = findAllParagraphRawBlocks(rawText);
-  if (!blocks.length) return;
-  const parsedPs: any[] = [];
-  collectParagraphsDfs(parsed, parsedPs);
-  const n = Math.min(blocks.length, parsedPs.length);
-  for (let i = 0; i < n; i++) {
-    if (blocks[i].includes("<a:br")) {
-      Object.defineProperty(parsedPs[i], "_rawSrc", {
-        value: blocks[i],
-        enumerable: false,
-        configurable: true,
-      });
+  // Cross-tag document order matters when a paragraph mixes <a:r>, <a:br>,
+  // and <a:fld>. fast-xml-parser groups by tag name, so we keep the raw
+  // XML for any paragraph that contains a break or a field.
+  if (rawText.includes("<a:br") || rawText.includes("<a:fld")) {
+    const blocks = findAllParagraphRawBlocks(rawText);
+    if (blocks.length) {
+      const parsedPs: any[] = [];
+      collectParagraphsDfs(parsed, parsedPs);
+      const n = Math.min(blocks.length, parsedPs.length);
+      for (let i = 0; i < n; i++) {
+        const block = blocks[i];
+        if (block.includes("<a:br") || block.includes("<a:fld")) {
+          Object.defineProperty(parsedPs[i], "_rawSrc", {
+            value: block,
+            enumerable: false,
+            configurable: true,
+          });
+        }
+      }
     }
   }
+  // <a:custGeom> path commands (moveTo, lnTo, cubicBezTo, …) are siblings,
+  // and their cross-tag order defines the silhouette of brand logos and
+  // hand-drawn shapes. Same fast-xml-parser issue, same fix: attach raw.
+  if (rawText.includes("<a:custGeom")) {
+    const blocks = findAllElementRawBlocks(rawText, "custGeom");
+    if (blocks.length) {
+      const parsedCustGeoms: any[] = [];
+      collectNamedDfs(parsed, "a:custGeom", parsedCustGeoms);
+      const n = Math.min(blocks.length, parsedCustGeoms.length);
+      for (let i = 0; i < n; i++) {
+        Object.defineProperty(parsedCustGeoms[i], "_rawSrc", {
+          value: blocks[i],
+          enumerable: false,
+          configurable: true,
+        });
+      }
+    }
+  }
+}
+
+function collectNamedDfs(node: any, key: string, acc: any[]): void {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const n of node) collectNamedDfs(n, key, acc);
+    return;
+  }
+  for (const k of Object.keys(node)) {
+    if (k.startsWith("@_") || k === "#text") continue;
+    if (k === key) {
+      for (const v of asArray(node[k])) acc.push(v);
+    } else {
+      collectNamedDfs(node[k], key, acc);
+    }
+  }
+}
+
+function findAllElementRawBlocks(raw: string, localName: string): string[] {
+  const blocks: string[] = [];
+  const openSelfClose = new RegExp(`<a:${localName}\\b[^>]*/>`);
+  const openTag = new RegExp(`<a:${localName}\\b[^>]*>`);
+  const close = `</a:${localName}>`;
+  let cursor = 0;
+  while (cursor < raw.length) {
+    const slice = raw.slice(cursor);
+    const sc = openSelfClose.exec(slice);
+    const ot = openTag.exec(slice);
+    // Pick whichever comes first (and only if it isn't a self-close that was
+    // also matched by openTag).
+    let start = -1;
+    let selfClose = false;
+    if (sc && (!ot || sc.index <= ot.index)) {
+      start = cursor + sc.index;
+      selfClose = true;
+    } else if (ot) {
+      start = cursor + ot.index;
+      selfClose = ot[0].endsWith("/>");
+    }
+    if (start < 0) break;
+    if (selfClose) {
+      const end = raw.indexOf(">", start);
+      blocks.push(raw.slice(start, end + 1));
+      cursor = end + 1;
+      continue;
+    }
+    const tagEnd = raw.indexOf(">", start);
+    const closeIdx = raw.indexOf(close, tagEnd + 1);
+    if (closeIdx < 0) break;
+    blocks.push(raw.slice(start, closeIdx + close.length));
+    cursor = closeIdx + close.length;
+  }
+  return blocks;
 }
 
 function findAllParagraphRawBlocks(raw: string): string[] {

@@ -70,7 +70,7 @@ function TextView({
   const inner: React.CSSProperties = {
     width: "100%",
     color: el.color,
-    fontFamily: el.fontFamily,
+    fontFamily: withGenericFallback(el.fontFamily),
     fontSize: el.fontSize,
     fontWeight: el.fontWeight,
     fontStyle: el.italic ? "italic" : "normal",
@@ -119,9 +119,33 @@ function TextView({
   );
 }
 
+/**
+ * Append a `sans-serif` generic so brand families imported from PPTX
+ * (e.g. "EON Office Head") degrade gracefully when the typeface isn't
+ * installed locally — without the generic the browser silently picks
+ * its default serif. Already-qualified stacks (containing a comma) and
+ * plain generics ("serif"/"monospace") pass through untouched.
+ */
+function withGenericFallback(family: string | undefined): string | undefined {
+  if (!family) return family;
+  if (family.includes(",")) return family;
+  const lower = family.trim().toLowerCase();
+  if (
+    lower === "serif" ||
+    lower === "sans-serif" ||
+    lower === "monospace" ||
+    lower === "cursive" ||
+    lower === "fantasy" ||
+    lower === "system-ui"
+  ) {
+    return family;
+  }
+  return `${family}, sans-serif`;
+}
+
 function runCssStyle(r: TextRun): React.CSSProperties {
   const s: React.CSSProperties = {};
-  if (r.fontFamily) s.fontFamily = r.fontFamily;
+  if (r.fontFamily) s.fontFamily = withGenericFallback(r.fontFamily);
   if (r.fontSize) s.fontSize = r.fontSize;
   if (r.fontWeight) s.fontWeight = r.fontWeight;
   if (r.color) s.color = r.color;
@@ -315,6 +339,27 @@ function sameStyle(a: TextRun, b: TextRun): boolean {
 function ShapeView({ el }: { el: ShapeElement }) {
   const stroke = el.stroke ?? "transparent";
   const sw = el.strokeWidth ?? 0;
+  // Custom vector path (PPTX <a:custGeom>) takes precedence over the preset
+  // kind — the path coordinates already encode the actual silhouette.
+  if (el.path) {
+    return (
+      <svg
+        viewBox={`0 0 ${el.path.viewW} ${el.path.viewH}`}
+        preserveAspectRatio="none"
+        width="100%"
+        height="100%"
+      >
+        <path
+          d={el.path.d}
+          fill={el.fill}
+          fillRule={el.path.fillRule ?? "nonzero"}
+          stroke={stroke}
+          strokeWidth={sw || undefined}
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    );
+  }
   if (el.shape === "rect" || el.shape === "rounded") {
     return (
       <div

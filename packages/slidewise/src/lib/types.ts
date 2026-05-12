@@ -90,6 +90,24 @@ export interface ShapeElement extends BaseElement {
   stroke?: string;
   strokeWidth?: number;
   radius?: number;
+  /**
+   * Optional vector path, set when the shape was imported from a PPTX
+   * `<a:custGeom>` (logos, brand marks, hand-drawn shapes). The renderer
+   * draws this as an SVG `<path>` filling the shape's bounding box; the
+   * `shape` field remains as a sensible fallback for older renderers.
+   */
+  path?: ShapePath;
+}
+
+export interface ShapePath {
+  /** SVG path `d` attribute. */
+  d: string;
+  /** Path coordinate-system width (mapped onto the element's bounding box). */
+  viewW: number;
+  /** Path coordinate-system height. */
+  viewH: number;
+  /** SVG `fill-rule` to apply — defaults to `nonzero`. */
+  fillRule?: "nonzero" | "evenodd";
 }
 
 export interface ImageElement extends BaseElement {
