@@ -86,11 +86,40 @@ function TextView({
     outline: "none",
   };
 
+  const backingPath = el.backingPath;
+  const positionedOuter: React.CSSProperties = backingPath
+    ? { ...outer, position: "relative" }
+    : outer;
+  const innerStacked: React.CSSProperties = backingPath
+    ? { ...inner, position: "relative", zIndex: 1 }
+    : inner;
+  const backingSvg = backingPath ? (
+    <svg
+      viewBox={`0 0 ${backingPath.viewW} ${backingPath.viewH}`}
+      preserveAspectRatio="none"
+      style={{
+        position: "absolute",
+        inset: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+        zIndex: 0,
+      }}
+    >
+      <path
+        d={backingPath.d}
+        fill={backingPath.fill}
+        fillRule={backingPath.fillRule ?? "nonzero"}
+      />
+    </svg>
+  ) : null;
+
   if (editing) {
     return (
-      <div style={outer}>
+      <div style={positionedOuter}>
+        {backingSvg}
         <EditableText
-          style={inner}
+          style={innerStacked}
           initialText={el.text}
           initialRuns={el.runs}
           onCommit={(t, r) => onCommit?.(t, r)}
@@ -101,8 +130,9 @@ function TextView({
 
   if (el.runs && el.runs.length) {
     return (
-      <div style={outer}>
-        <div style={inner}>
+      <div style={positionedOuter}>
+        {backingSvg}
+        <div style={innerStacked}>
           {el.runs.map((r, i) => (
             <span key={i} style={runCssStyle(r)}>
               {r.text}
@@ -114,8 +144,9 @@ function TextView({
   }
 
   return (
-    <div style={outer}>
-      <div style={inner}>{el.text}</div>
+    <div style={positionedOuter}>
+      {backingSvg}
+      <div style={innerStacked}>{el.text}</div>
     </div>
   );
 }

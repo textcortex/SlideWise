@@ -912,14 +912,27 @@ function makeTextElement(
       : 0,
     ...(hasMixedFormatting ? { runs } : {}),
   };
-  // Layout placeholders often supply a fill (e.g. a tinted body box, a
-  // white logo plate) that should sit *immediately* behind the slide's
-  // hosted text — at the same z, not in the underlay. Otherwise a
-  // full-bleed image on the slide will cover the fill.
-  const phFill = layoutPh?.spPr
-    ? extractShapeFill(layoutPh.spPr, ctx.theme)
+  // Layout placeholders often supply a fill (e.g. a tinted body box) or a
+  // <a:custGeom> path (a white brand-logo plate) that should sit
+  // *immediately* behind the slide's hosted text — at the same z, not in
+  // the underlay. Otherwise a full-bleed image on the slide will cover the
+  // backing.
+  const phSpPr = layoutPh?.spPr;
+  const phFill = phSpPr ? extractShapeFill(phSpPr, ctx.theme) : undefined;
+  const phPath = phSpPr?.["a:custGeom"]
+    ? parseCustGeomPath(phSpPr["a:custGeom"])
     : undefined;
-  if (phFill && phFill !== "transparent") {
+  if (phPath && phFill && phFill !== "transparent") {
+    // custGeom defines the actual rendered silhouette; the fill applies to
+    // it. Skip the flat background and render the glyph as a backing path.
+    el.backingPath = {
+      d: phPath.d,
+      viewW: phPath.viewW,
+      viewH: phPath.viewH,
+      fill: phFill,
+      fillRule: phPath.fillRule,
+    };
+  } else if (phFill && phFill !== "transparent") {
     el.background = phFill;
   }
   return el;

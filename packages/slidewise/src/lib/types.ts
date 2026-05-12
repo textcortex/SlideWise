@@ -76,6 +76,19 @@ export interface TextElement extends BaseElement {
    */
   background?: string;
   /**
+   * Optional vector glyph drawn behind the text. Set by the PPTX importer
+   * when the layout placeholder carried an `<a:custGeom>` (typically a
+   * brand logo plate) — the path fills the text box, the text spans render
+   * on top. Same renderer contract as ShapeElement.path.
+   */
+  backingPath?: {
+    d: string;
+    viewW: number;
+    viewH: number;
+    fill: string;
+    fillRule?: "nonzero" | "evenodd";
+  };
+  /**
    * Optional rich-text breakdown. When present, the renderer and PPTX writer
    * use these per-run styles; the flat fields above act as defaults for any
    * field a run leaves unset. Editing the text via the contentEditable surface
