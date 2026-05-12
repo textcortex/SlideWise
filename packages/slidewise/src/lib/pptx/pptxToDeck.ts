@@ -1035,44 +1035,16 @@ async function parsePic(
 
   const ext = (fullPath.split(".").pop() || "png").toLowerCase();
   // EMF / WMF are Microsoft vector formats that browsers can't render
-  // natively. Emit a text placeholder at the image's bounds using the
-  // picture's descr/name (often the brand wordmark filename, e.g.
-  // "Dickinson_hoefler_0-100-81-4.eps") so the slide still communicates
-  // what's there — vs. surfacing a broken-image icon. Consumers needing
-  // pixel-perfect fidelity should pre-rasterise the metafiles.
+  // natively. Skip them with a diagnostic — emitting them as
+  // <img src="data:application/octet-stream…"> surfaces a broken-image
+  // icon, and synthesising a fake placeholder only hides the gap.
+  // Consumers needing fidelity should pre-rasterise the metafiles before
+  // import; a true EMF→SVG path needs a dedicated JS decoder (separate PR).
   if (ext === "emf" || ext === "wmf") {
     ctx.diagnostics.warnings.push(
-      `Replaced ${ext.toUpperCase()} image at ${fullPath} with a label — vector metafiles aren't supported in the browser.`
+      `Skipped ${ext.toUpperCase()} image at ${fullPath} — vector metafiles aren't supported in the browser.`
     );
-    const cNvPr = pic?.["p:nvPicPr"]?.["p:cNvPr"];
-    const hint =
-      labelFromImageName(cNvPr?.["@_descr"]) ??
-      labelFromImageName(cNvPr?.["@_name"]);
-    if (!hint) return null;
-    // Size the placeholder to fill the picture's bounds — height drives
-    // glyph size, the width acts as a ceiling for very tall narrow boxes.
-    const baseSize = Math.max(24, Math.min(geom.h * 0.85, geom.w / 4));
-    return {
-      id: nanoid(8),
-      type: "text",
-      ...geom,
-      z: 0,
-      text: hint.label,
-      fontFamily: hint.fontFamily ?? "Georgia, serif",
-      fontSize: Math.round(baseSize),
-      fontWeight: 400,
-      italic: false,
-      underline: false,
-      strike: false,
-      // Use the brand colour parsed from the filename when present;
-      // otherwise a neutral mid-tone keeps the placeholder readable on
-      // both light and dark slide backgrounds.
-      color: hint.color ?? "#888888",
-      align: "left",
-      vAlign: "middle",
-      lineHeight: 1.1,
-      letterSpacing: 0,
-    } satisfies TextElement;
+    return null;
   }
   const base64 = await file.async("base64");
   const mime = mimeForExt(ext);
@@ -1103,93 +1075,6 @@ async function parsePic(
     ...(hasCrop ? { crop } : {}),
   };
   return image;
-}
-
-/**
- * Decode a PPTX picture name/descr into a styled text placeholder.
- *
- * Designers commonly export brand assets with filenames that encode both
- * the typeface and the brand color, e.g. "Dickinson_hoefler_0-100-81-4.eps"
- * → name "Dickinson", font hint "hoefler", CMYK 0/100/81/4. We harvest
- * that information so the EMF/WMF fallback at least carries the original
- * silhouette's font family and brand colour, instead of a flat
- * mid-grey block.
- */
-interface ImageLabelHint {
-  label: string;
-  fontFamily?: string;
-  color?: string;
-}
-
-function labelFromImageName(value: unknown): ImageLabelHint | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  const tokens = trimmed.split(/[._\-\s]+/).filter(Boolean);
-  if (!tokens.length) return undefined;
-  const head = tokens[0];
-  if (/^(picture|image|graphic|object|logo)$/i.test(head)) return undefined;
-  let fontFamily: string | undefined;
-  for (const t of tokens.slice(1)) {
-    const fam = brandFontGuess(t);
-    if (fam) {
-      fontFamily = fam;
-      break;
-    }
-  }
-  let color: string | undefined;
-  const cmyk = /(?:^|[^\d])(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})(?:$|[^\d])/.exec(
-    trimmed
-  );
-  if (cmyk) {
-    color = cmykToHex(
-      Number(cmyk[1]),
-      Number(cmyk[2]),
-      Number(cmyk[3]),
-      Number(cmyk[4])
-    );
-  }
-  return { label: head, fontFamily, color };
-}
-
-function brandFontGuess(token: string): string | undefined {
-  switch (token.toLowerCase()) {
-    case "hoefler":
-      return "'Hoefler Text', 'Cormorant Garamond', Georgia, serif";
-    case "didot":
-      return "'GFS Didot', 'Bodoni 72', Didot, serif";
-    case "bodoni":
-      return "'Bodoni 72', 'Playfair Display', Didot, serif";
-    case "garamond":
-      return "'EB Garamond', Garamond, Georgia, serif";
-    case "times":
-      return "'Times New Roman', Times, serif";
-    case "futura":
-      return "Futura, 'Avenir Next', 'Helvetica Neue', sans-serif";
-    case "helvetica":
-      return "'Helvetica Neue', Helvetica, Arial, sans-serif";
-    case "gotham":
-      return "'Gotham', 'Montserrat', 'Helvetica Neue', sans-serif";
-    case "avenir":
-      return "'Avenir Next', Avenir, 'Helvetica Neue', sans-serif";
-    case "univers":
-      return "Univers, 'Helvetica Neue', Helvetica, sans-serif";
-    default:
-      return undefined;
-  }
-}
-
-function cmykToHex(c: number, m: number, y: number, k: number): string {
-  const clamp = (n: number) => Math.max(0, Math.min(100, n));
-  const cn = clamp(c) / 100;
-  const mn = clamp(m) / 100;
-  const yn = clamp(y) / 100;
-  const kn = clamp(k) / 100;
-  const r = Math.round(255 * (1 - cn) * (1 - kn));
-  const g = Math.round(255 * (1 - mn) * (1 - kn));
-  const b = Math.round(255 * (1 - yn) * (1 - kn));
-  const hex = (n: number) => n.toString(16).padStart(2, "0").toUpperCase();
-  return `#${hex(r)}${hex(g)}${hex(b)}`;
 }
 
 /**
