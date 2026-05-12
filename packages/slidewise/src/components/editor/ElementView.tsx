@@ -555,7 +555,9 @@ function LineView({ el }: { el: LineElement }) {
 function TableView({ el }: { el: TableElement }) {
   const cols = el.rows[0]?.length ?? 1;
   // PPTX-faithful: contiguous cells, no inter-cell gap, no rounded corners.
-  // Earlier "card grid" styling drifted too far from the source look.
+  // Cells share their dividers via inset box-shadows so we draw a single
+  // grid line between adjacent cells instead of doubling-up borders.
+  const stroke = el.borderColor ?? "rgba(0, 0, 0, 0.12)";
   return (
     <div
       style={{
@@ -566,6 +568,7 @@ function TableView({ el }: { el: TableElement }) {
         height: "100%",
         gap: 0,
         background: "transparent",
+        boxShadow: `inset 0 0 0 1px ${stroke}`,
       }}
     >
       {el.rows.flatMap((row, ri) =>
@@ -585,6 +588,10 @@ function TableView({ el }: { el: TableElement }) {
               minHeight: 0,
               overflow: "hidden",
               wordBreak: "break-word",
+              borderRight:
+                ci < cols - 1 ? `1px solid ${stroke}` : undefined,
+              borderBottom:
+                ri < el.rows.length - 1 ? `1px solid ${stroke}` : undefined,
             }}
           >
             {cell}

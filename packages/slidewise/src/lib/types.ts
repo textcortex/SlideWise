@@ -168,6 +168,12 @@ export interface TableElement extends BaseElement {
   rowFill: string;
   textColor: string;
   fontSize: number;
+  /**
+   * Optional cell border colour (CSS). PPTX tables typically draw thin
+   * dividers between cells; we render them as a 1px border around each
+   * cell. Defaults to a faint grey when omitted.
+   */
+  borderColor?: string;
 }
 
 export interface IconElement extends BaseElement {
