@@ -12,6 +12,7 @@ import type {
   TableElement,
   IconElement,
   EmbedElement,
+  ChartElement,
   UnknownElement,
 } from "@/lib/types";
 import { pxToInches, pxToPoints } from "./units";
@@ -88,6 +89,13 @@ function addElement(s: pptxgen.Slide, el: SlideElement): void {
       return;
     case "embed":
       addEmbed(s, el);
+      return;
+    case "chart":
+      // Charts round-trip via their preserved <p:graphicFrame> OOXML,
+      // re-injected by preserveUnknowns(). Editing live chart data inside
+      // Slidewise isn't yet wired up to a chart-XML writer; until then we
+      // re-emit the source verbatim so the chart and its embedded Excel
+      // survive open/save.
       return;
     case "unknown":
       // Preserved by preserveUnknowns() after pptxgenjs writes the zip.
@@ -332,8 +340,14 @@ async function preserveUnknowns(
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
 }
 
+/**
+ * Both UnknownElement and (post-PR-38) ChartElement preserve their source
+ * `<p:graphicFrame>` OOXML for round-trip. Treat them uniformly here.
+ */
+type PreservedElement = { ooxmlXml: string };
+
 interface UnknownGroup {
-  unknowns: UnknownElement[];
+  unknowns: PreservedElement[];
   sourcePath: string | undefined;
 }
 
@@ -342,7 +356,10 @@ function collectUnknowns(deck: Deck): Map<number, UnknownGroup> {
   for (let i = 0; i < deck.slides.length; i++) {
     const slide = deck.slides[i];
     const unknowns = slide.elements.filter(
-      (e): e is UnknownElement => e.type === "unknown" && !!e.ooxmlXml
+      (e): e is UnknownElement | (ChartElement & { ooxmlXml: string }) =>
+        (e.type === "unknown" || e.type === "chart") &&
+        typeof (e as { ooxmlXml?: unknown }).ooxmlXml === "string" &&
+        (e as { ooxmlXml: string }).ooxmlXml.length > 0
     );
     if (!unknowns.length) continue;
     const sourcePath = (slide as unknown as Record<string, unknown>)[
@@ -368,7 +385,7 @@ async function injectUnknownsIntoSlide(
   generatedSlidePath: string,
   generatedRelsPath: string,
   sourceRelsPath: string,
-  unknowns: UnknownElement[]
+  unknowns: PreservedElement[]
 ): Promise<void> {
   const slideXml = await outZip.file(generatedSlidePath)!.async("string");
   const closeIdx = slideXml.lastIndexOf("</p:spTree>");

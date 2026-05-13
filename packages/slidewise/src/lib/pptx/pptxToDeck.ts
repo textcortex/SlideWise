@@ -13,6 +13,8 @@ import type {
   ImageElement,
   LineElement,
   TableElement,
+  ChartElement,
+  ChartSeries,
   UnknownElement,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
@@ -96,6 +98,42 @@ interface ParseContext {
   layoutPh: Map<string, PlaceholderInfo>;
   masterPh: Map<string, PlaceholderInfo>;
   masterTextDefaults: MasterTextDefaults;
+  /**
+   * Parsed `ppt/tableStyles.xml`, keyed by style GUID (uppercased, no
+   * braces). Raw `<a:fill>` / `<a:tcTxStyle>` nodes are kept untouched so
+   * each table can resolve colours against its own slide's theme.
+   */
+  tableStyles: Map<string, TableStyleRaw>;
+  /**
+   * GUID of the default table style declared at file level via
+   * `<a:tableStyleList def="…">`. Applied when a `<a:tbl>` omits its own
+   * `<a:tableStyleId>`.
+   */
+  defaultTableStyleId?: string;
+}
+
+/**
+ * Raw table-style parts kept as parsed XML nodes — colour resolution
+ * happens at apply time against the table's slide theme. Each part
+ * corresponds to a `<a:wholeTbl>` / `<a:firstRow>` / `<a:band1H>` /
+ * etc. region inside a `<a:tblStyle>`.
+ */
+interface TableStylePart {
+  fill?: any; // <a:fill> or <a:fillRef>
+  textColor?: any; // <a:tcTxStyle> colour child
+  bold?: boolean;
+}
+
+interface TableStyleRaw {
+  wholeTbl?: TableStylePart;
+  firstRow?: TableStylePart;
+  lastRow?: TableStylePart;
+  firstCol?: TableStylePart;
+  lastCol?: TableStylePart;
+  band1H?: TableStylePart;
+  band2H?: TableStylePart;
+  band1V?: TableStylePart;
+  band2V?: TableStylePart;
 }
 
 /**
@@ -233,9 +271,22 @@ export async function parsePptx(
 
   const title = await readTitle(zip);
 
+  // ppt/tableStyles.xml lives at a deck-level path referenced from
+  // ppt/_rels/presentation.xml.rels. Loading it once and threading via
+  // ParseContext keeps per-slide table parsing flat.
+  const { styles: tableStyles, defaultId: defaultTableStyleId } =
+    await readTableStyles(zip, presentationRels);
+
   const slides: Slide[] = [];
   for (const slidePath of slidePaths) {
-    const slide = await parseSlide(zip, slidePath, diagnostics, fit);
+    const slide = await parseSlide(
+      zip,
+      slidePath,
+      diagnostics,
+      fit,
+      tableStyles,
+      defaultTableStyleId
+    );
     if (slide) {
       // Tag the slide with the source xml path so the serializer can pick
       // the right `ppt/slides/slideN.xml.rels` to copy media refs from
@@ -292,7 +343,9 @@ async function parseSlide(
   zip: JSZip,
   slidePath: string,
   diagnostics: ParseDiagnostics,
-  fit: Fit
+  fit: Fit,
+  tableStyles: Map<string, TableStyleRaw>,
+  defaultTableStyleId: string | undefined
 ): Promise<Slide | null> {
   const xml = await readXml(zip, slidePath);
   if (!xml) return null;
@@ -367,6 +420,8 @@ async function parseSlide(
     layoutPh,
     masterPh,
     masterTextDefaults,
+    tableStyles,
+    defaultTableStyleId,
   };
 
   const sld = xml["p:sld"];
@@ -640,7 +695,7 @@ async function parseSpTree(
       const el = parseCxn(node, ctx, outer);
       if (el) out.push(el);
     } else if (tag === "p:graphicFrame") {
-      const el = parseGraphicFrame(node, ctx, outer);
+      const el = await parseGraphicFrame(node, ctx, outer);
       if (el) out.push(el);
     } else if (tag === "p:grpSp") {
       const inner = composeGroupTransform(node, outer);
@@ -1062,35 +1117,40 @@ async function parsePic(
   // Modern PPTX embeds SVGs via a dual-blip: <a:blip r:embed="rId_png">…
   //   <a:extLst><a:ext uri="…"><asvg:svgBlip r:embed="rId_svg"/></a:ext></a:extLst>
   // </a:blip>. The outer embed is the raster fallback; prefer the SVG when
-  // present so vector logos stay sharp.
+  // present so vector logos stay sharp. EMF/WMF primaries also sometimes
+  // ship an alternate raster blip in the same extLst — collect every rId
+  // and let resolveBlipMedia pick the best renderable one.
   const blip = pic?.["p:blipFill"]?.["a:blip"];
-  const svgRef = findSvgBlipRef(blip);
-  const rasterRef = blip?.["@_r:embed"];
-  const blipRef = svgRef ?? rasterRef;
-  if (!blipRef) return toUnknown(pic, "p:pic", ctx, outer);
+  const candidateRefs = collectBlipRefs(blip);
+  if (!candidateRefs.length) return toUnknown(pic, "p:pic", ctx, outer);
 
-  const mediaPath = ctx.slideRels.byId.get(blipRef)?.target;
-  if (!mediaPath) return toUnknown(pic, "p:pic", ctx, outer);
-
-  const fullPath = normalisePath(mediaPath, dirOf(ctx.slidePath));
-  const file = ctx.zip.file(fullPath);
-  if (!file) return toUnknown(pic, "p:pic", ctx, outer);
-
-  const ext = (fullPath.split(".").pop() || "png").toLowerCase();
-  // EMF / WMF are Microsoft vector formats that browsers can't render
-  // natively. Skip them with a diagnostic — emitting them as
-  // <img src="data:application/octet-stream…"> surfaces a broken-image
-  // icon, and synthesising a fake placeholder only hides the gap.
-  // Consumers needing fidelity should pre-rasterise the metafiles before
-  // import; a true EMF→SVG path needs a dedicated JS decoder (separate PR).
+  const resolved = resolveBlipMedia(candidateRefs, ctx, pic);
+  if (!resolved) return toUnknown(pic, "p:pic", ctx, outer);
+  const { fullPath, file, ext } = resolved;
+  let base64: string;
+  let mime: string;
   if (ext === "emf" || ext === "wmf") {
-    ctx.diagnostics.warnings.push(
-      `Skipped ${ext.toUpperCase()} image at ${fullPath} — vector metafiles aren't supported in the browser.`
-    );
-    return null;
+    // No raster sibling shipped — decode the metafile in-browser via
+    // emf-converter (Canvas-based EMF/WMF parser). Returns null when no
+    // canvas API is available (e.g. SSR / Node tests without jsdom);
+    // we fall back to the legacy diagnostic-skip in that case so consumers
+    // still detect dropped vector metafiles.
+    const decoded = await decodeMetafileToDataUrl(file, ext);
+    if (!decoded) {
+      ctx.diagnostics.warnings.push(
+        `Skipped ${ext.toUpperCase()} image at ${fullPath} — vector metafile decode unavailable in this environment.`
+      );
+      return null;
+    }
+    // decoded is `data:image/png;base64,…` — strip prefix to match the
+    // common path below.
+    const comma = decoded.indexOf(",");
+    base64 = comma >= 0 ? decoded.slice(comma + 1) : "";
+    mime = "image/png";
+  } else {
+    base64 = await file.async("base64");
+    mime = mimeForExt(ext);
   }
-  const base64 = await file.async("base64");
-  const mime = mimeForExt(ext);
 
   const blipFill = pic?.["p:blipFill"];
   const hasStretch = !!blipFill?.["a:stretch"];
@@ -1121,6 +1181,36 @@ async function parsePic(
 }
 
 /**
+ * Decode an EMF / WMF metafile to a PNG data URL using `emf-converter`'s
+ * Canvas-based replayer. Returns null when:
+ *  - the runtime has no Canvas / OffscreenCanvas (SSR, Node without jsdom),
+ *  - the metafile header is malformed,
+ *  - the decoder throws (e.g. unsupported record).
+ * The caller falls back to the legacy diagnostic-skip in that case so we
+ * never blow up parsing over a single bad picture.
+ */
+async function decodeMetafileToDataUrl(
+  file: JSZip.JSZipObject,
+  ext: string
+): Promise<string | null> {
+  try {
+    const u8 = await file.async("uint8array");
+    const buffer = u8.buffer.slice(
+      u8.byteOffset,
+      u8.byteOffset + u8.byteLength
+    ) as ArrayBuffer;
+    const { convertEmfToDataUrl, convertWmfToDataUrl } = await import(
+      "emf-converter"
+    );
+    return ext === "wmf"
+      ? await convertWmfToDataUrl(buffer)
+      : await convertEmfToDataUrl(buffer);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Pull the SVG blip rId from a:blip/a:extLst/a:ext/asvg:svgBlip if present.
  * Returns undefined when the picture is raster-only.
  */
@@ -1133,6 +1223,120 @@ function findSvgBlipRef(blip: any): string | undefined {
     if (ref) return ref;
   }
   return undefined;
+}
+
+/**
+ * Collect every rId that could provide pixels for a `<p:blipFill>`. Ordered
+ * by preference: SVG blip (sharpest), the primary `<a:blip r:embed>`, then
+ * any additional `r:embed` carried inside `<a:extLst>` (Microsoft
+ * occasionally embeds an alt raster alongside an EMF primary).
+ */
+function collectBlipRefs(blip: any): string[] {
+  if (!blip) return [];
+  const out: string[] = [];
+  const svgRef = findSvgBlipRef(blip);
+  if (svgRef) out.push(svgRef);
+  const primary = blip?.["@_r:embed"];
+  if (primary && !out.includes(primary)) out.push(primary);
+  const exts = asArray(blip?.["a:extLst"]?.["a:ext"]);
+  for (const ext of exts) {
+    // Skip the svgBlip envelope (handled above) and walk every remaining
+    // descendant for an `r:embed` attribute.
+    for (const ref of collectREmbedRefs(ext)) {
+      if (!out.includes(ref)) out.push(ref);
+    }
+  }
+  return out;
+}
+
+function collectREmbedRefs(node: any): string[] {
+  const out: string[] = [];
+  const walk = (n: any) => {
+    if (!n || typeof n !== "object") return;
+    if (Array.isArray(n)) {
+      for (const it of n) walk(it);
+      return;
+    }
+    const embed = n["@_r:embed"];
+    if (typeof embed === "string") out.push(embed);
+    for (const k of Object.keys(n)) {
+      if (k.startsWith("@_")) continue;
+      walk(n[k]);
+    }
+  };
+  walk(node);
+  return out;
+}
+
+const RASTER_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+
+interface ResolvedMedia {
+  fullPath: string;
+  file: JSZip.JSZipObject;
+  ext: string;
+}
+
+/**
+ * Pick the best renderable media file for a picture. Walks the candidate
+ * rId list, prefers raster/SVG entries over EMF/WMF, and as a last resort
+ * scans the slide rels for an image sharing the EMF's base filename — some
+ * authoring tools ship `image1.emf` next to `image1.png` for exactly this
+ * fallback case.
+ */
+function resolveBlipMedia(
+  refs: string[],
+  ctx: ParseContext,
+  pic: any
+): ResolvedMedia | null {
+  type Candidate = { fullPath: string; file: JSZip.JSZipObject; ext: string };
+  let emfHit: Candidate | null = null;
+
+  const tryPath = (target: string): Candidate | null => {
+    const fullPath = normalisePath(target, dirOf(ctx.slidePath));
+    const file = ctx.zip.file(fullPath);
+    if (!file) return null;
+    const ext = (fullPath.split(".").pop() || "png").toLowerCase();
+    return { fullPath, file, ext };
+  };
+
+  for (const ref of refs) {
+    const target = ctx.slideRels.byId.get(ref)?.target;
+    if (!target) continue;
+    const c = tryPath(target);
+    if (!c) continue;
+    if (RASTER_EXTS.has(c.ext)) return c;
+    if ((c.ext === "emf" || c.ext === "wmf") && !emfHit) emfHit = c;
+  }
+
+  // Last-ditch: when the only hit is EMF/WMF, scan the slide rels for any
+  // image whose basename matches (`image1.emf` → `image1.png`). This catches
+  // decks where PowerPoint shipped both formats but only the EMF was wired
+  // into the <a:blip>.
+  if (emfHit) {
+    const base = emfHit.fullPath.replace(/\.[^.]+$/, "");
+    const baseLeaf = base.split("/").pop() ?? base;
+    for (const { target } of ctx.slideRels.byId.values()) {
+      const candidatePath = normalisePath(target, dirOf(ctx.slidePath));
+      const leaf = candidatePath.split("/").pop() ?? candidatePath;
+      const ext = (candidatePath.split(".").pop() || "").toLowerCase();
+      if (!RASTER_EXTS.has(ext)) continue;
+      const leafBase = leaf.replace(/\.[^.]+$/, "");
+      if (leafBase !== baseLeaf) continue;
+      const file = ctx.zip.file(candidatePath);
+      if (file) return { fullPath: candidatePath, file, ext };
+    }
+    // Picture-level <a:extLst> on the <p:pic> itself sometimes carries a
+    // cached raster preview as <p:blip r:embed>; sweep that too.
+    const picExtRefs = collectREmbedRefs(pic?.["p:nvPicPr"]?.["p:nvPr"]?.["p:extLst"]);
+    for (const ref of picExtRefs) {
+      const target = ctx.slideRels.byId.get(ref)?.target;
+      if (!target) continue;
+      const c = tryPath(target);
+      if (c && RASTER_EXTS.has(c.ext)) return c;
+    }
+    return emfHit;
+  }
+  return null;
 }
 
 function parseCxn(
@@ -1192,18 +1396,31 @@ function makeLineFromGeometry(
   return line;
 }
 
-function parseGraphicFrame(
+async function parseGraphicFrame(
   gf: any,
   ctx: ParseContext,
   outer: GroupTransform
-): SlideElement | null {
+): Promise<SlideElement | null> {
   const tbl = gf?.["a:graphic"]?.["a:graphicData"]?.["a:tbl"];
   if (tbl) {
     const parsed = parseTable(gf, tbl, ctx, outer);
     if (parsed) return parsed;
   }
+  // Charts: <c:chart r:id="rId…"/> sits inside graphicData. We try, in
+  // order: (1) cached preview image shipped via chart rels (fastest +
+  // PowerPoint-faithful), (2) parse the chart XML into a ChartElement
+  // and render it live via ECharts. The original <p:graphicFrame> XML is
+  // always preserved so save round-trips keep the source chart part.
+  const chart = gf?.["a:graphic"]?.["a:graphicData"]?.["c:chart"];
+  if (chart) {
+    const img = await parseChartCachedImage(gf, chart, ctx, outer);
+    if (img) return img;
+    const live = await parseLiveChart(gf, chart, ctx, outer);
+    if (live) return live;
+  }
   return toUnknown(gf, "p:graphicFrame", ctx, outer);
 }
+
 
 function parseTable(
   gf: any,
@@ -1218,11 +1435,45 @@ function parseTable(
   const trs = asArray(tbl["a:tr"]);
   if (!trs.length) return null;
 
+  // <a:tblPr> drives which style parts apply. Defaults match PowerPoint's
+  // "Insert Table" behaviour: first row treated as header, no banding.
+  const tblPr = tbl?.["a:tblPr"] ?? {};
+  const tblPrAttr = (name: string): boolean => {
+    const v = tblPr?.[`@_${name}`];
+    return v === "1" || v === "true";
+  };
+  const hasHeader = tblPrAttr("firstRow");
+  const hasLastRow = tblPrAttr("lastRow");
+  const hasFirstCol = tblPrAttr("firstCol");
+  const hasLastCol = tblPrAttr("lastCol");
+  const bandRows = tblPrAttr("bandRow");
+
+  const styleIdRaw =
+    extractText(tblPr?.["a:tableStyleId"]) ?? ctx.defaultTableStyleId;
+  const styleId = styleIdRaw ? normaliseGuid(styleIdRaw) : undefined;
+  const style = styleId ? ctx.tableStyles.get(styleId) : undefined;
+
+  const styleFill = (part: TableStylePart | undefined): string | undefined =>
+    part ? resolveTableStyleFill(part, ctx) : undefined;
+  const styleText = (part: TableStylePart | undefined): string | undefined =>
+    part ? resolveTableStyleTextColor(part, ctx) : undefined;
+
+  const wholeFill = styleFill(style?.wholeTbl);
+  const wholeText = styleText(style?.wholeTbl);
+  const headerStyleFill = styleFill(style?.firstRow);
+  const headerStyleText = styleText(style?.firstRow);
+  const lastRowFill = styleFill(style?.lastRow);
+  const firstColFill = styleFill(style?.firstCol);
+  const firstColText = styleText(style?.firstCol);
+  const lastColFill = styleFill(style?.lastCol);
+  const band1Fill = styleFill(style?.band1H);
+  const band2Fill = styleFill(style?.band2H);
+
   const rows: string[][] = [];
   let firstFontSizePx: number | undefined;
   let firstColor: string | undefined;
-  let headerFill = "#0E1330";
-  let bodyFill = "#FFFFFF";
+  let headerCellFill: string | undefined;
+  let bodyCellFill: string | undefined;
 
   for (let ri = 0; ri < trs.length; ri++) {
     const tr = trs[ri];
@@ -1245,14 +1496,25 @@ function parseTable(
       }
       if (!firstColor && r0?.color) firstColor = r0.color;
 
+      // Cell-level <a:tcPr><a:solidFill> wins over style fills (PPTX
+      // override semantics): record it here so the table-level defaults
+      // we pick below don't clobber it. We can't model per-cell fills
+      // yet, so the *first* explicit cell fill on the header / body
+      // wins for the whole row class.
       const cellFill = resolveColor(tc?.["a:tcPr"]?.["a:solidFill"], ctx.theme);
       if (cellFill) {
-        if (ri === 0) headerFill = cellFill;
-        else bodyFill = cellFill;
+        if (ri === 0 && headerCellFill === undefined) headerCellFill = cellFill;
+        else if (ri > 0 && bodyCellFill === undefined) bodyCellFill = cellFill;
       }
     }
     rows.push(cells);
   }
+
+  // Resolve final fills with precedence: cell-level override > style part > whole-table > built-in default.
+  const headerFill =
+    headerCellFill ?? (hasHeader ? headerStyleFill : undefined) ?? wholeFill ?? "#0E1330";
+  const rowFill = bodyCellFill ?? band1Fill ?? wholeFill ?? "#FFFFFF";
+  const rowAltFill = bandRows ? band2Fill ?? wholeFill : undefined;
 
   const table: TableElement = {
     id: nanoid(8),
@@ -1261,11 +1523,329 @@ function parseTable(
     z: 0,
     rows,
     headerFill,
-    rowFill: bodyFill,
-    textColor: firstColor ?? "#0E1330",
+    rowFill,
+    textColor: firstColor ?? wholeText ?? "#0E1330",
     fontSize: firstFontSizePx ?? 18,
+    hasHeader,
+    bandRows,
+    ...(rowAltFill ? { rowAltFill } : {}),
+    ...(hasLastRow && lastRowFill ? { lastRowFill } : {}),
+    ...(hasFirstCol && firstColFill ? { firstColFill } : {}),
+    ...(hasLastCol && lastColFill ? { lastColFill } : {}),
+    ...(hasHeader && headerStyleText ? { headerTextColor: headerStyleText } : {}),
+    ...(hasFirstCol && firstColText ? { firstColTextColor: firstColText } : {}),
   };
   return table;
+}
+
+/**
+ * Render a chart's cached image (when one is shipped alongside the chart
+ * part) as an ImageElement. PowerPoint authoring tools embed a rasterised
+ * preview either as a related image part on `ppt/charts/chartN.xml` or
+ * inside the chart XML's `<c:plotArea>`/`<c:extLst>` — both code paths
+ * land here. Returns null when no usable raster is found; the caller
+ * falls back to UnknownElement.
+ *
+ * Live chart rendering (parse series → ECharts) is a deliberate follow-up;
+ * see docs/plans/pptx-tables-charts-emf.md.
+ */
+async function parseChartCachedImage(
+  gf: any,
+  chart: any,
+  ctx: ParseContext,
+  outer: GroupTransform
+): Promise<ImageElement | null> {
+  const xfrm = gf?.["p:xfrm"] || gf?.["p:spPr"]?.["a:xfrm"];
+  const geom = readGeometry(xfrm, ctx.fit, outer);
+  if (!geom) return null;
+
+  const chartRef: string | undefined = chart?.["@_r:id"];
+  if (!chartRef) return null;
+  const chartTarget = ctx.slideRels.byId.get(chartRef)?.target;
+  if (!chartTarget) return null;
+  const chartPath = normalisePath(chartTarget, dirOf(ctx.slidePath));
+  const chartRels = await readRels(ctx.zip, relsPathFor(chartPath));
+
+  // Image rels off the chart part — image1.png next to chart1.xml is the
+  // common shape, but we accept any `…/relationships/image` entry.
+  const imageTargets: string[] = [];
+  for (const { target, type } of chartRels.byId.values()) {
+    if (type.endsWith("/image")) imageTargets.push(target);
+  }
+
+  for (const target of imageTargets) {
+    const fullPath = normalisePath(target, dirOf(chartPath));
+    const file = ctx.zip.file(fullPath);
+    if (!file) continue;
+    const ext = (fullPath.split(".").pop() || "png").toLowerCase();
+    if (!RASTER_EXTS.has(ext)) continue;
+    const base64 = await file.async("base64");
+    const mime = mimeForExt(ext);
+    return {
+      id: nanoid(8),
+      type: "image",
+      ...geom,
+      z: 0,
+      src: `data:${mime};base64,${base64}`,
+      fit: "contain",
+      alt: "Chart",
+    };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Live chart parsing (bar / column / line / pie / doughnut / area)
+// ---------------------------------------------------------------------------
+
+const CHART_TAG_TO_KIND: Record<string, ChartElement["kind"]> = {
+  "c:barChart": "bar", // direction (col vs bar) refines later
+  "c:bar3DChart": "bar",
+  "c:lineChart": "line",
+  "c:line3DChart": "line",
+  "c:pieChart": "pie",
+  "c:pie3DChart": "pie",
+  "c:doughnutChart": "doughnut",
+  "c:areaChart": "area",
+  "c:area3DChart": "area",
+};
+
+/**
+ * Parse the chart part referenced by a `<c:chart>` into a ChartElement. The
+ * source `<p:graphicFrame>` XML is preserved on the element so save
+ * round-trips re-emit it verbatim (we don't yet write chart XML back from
+ * editor edits). Returns null when the chart part is missing, has no
+ * recognisable plot, or has no series data.
+ */
+async function parseLiveChart(
+  gf: any,
+  chart: any,
+  ctx: ParseContext,
+  outer: GroupTransform
+): Promise<ChartElement | null> {
+  const xfrm = gf?.["p:xfrm"] || gf?.["p:spPr"]?.["a:xfrm"];
+  const geom = readGeometry(xfrm, ctx.fit, outer);
+  if (!geom) return null;
+
+  const chartRef: string | undefined = chart?.["@_r:id"];
+  if (!chartRef) return null;
+  const chartTarget = ctx.slideRels.byId.get(chartRef)?.target;
+  if (!chartTarget) return null;
+  const chartPath = normalisePath(chartTarget, dirOf(ctx.slidePath));
+  const chartXml = await readXml(ctx.zip, chartPath);
+  const plotArea = chartXml?.["c:chartSpace"]?.["c:chart"]?.["c:plotArea"];
+  if (!plotArea) return null;
+
+  // Find the first recognised plot tag. PowerPoint allows multiple charts
+  // co-plotted (e.g. combo bar+line) but the first plot usually dominates;
+  // we render that and fall through to UnknownElement if nothing fits.
+  let plotNode: any | undefined;
+  let kindTag: string | undefined;
+  for (const tag of Object.keys(CHART_TAG_TO_KIND)) {
+    if (plotArea[tag]) {
+      plotNode = plotArea[tag];
+      kindTag = tag;
+      break;
+    }
+  }
+  if (!plotNode || !kindTag) return null;
+
+  let kind = CHART_TAG_TO_KIND[kindTag];
+  // <c:barChart><c:barDir val="bar"/> means horizontal bars; "col" is the
+  // vertical default. We distinguish so the renderer can pick orientation.
+  const barDir = plotNode?.["c:barDir"]?.["@_val"];
+  if (kindTag.startsWith("c:bar") && barDir === "col") kind = "column";
+
+  const groupingVal = plotNode?.["c:grouping"]?.["@_val"];
+  const grouping: ChartElement["grouping"] | undefined =
+    groupingVal === "stacked"
+      ? "stacked"
+      : groupingVal === "percentStacked"
+        ? "percentStacked"
+        : groupingVal === "clustered" || groupingVal === "standard"
+          ? "standard"
+          : undefined;
+
+  const sers = asArray(plotNode["c:ser"]);
+  if (!sers.length) return null;
+
+  // Categories come from the first series' <c:cat>; PPTX requires every
+  // series to share the same category axis so this is safe.
+  const categories: string[] = extractCategories(sers[0]);
+
+  const series: ChartSeries[] = [];
+  let valueFormat: string | undefined;
+  let showDataLabels = false;
+  for (const ser of sers) {
+    const name = extractSeriesName(ser);
+    const values = extractSeriesValues(ser, categories.length);
+    if (!values.length && !name) continue;
+    // PPTX series colours: explicit `<c:spPr><a:solidFill>` wins; otherwise
+    // PowerPoint uses the theme accent palette indexed by `<c:idx>` modulo
+    // 6, cycling accent1..accent6. (Order is the visual position; idx is
+    // the colour-picker key — they often differ, e.g. the second-drawn
+    // series can have idx=0 to inherit accent1.)
+    const explicitFill = ser?.["c:spPr"]?.["a:solidFill"];
+    const idx = Number(ser?.["c:idx"]?.["@_val"] ?? 0);
+    const color =
+      resolveColor(explicitFill, ctx.theme) ?? seriesAccentColor(idx, ctx.theme);
+    series.push({ name, values, ...(color ? { color } : {}) });
+    if (!valueFormat) {
+      const num = ser?.["c:val"]?.["c:numRef"]?.["c:numCache"]?.["c:formatCode"];
+      const code = typeof num === "string" ? num : num?.["#text"];
+      if (typeof code === "string" && code !== "General") valueFormat = code;
+    }
+    if (!showDataLabels && ser?.["c:dLbls"]?.["c:showVal"]?.["@_val"] === "1") {
+      showDataLabels = true;
+    }
+  }
+  if (!series.length) return null;
+
+  const title = extractChartTitle(chartXml?.["c:chartSpace"]?.["c:chart"]?.["c:title"]);
+  const ooxmlXml = xmlBuilder.build({ "p:graphicFrame": gf });
+
+  const element: ChartElement = {
+    id: nanoid(8),
+    type: "chart",
+    ...geom,
+    z: 0,
+    kind,
+    ...(grouping ? { grouping } : {}),
+    categories,
+    series,
+    ...(showDataLabels ? { showDataLabels: true } : {}),
+    ...(title ? { title } : {}),
+    ...(valueFormat ? { valueFormat } : {}),
+    ooxmlXml,
+  };
+  return element;
+}
+
+function extractCategories(ser: any): string[] {
+  const cat = ser?.["c:cat"] ?? ser?.["c:xVal"];
+  if (!cat) return [];
+  const strCache = cat?.["c:strRef"]?.["c:strCache"] ?? cat?.["c:strCache"];
+  const numCache = cat?.["c:numRef"]?.["c:numCache"] ?? cat?.["c:numCache"];
+  const cache = strCache ?? numCache;
+  if (!cache) return [];
+  const ptCount = Number(cache?.["c:ptCount"]?.["@_val"] ?? 0);
+  const pts = asArray(cache?.["c:pt"]);
+  const arr = new Array<string>(ptCount).fill("");
+  for (const p of pts) {
+    const idx = Number(p?.["@_idx"] ?? -1);
+    if (idx < 0 || idx >= ptCount) continue;
+    const v = p?.["c:v"];
+    arr[idx] = typeof v === "string" ? v : (v?.["#text"] ?? "");
+  }
+  return arr;
+}
+
+function extractSeriesName(ser: any): string {
+  const tx = ser?.["c:tx"];
+  if (!tx) return "";
+  const cache = tx?.["c:strRef"]?.["c:strCache"];
+  if (cache) {
+    const pt = asArray(cache["c:pt"])[0];
+    const v = pt?.["c:v"];
+    return typeof v === "string" ? v : (v?.["#text"] ?? "");
+  }
+  const v = tx?.["c:v"];
+  return typeof v === "string" ? v : "";
+}
+
+function extractSeriesValues(ser: any, expected: number): (number | null)[] {
+  const val = ser?.["c:val"] ?? ser?.["c:yVal"];
+  if (!val) return [];
+  const cache = val?.["c:numRef"]?.["c:numCache"] ?? val?.["c:numCache"];
+  if (!cache) return [];
+  const ptCount = Number(cache?.["c:ptCount"]?.["@_val"] ?? expected);
+  const length = Math.max(ptCount, expected);
+  const out = new Array<number | null>(length).fill(null);
+  for (const p of asArray(cache["c:pt"])) {
+    const idx = Number(p?.["@_idx"] ?? -1);
+    if (idx < 0 || idx >= length) continue;
+    const v = p?.["c:v"];
+    const raw = typeof v === "string" ? v : v?.["#text"];
+    const n = raw === undefined ? NaN : Number(raw);
+    out[idx] = Number.isFinite(n) ? n : null;
+  }
+  return out;
+}
+
+/**
+ * PowerPoint default series colour: `theme.accent{(idx % 6) + 1}`. Matches
+ * the visual order the colour picker cycles when an author never overrides
+ * a series fill — for the Dickinson sample, series-with-idx-0 picks up
+ * accent1 (red).
+ */
+function seriesAccentColor(idx: number, theme: ThemeColors): string {
+  const slot = ((idx % 6) + 6) % 6; // safe modulo for negatives
+  const key = (`accent${slot + 1}`) as keyof ThemeColors;
+  return theme[key];
+}
+
+function extractChartTitle(title: any): string | undefined {
+  if (!title) return undefined;
+  const paragraphs = asArray(title?.["c:tx"]?.["c:rich"]?.["a:p"]);
+  const parts: string[] = [];
+  for (const p of paragraphs) {
+    for (const r of asArray(p?.["a:r"])) {
+      const t = r?.["a:t"];
+      if (typeof t === "string") parts.push(t);
+      else if (t?.["#text"]) parts.push(t["#text"]);
+    }
+  }
+  const joined = parts.join("").trim();
+  return joined || undefined;
+}
+
+function normaliseGuid(raw: string): string {
+  return raw.trim().replace(/[{}]/g, "").toUpperCase();
+}
+
+function extractText(node: any): string | undefined {
+  if (!node) return undefined;
+  if (typeof node === "string") return node;
+  if (typeof node === "object" && typeof node["#text"] === "string") {
+    return node["#text"];
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a table-style `<a:fillRef>`/`<a:fill>` into a CSS colour against
+ * the current slide's theme. Style entries use `<a:fillRef idx="…">`
+ * pointing at the theme's fillStyleLst, or carry an inline `<a:fill>` with
+ * a `<a:solidFill>`. We only handle solid fills here — gradient / pattern
+ * styles fall through to the table's default row fill.
+ */
+function resolveTableStyleFill(
+  part: TableStylePart,
+  ctx: ParseContext
+): string | undefined {
+  const node = part.fill;
+  if (!node) return undefined;
+  // Inline solid fill.
+  const solid = node?.["a:solidFill"];
+  if (solid) {
+    return resolveColor(substitutePhClr(solid, undefined), ctx.theme);
+  }
+  // <a:fillRef idx="N"><a:schemeClr…/></a:fillRef> — N is 1-based into
+  // fillStyleLst. We use the schemeClr inside as the colour, ignoring the
+  // referenced fill style itself (gradients aren't modelled on tables).
+  const fillRef = node?.["a:fillRef"] ?? node;
+  if (fillRef && (fillRef["a:schemeClr"] || fillRef["a:srgbClr"])) {
+    return resolveColor(fillRef, ctx.theme);
+  }
+  return undefined;
+}
+
+function resolveTableStyleTextColor(
+  part: TableStylePart,
+  ctx: ParseContext
+): string | undefined {
+  if (!part.textColor) return undefined;
+  return resolveColor(part.textColor, ctx.theme);
 }
 
 function toUnknown(
@@ -1575,10 +2155,9 @@ function resolveColor(node: any, theme: ThemeColors): string | undefined {
   // Allow caller to pass either a:solidFill or a bare color node.
   const inner = pickColorChild(node) ?? node;
   if (!inner) return undefined;
-  let base = readBaseHex(inner, theme);
+  const base = readBaseHex(inner, theme);
   if (!base) return undefined;
   let { r, g, b, a } = hexToRgba(base);
-  let { h, s, l } = rgbToHsl(r, g, b);
 
   const modParent = pickColorChildEnvelope(node) ?? inner;
   const lumMod = numFromVal(modParent?.["a:lumMod"]);
@@ -1587,13 +2166,29 @@ function resolveColor(node: any, theme: ThemeColors): string | undefined {
   const tint = numFromVal(modParent?.["a:tint"]);
   const alphaN = numFromVal(modParent?.["a:alpha"]);
 
-  if (lumMod !== undefined) l = clamp(l * lumMod);
-  if (lumOff !== undefined) l = clamp(l + lumOff);
-  // shade/tint: per OOXML, val=100000 is no-op. shade darkens via L; tint lightens via L.
-  if (shade !== undefined) l = clamp(l * shade);
-  if (tint !== undefined) l = clamp(l + (1 - l) * (1 - tint));
-
-  ({ r, g, b } = hslToRgb(h, s, l));
+  // lumMod / lumOff operate in HSL on the luminance channel. tint / shade
+  // operate per-RGB-channel per ECMA-376 §20.1.2.3 (mix with white / black
+  // respectively). Conflating the two — as a single HSL-luminance shift —
+  // over-saturates pastel tints like Office's "Medium Style 2 — Accent 1"
+  // table style.
+  if (lumMod !== undefined || lumOff !== undefined) {
+    let { h, s, l } = rgbToHsl(r, g, b);
+    if (lumMod !== undefined) l = clamp(l * lumMod);
+    if (lumOff !== undefined) l = clamp(l + lumOff);
+    ({ r, g, b } = hslToRgb(h, s, l));
+  }
+  if (tint !== undefined) {
+    // tint=1 → unchanged; tint=0 → white. final = base*tint + 255*(1-tint).
+    r = r * tint + 255 * (1 - tint);
+    g = g * tint + 255 * (1 - tint);
+    b = b * tint + 255 * (1 - tint);
+  }
+  if (shade !== undefined) {
+    // shade=1 → unchanged; shade=0 → black. final = base * shade.
+    r = r * shade;
+    g = g * shade;
+    b = b * shade;
+  }
   if (alphaN !== undefined) a = clamp(a * alphaN);
 
   const hex = rgbToHex(r, g, b);
@@ -2990,6 +3585,76 @@ async function readRels(zip: JSZip, path: string): Promise<Rels> {
     if (id && target) byId.set(id, { target, type });
   }
   return { byId };
+}
+
+/**
+ * Parse `ppt/tableStyles.xml` once at the top of a deck import. The file
+ * is referenced from `ppt/_rels/presentation.xml.rels` with relationship
+ * type `…/relationships/tableStyles`. Returns a map keyed by uppercased,
+ * unbraced GUID plus the file-level default GUID (from
+ * `<a:tblStyleLst def="…">`) when present.
+ *
+ * Only solid-fill style parts are captured; gradient / pattern parts and
+ * border styling aren't modelled yet. Each `<a:tblStyle>` may have any of
+ * the part regions; missing ones simply leave the field undefined and
+ * fall back to the table's row/header defaults at apply time.
+ */
+async function readTableStyles(
+  zip: JSZip,
+  presentationRels: Rels
+): Promise<{ styles: Map<string, TableStyleRaw>; defaultId?: string }> {
+  const styles = new Map<string, TableStyleRaw>();
+  let target: string | undefined;
+  for (const { target: t, type } of presentationRels.byId.values()) {
+    if (type.endsWith("/tableStyles")) {
+      target = t;
+      break;
+    }
+  }
+  const path = target
+    ? normalisePath(target, "ppt")
+    : "ppt/tableStyles.xml";
+  const xml = await readXml(zip, path);
+  if (!xml) return { styles };
+  const lst = xml?.["a:tblStyleLst"];
+  if (!lst) return { styles };
+  const defaultId = lst["@_def"] ? normaliseGuid(lst["@_def"]) : undefined;
+  for (const s of asArray(lst["a:tblStyle"])) {
+    const guidAttr: string | undefined = s?.["@_styleId"];
+    if (!guidAttr) continue;
+    const guid = normaliseGuid(guidAttr);
+    styles.set(guid, extractTableStyle(s));
+  }
+  return { styles, defaultId };
+}
+
+function extractTableStyle(node: any): TableStyleRaw {
+  const part = (name: string): TableStylePart | undefined => {
+    const region = node?.[name];
+    if (!region) return undefined;
+    const tcStyle = region["a:tcStyle"];
+    const tcTxStyle = region["a:tcTxStyle"];
+    const fill = tcStyle?.["a:fill"] ?? tcStyle?.["a:fillRef"];
+    const out: TableStylePart = {};
+    if (fill) out.fill = fill;
+    if (tcTxStyle) {
+      out.textColor = pickColorChild(tcTxStyle) ?? tcTxStyle;
+      const b = tcTxStyle["@_b"];
+      if (b === "on" || b === "1" || b === "true") out.bold = true;
+    }
+    return out.fill || out.textColor ? out : undefined;
+  };
+  return {
+    wholeTbl: part("a:wholeTbl"),
+    firstRow: part("a:firstRow"),
+    lastRow: part("a:lastRow"),
+    firstCol: part("a:firstCol"),
+    lastCol: part("a:lastCol"),
+    band1H: part("a:band1H"),
+    band2H: part("a:band2H"),
+    band1V: part("a:band1V"),
+    band2V: part("a:band2V"),
+  };
 }
 
 function firstByType(rels: Rels, suffix: string): string | undefined {
