@@ -32,7 +32,24 @@ import { SOURCE_PPTX, SOURCE_SLIDE_PATH } from "./pptxToDeck";
  * zip, renumbering rIds as needed to avoid clashes with what
  * pptxgenjs already wrote.
  */
-export async function serializeDeck(deck: Deck): Promise<Blob> {
+/**
+ * Optional knobs for the serializer.
+ *
+ * `source` lets the host pass the original PPTX bytes alongside the deck so
+ * UnknownElement preservation can run even when the deck object has been
+ * cloned, spread, JSON-rehydrated, or otherwise stripped of the
+ * non-enumerable attachment that `parsePptx` stamps on. Hosts running an
+ * editor (Zustand snapshots, immutable updates, localStorage rehydrate)
+ * should pass `source` explicitly.
+ */
+export interface SerializeOptions {
+  source?: Blob | ArrayBuffer | Uint8Array;
+}
+
+export async function serializeDeck(
+  deck: Deck,
+  options: SerializeOptions = {}
+): Promise<Blob> {
   const pptx = new pptxgen();
   pptx.title = deck.title || "Untitled";
   pptx.layout = "LAYOUT_WIDE"; // 13.333 × 7.5 in
@@ -46,7 +63,7 @@ export async function serializeDeck(deck: Deck): Promise<Blob> {
   const generated = (await pptx.write({
     outputType: "arraybuffer",
   })) as ArrayBuffer;
-  return preserveUnknowns(generated, deck);
+  return preserveUnknowns(generated, deck, options.source);
 }
 
 function addSlide(pptx: pptxgen, slide: Slide): void {
@@ -298,25 +315,38 @@ function addEmbed(s: pptxgen.Slide, el: EmbedElement): void {
  */
 async function preserveUnknowns(
   generated: ArrayBuffer,
-  deck: Deck
+  deck: Deck,
+  explicitSource?: Blob | ArrayBuffer | Uint8Array
 ): Promise<Blob> {
   const wrapBlob = () => new Blob([generated], { type: PPTX_MIME });
   const unknownsBySlide = collectUnknowns(deck);
   if (!unknownsBySlide.size) return wrapBlob();
-  const sourceBuffer = (deck as unknown as Record<string, unknown>)[SOURCE_PPTX];
-  if (!(sourceBuffer instanceof ArrayBuffer)) return wrapBlob();
+  // Prefer the caller-supplied source (survives state cloning / localStorage
+  // rehydrate); fall back to the non-enumerable attachment from parsePptx
+  // for the "parse → serialize" happy path with no state in between.
+  const sourceBuffer = await resolveSource(deck, explicitSource);
+  if (!sourceBuffer) return wrapBlob();
 
   const [outZip, srcZip] = await Promise.all([
     JSZip.loadAsync(generated),
     JSZip.loadAsync(sourceBuffer),
   ]);
 
-  for (const [slideIndex, group] of unknownsBySlide) {
+  // The source's slide-XML paths (in deck order). Used as a fallback when
+  // the per-slide non-enumerable attachment has been stripped by state
+  // cloning — we then map deck.slides[i] back to source slides[i].
+  const sourceSlidePaths = await readSourceSlidePaths(srcZip);
+
+  let sortedIndices = [...unknownsBySlide.keys()].sort((a, b) => a - b);
+  for (const slideIndex of sortedIndices) {
+    const group = unknownsBySlide.get(slideIndex)!;
     const generatedSlidePath = `ppt/slides/slide${slideIndex + 1}.xml`;
     const generatedRelsPath = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
     if (!outZip.file(generatedSlidePath)) continue;
-    if (!group.sourcePath) continue;
-    const sourceRelsPath = relsPathFor(group.sourcePath);
+    const sourcePath =
+      group.sourcePath ?? sourceSlidePaths[slideIndex] ?? undefined;
+    if (!sourcePath) continue;
+    const sourceRelsPath = relsPathFor(sourcePath);
 
     await injectUnknownsIntoSlide(
       outZip,
@@ -330,6 +360,23 @@ async function preserveUnknowns(
 
   // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+}
+
+async function resolveSource(
+  deck: Deck,
+  explicit?: Blob | ArrayBuffer | Uint8Array
+): Promise<ArrayBuffer | undefined> {
+  if (explicit) {
+    if (explicit instanceof ArrayBuffer) return explicit;
+    if (explicit instanceof Uint8Array) {
+      const copy = new ArrayBuffer(explicit.byteLength);
+      new Uint8Array(copy).set(explicit);
+      return copy;
+    }
+    return explicit.arrayBuffer();
+  }
+  const attached = (deck as unknown as Record<string, unknown>)[SOURCE_PPTX];
+  return attached instanceof ArrayBuffer ? attached : undefined;
 }
 
 interface UnknownGroup {
@@ -459,6 +506,28 @@ async function injectUnknownsIntoSlide(
           );
     outZip.file(generatedRelsPath, updatedRels);
   }
+}
+
+async function readSourceSlidePaths(srcZip: JSZip): Promise<string[]> {
+  // Walk the source presentation.xml + its rels to get slide-xml paths in
+  // deck order. Best-effort: if anything's missing we return [] and the
+  // caller falls back to its own per-slide source attachment.
+  const presentation = await srcZip
+    .file("ppt/presentation.xml")
+    ?.async("string");
+  const presentationRels = await srcZip
+    .file("ppt/_rels/presentation.xml.rels")
+    ?.async("string");
+  if (!presentation || !presentationRels) return [];
+  const relMap = parseRels(presentationRels);
+  const sldIdRe = /<p:sldId\b[^>]*\br:id="([^"]+)"/g;
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = sldIdRe.exec(presentation))) {
+    const rel = relMap.get(m[1]);
+    if (rel?.target) out.push(normalisePath(rel.target, "ppt"));
+  }
+  return out;
 }
 
 function parseRels(xml: string | null): Map<string, { type: string; target: string }> {

@@ -124,6 +124,13 @@ export function App() {
   const [overlay, setOverlay] = useState<string | null>(null);
   const [sourceLabel, setSourceLabel] = useState<string>("Seed deck");
   const [activeDemo, setActiveDemo] = useState<DemoId>("default");
+  // Original PPTX bytes for whatever was last loaded. Kept here (not on
+  // the Deck) so the bytes survive the editor's immutable state updates,
+  // Zustand snapshots, and the localStorage JSON round-trip — all of
+  // which strip non-enumerable / non-JSON properties. Required by
+  // serializeDeck to round-trip UnknownElement payloads (charts,
+  // SmartArt, group shapes, …) without dropping them.
+  const sourcePptxRef = useRef<ArrayBuffer | undefined>(undefined);
 
   const loadFromFile = async (file: File) => {
     if (!file.name.toLowerCase().endsWith(".pptx")) {
@@ -133,7 +140,9 @@ export function App() {
     }
     try {
       setOverlay(`Loading ${file.name}…`);
-      const next = await parsePptx(file);
+      const buffer = await file.arrayBuffer();
+      sourcePptxRef.current = buffer;
+      const next = await parsePptx(buffer);
       setDeck(next);
       setSourceLabel(file.name);
       setOverlay(`Loaded ${next.slides.length} slides from ${file.name}`);
@@ -193,7 +202,9 @@ export function App() {
 
   const handleExportPptx = async (current: Deck) => {
     try {
-      const blob = await serializeDeck(current);
+      const blob = await serializeDeck(current, {
+        source: sourcePptxRef.current,
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
