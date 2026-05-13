@@ -15,7 +15,12 @@ import type {
   UnknownElement,
 } from "@/lib/types";
 import { pxToInches, pxToPoints } from "./units";
-import { SOURCE_PPTX, SOURCE_SLIDE_PATH } from "./pptxToDeck";
+import {
+  SOURCE_PPTX,
+  SOURCE_SLIDE_PATH,
+  getElementSource,
+  snapshotElement,
+} from "./pptxToDeck";
 
 /**
  * Serialize a Slidewise Deck to a real PPTX blob.
@@ -32,7 +37,24 @@ import { SOURCE_PPTX, SOURCE_SLIDE_PATH } from "./pptxToDeck";
  * zip, renumbering rIds as needed to avoid clashes with what
  * pptxgenjs already wrote.
  */
-export async function serializeDeck(deck: Deck): Promise<Blob> {
+/**
+ * Optional knobs for the serializer.
+ *
+ * `source` lets the host pass the original PPTX bytes alongside the deck so
+ * UnknownElement preservation can run even when the deck object has been
+ * cloned, spread, JSON-rehydrated, or otherwise stripped of the
+ * non-enumerable attachment that `parsePptx` stamps on. Hosts running an
+ * editor (Zustand snapshots, immutable updates, localStorage rehydrate)
+ * should pass `source` explicitly.
+ */
+export interface SerializeOptions {
+  source?: Blob | ArrayBuffer | Uint8Array;
+}
+
+export async function serializeDeck(
+  deck: Deck,
+  options: SerializeOptions = {}
+): Promise<Blob> {
   const pptx = new pptxgen();
   pptx.title = deck.title || "Untitled";
   pptx.layout = "LAYOUT_WIDE"; // 13.333 × 7.5 in
@@ -46,7 +68,7 @@ export async function serializeDeck(deck: Deck): Promise<Blob> {
   const generated = (await pptx.write({
     outputType: "arraybuffer",
   })) as ArrayBuffer;
-  return preserveUnknowns(generated, deck);
+  return preserveUnknowns(generated, deck, options.source);
 }
 
 function addSlide(pptx: pptxgen, slide: Slide): void {
@@ -55,6 +77,11 @@ function addSlide(pptx: pptxgen, slide: Slide): void {
 
   const sorted = [...slide.elements].sort((a, b) => a.z - b.z);
   for (const el of sorted) {
+    // Skip elements whose imported OOXML survived this far AND haven't
+    // been edited — the post-process step replays their source XML
+    // verbatim, sidestepping pptxgenjs's lossy translation of
+    // gradient / custGeom / backing fields.
+    if (isPristineImportedElement(el)) continue;
     try {
       addElement(s, el);
     } catch (err) {
@@ -64,6 +91,12 @@ function addSlide(pptx: pptxgen, slide: Slide): void {
       );
     }
   }
+}
+
+function isPristineImportedElement(el: SlideElement): boolean {
+  const src = getElementSource(el.id);
+  if (!src) return false;
+  return src.snapshot === snapshotElement(el);
 }
 
 function addElement(s: pptxgen.Slide, el: SlideElement): void {
@@ -298,33 +331,66 @@ function addEmbed(s: pptxgen.Slide, el: EmbedElement): void {
  */
 async function preserveUnknowns(
   generated: ArrayBuffer,
-  deck: Deck
+  deck: Deck,
+  explicitSource?: Blob | ArrayBuffer | Uint8Array
 ): Promise<Blob> {
   const wrapBlob = () => new Blob([generated], { type: PPTX_MIME });
   const unknownsBySlide = collectUnknowns(deck);
-  if (!unknownsBySlide.size) return wrapBlob();
-  const sourceBuffer = (deck as unknown as Record<string, unknown>)[SOURCE_PPTX];
-  if (!(sourceBuffer instanceof ArrayBuffer)) return wrapBlob();
+  const pristinesBySlide = collectPristineImports(deck);
+  if (!unknownsBySlide.size && !pristinesBySlide.size) return wrapBlob();
+  // Prefer the caller-supplied source (survives state cloning / localStorage
+  // rehydrate); fall back to the non-enumerable attachment from parsePptx
+  // for the "parse → serialize" happy path with no state in between.
+  const sourceBuffer = await resolveSource(deck, explicitSource);
+  if (!sourceBuffer) return wrapBlob();
 
   const [outZip, srcZip] = await Promise.all([
     JSZip.loadAsync(generated),
     JSZip.loadAsync(sourceBuffer),
   ]);
 
-  for (const [slideIndex, group] of unknownsBySlide) {
+  // The source's slide-XML paths (in deck order). Used as a fallback when
+  // the per-slide non-enumerable attachment has been stripped by state
+  // cloning — we then map deck.slides[i] back to source slides[i].
+  const sourceSlidePaths = await readSourceSlidePaths(srcZip);
+
+  const slideIndices = new Set<number>([
+    ...unknownsBySlide.keys(),
+    ...pristinesBySlide.keys(),
+  ]);
+  const sortedIndices = [...slideIndices].sort((a, b) => a - b);
+  for (const slideIndex of sortedIndices) {
+    const unknownGroup = unknownsBySlide.get(slideIndex);
+    const pristineGroup = pristinesBySlide.get(slideIndex);
     const generatedSlidePath = `ppt/slides/slide${slideIndex + 1}.xml`;
     const generatedRelsPath = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
     if (!outZip.file(generatedSlidePath)) continue;
-    if (!group.sourcePath) continue;
-    const sourceRelsPath = relsPathFor(group.sourcePath);
-
-    await injectUnknownsIntoSlide(
+    // The slide's own source path is the default for UnknownElement
+    // fragments; each pristine fragment carries its own (layout / master)
+    // source path so the injector can resolve r:id references against
+    // the correct rels file.
+    const slideSourcePath =
+      unknownGroup?.sourcePath ?? sourceSlidePaths[slideIndex] ?? undefined;
+    const unknownFragments: PristineFragment[] =
+      unknownGroup && slideSourcePath
+        ? unknownGroup.unknowns.map((u) => ({
+            xml: u.ooxmlXml,
+            sourcePath: slideSourcePath,
+          }))
+        : [];
+    if (
+      !unknownFragments.length &&
+      !(pristineGroup?.fragments.length ?? 0)
+    ) {
+      continue;
+    }
+    await injectIntoSlide(
       outZip,
       srcZip,
       generatedSlidePath,
       generatedRelsPath,
-      sourceRelsPath,
-      group.unknowns
+      pristineGroup?.fragments ?? [],
+      unknownFragments
     );
   }
 
@@ -332,9 +398,58 @@ async function preserveUnknowns(
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
 }
 
+async function resolveSource(
+  deck: Deck,
+  explicit?: Blob | ArrayBuffer | Uint8Array
+): Promise<ArrayBuffer | undefined> {
+  if (explicit) {
+    if (explicit instanceof ArrayBuffer) return explicit;
+    if (explicit instanceof Uint8Array) {
+      const copy = new ArrayBuffer(explicit.byteLength);
+      new Uint8Array(copy).set(explicit);
+      return copy;
+    }
+    return explicit.arrayBuffer();
+  }
+  const attached = (deck as unknown as Record<string, unknown>)[SOURCE_PPTX];
+  return attached instanceof ArrayBuffer ? attached : undefined;
+}
+
 interface UnknownGroup {
   unknowns: UnknownElement[];
   sourcePath: string | undefined;
+}
+
+interface PristineFragment {
+  xml: string;
+  /** Archive path of the XML's origin (slide / layout / master) — used
+   *  to resolve r:id references against the correct rels file. */
+  sourcePath: string;
+}
+
+interface PristineGroup {
+  fragments: PristineFragment[];
+}
+
+function collectPristineImports(deck: Deck): Map<number, PristineGroup> {
+  const out = new Map<number, PristineGroup>();
+  for (let i = 0; i < deck.slides.length; i++) {
+    const slide = deck.slides[i];
+    const fragments: PristineFragment[] = [];
+    for (const el of slide.elements) {
+      // UnknownElement carries its OOXML directly and goes through the
+      // separate (high-z, append) injection path — don't double-inject
+      // it as a pristine fragment too.
+      if (el.type === "unknown") continue;
+      const src = getElementSource(el.id);
+      if (!src) continue;
+      if (src.snapshot !== snapshotElement(el)) continue;
+      fragments.push({ xml: src.xml, sourcePath: src.slidePath });
+    }
+    if (!fragments.length) continue;
+    out.set(i, { fragments });
+  }
+  return out;
 }
 
 function collectUnknowns(deck: Deck): Map<number, UnknownGroup> {
@@ -357,64 +472,80 @@ function collectUnknowns(deck: Deck): Map<number, UnknownGroup> {
 }
 
 /**
- * For one slide: rewrite the preserved fragments so their rIds don't
- * collide with whatever pptxgenjs already allocated, copy the
- * referenced rels + media from the source zip, and splice the
- * fragments in before the closing `</p:spTree>`.
+ * For one slide: rewrite preserved fragments so their rIds don't collide
+ * with whatever pptxgenjs already allocated, copy the referenced rels +
+ * media from the source zip, and splice the fragments into the generated
+ * `<p:spTree>`. `pristineFragments` (verbatim imported elements that
+ * weren't edited) get prepended right after `<p:grpSpPr>` so they sit
+ * at the bottom of the z stack — that's where layout-derived backgrounds
+ * / gradients / wordmarks belong. `unknownPayloads` (charts / SmartArt /
+ * OLE) get appended just before `</p:spTree>` so they sit on top, where
+ * authored content typically lives.
  */
-async function injectUnknownsIntoSlide(
+async function injectIntoSlide(
   outZip: JSZip,
   srcZip: JSZip,
   generatedSlidePath: string,
   generatedRelsPath: string,
-  sourceRelsPath: string,
-  unknowns: UnknownElement[]
+  pristineFragments: PristineFragment[],
+  unknownFragments: PristineFragment[]
 ): Promise<void> {
   const slideXml = await outZip.file(generatedSlidePath)!.async("string");
   const closeIdx = slideXml.lastIndexOf("</p:spTree>");
   if (closeIdx < 0) return;
 
-  const srcRelsXml = (await srcZip.file(sourceRelsPath)?.async("string")) ?? null;
   const outRelsXml =
     (await outZip.file(generatedRelsPath)?.async("string")) ??
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
 
-  const srcRels = parseRels(srcRelsXml);
   const outRels = parseRels(outRelsXml);
   let nextRid = highestRid(outRels) + 1;
   const newRelLines: string[] = [];
-  const ridMap = new Map<string, string>();
-  // Source slide's directory (used to resolve relative rel targets like
-  // "../media/imageN.png" against the source archive).
-  const sourceSlidePath = sourceRelsPath.replace(/_rels\/([^/]+)\.rels$/, "$1");
-  const sourceDir = dirOf(sourceSlidePath);
   const outDir = dirOf(generatedSlidePath);
-  const rewritten: string[] = [];
 
-  for (const u of unknowns) {
-    // Every r:id / r:embed / r:link inside the preserved fragment refers
-    // to a relationship in the SOURCE slide's rels. Renumber to fresh
-    // rIds, copy the matching source rel into the generated rels, and
-    // copy the media payload into the generated zip (at a fresh path so
-    // pptxgenjs-allocated media doesn't clash with the preserved media).
-    // Match every `r:*="rIdN"` attribute. The relationship-namespaced
-    // attribute names depend on the schema: `r:id` / `r:embed` / `r:link`
-    // for slides + drawings, but charts use `r:id`, SmartArt uses `r:dm`
-    // (data model) / `r:cs` (colors) / `r:qs` (quick styles) / `r:lo`
-    // (layout), and embedded objects use `r:id`/`r:image`. Restricting to
-    // the value pattern `rId\d+` keeps unrelated `r:*` attributes
-    // untouched.
-    const xml = u.ooxmlXml.replace(
+  // Per-fragment rId map: r:* references inside one fragment only reuse
+  // earlier rIds when they came from the *same* source rels file. Two
+  // fragments sourced from different layouts/masters that happen to use
+  // the same rId number ("rId2") refer to completely different rels.
+  const srcRelsCache = new Map<string, Map<string, { type: string; target: string }>>();
+  const getSrcRels = async (
+    sourcePath: string
+  ): Promise<Map<string, { type: string; target: string }>> => {
+    const relsPath = relsPathFor(sourcePath);
+    let cached = srcRelsCache.get(relsPath);
+    if (cached) return cached;
+    const xml = (await srcZip.file(relsPath)?.async("string")) ?? null;
+    cached = parseRels(xml);
+    srcRelsCache.set(relsPath, cached);
+    return cached;
+  };
+
+  /**
+   * Rewrite every `r:*="rIdN"` in the fragment to a fresh rId pointing at
+   * the source rel's target. Copies the referenced media into the
+   * generated zip at a uniquely-prefixed path so it can't collide with
+   * media pptxgenjs already wrote. Each fragment carries its own source
+   * path so the rels lookup uses the right archive entry
+   * (slide / layout / master).
+   *
+   * Matches `r:id` / `r:embed` / `r:link` (slides + drawings + charts),
+   * `r:dm` / `r:cs` / `r:qs` / `r:lo` (SmartArt), and any other
+   * `r:NAME="rIdN"` style attribute the schema uses. Restricting to the
+   * value pattern `rId\d+` keeps unrelated `r:*` attributes untouched.
+   */
+  const rewriteFragment = async (frag: PristineFragment): Promise<string> => {
+    const srcRels = await getSrcRels(frag.sourcePath);
+    const sourceDir = dirOf(frag.sourcePath);
+    const ridMap = new Map<string, string>();
+    return frag.xml.replace(
       /\b(r:[a-zA-Z]+)="(rId\d+)"/g,
-      (_match, attr, srcRid) => {
+      (_m, attr, srcRid) => {
         const cached = ridMap.get(srcRid);
         if (cached) return `${attr}="${cached}"`;
         const srcRel = srcRels.get(srcRid);
         if (!srcRel) return `${attr}="${srcRid}"`;
-
         const newRid = `rId${nextRid++}`;
         ridMap.set(srcRid, newRid);
-
         let target = srcRel.target;
         const isExternal = /^https?:\/\//i.test(target);
         const isInternalPart = !isExternal && !target.startsWith("/");
@@ -422,8 +553,6 @@ async function injectUnknownsIntoSlide(
           const srcFullTarget = normalisePath(target, sourceDir);
           const srcFile = srcZip.file(srcFullTarget);
           if (srcFile) {
-            // Always copy to a uniquely-prefixed path so we never collide
-            // with media pptxgenjs already wrote.
             const newTarget = uniqueTarget(target, outZip, outDir);
             const newFullTarget = normalisePath(newTarget, outDir);
             outZip.file(newFullTarget, srcFile.async("uint8array"), {
@@ -432,17 +561,42 @@ async function injectUnknownsIntoSlide(
             target = newTarget;
           }
         }
-
         newRelLines.push(buildRelXml(newRid, srcRel.type, target));
         return `${attr}="${newRid}"`;
       }
     );
-    rewritten.push(xml);
-  }
+  };
 
-  if (rewritten.length) {
-    const inject = rewritten.join("");
-    const updatedSlide = slideXml.slice(0, closeIdx) + inject + slideXml.slice(closeIdx);
+  const rewrittenPristines = await Promise.all(
+    pristineFragments.map(rewriteFragment)
+  );
+  const rewrittenUnknowns = await Promise.all(
+    unknownFragments.map(rewriteFragment)
+  );
+
+  let updatedSlide = slideXml;
+  // Pristine fragments → prepend after `<p:grpSpPr/>` (low z, decoration
+  // layer). Unknown payloads → append before `</p:spTree>` (high z,
+  // chart / SmartArt / content layer).
+  if (rewrittenPristines.length) {
+    const insertAfter = findSpTreeContentInsertionPoint(updatedSlide);
+    if (insertAfter >= 0) {
+      updatedSlide =
+        updatedSlide.slice(0, insertAfter) +
+        rewrittenPristines.join("") +
+        updatedSlide.slice(insertAfter);
+    }
+  }
+  if (rewrittenUnknowns.length) {
+    const close = updatedSlide.lastIndexOf("</p:spTree>");
+    if (close >= 0) {
+      updatedSlide =
+        updatedSlide.slice(0, close) +
+        rewrittenUnknowns.join("") +
+        updatedSlide.slice(close);
+    }
+  }
+  if (updatedSlide !== slideXml) {
     outZip.file(generatedSlidePath, updatedSlide);
   }
 
@@ -459,6 +613,50 @@ async function injectUnknownsIntoSlide(
           );
     outZip.file(generatedRelsPath, updatedRels);
   }
+}
+
+/**
+ * Find the position in a slide XML string immediately after the group's
+ * own `<p:grpSpPr…/>` / `</p:grpSpPr>` — i.e. just before the first child
+ * element of the spTree. Used to prepend pristine fragments at the
+ * bottom of the z stack.
+ */
+function findSpTreeContentInsertionPoint(slideXml: string): number {
+  const spTreeOpen = slideXml.indexOf("<p:spTree");
+  if (spTreeOpen < 0) return -1;
+  // Self-closing grpSpPr (`<p:grpSpPr/>`) is the typical pptxgenjs output.
+  const selfCloseRe = /<p:grpSpPr\s*\/>/g;
+  selfCloseRe.lastIndex = spTreeOpen;
+  const sc = selfCloseRe.exec(slideXml);
+  if (sc) return sc.index + sc[0].length;
+  // Otherwise look for the explicit close tag.
+  const closeIdx = slideXml.indexOf("</p:grpSpPr>", spTreeOpen);
+  if (closeIdx >= 0) return closeIdx + "</p:grpSpPr>".length;
+  // No grpSpPr → fall back to just after `<p:spTree>`'s opening tag.
+  const opTagEnd = slideXml.indexOf(">", spTreeOpen);
+  return opTagEnd >= 0 ? opTagEnd + 1 : -1;
+}
+
+async function readSourceSlidePaths(srcZip: JSZip): Promise<string[]> {
+  // Walk the source presentation.xml + its rels to get slide-xml paths in
+  // deck order. Best-effort: if anything's missing we return [] and the
+  // caller falls back to its own per-slide source attachment.
+  const presentation = await srcZip
+    .file("ppt/presentation.xml")
+    ?.async("string");
+  const presentationRels = await srcZip
+    .file("ppt/_rels/presentation.xml.rels")
+    ?.async("string");
+  if (!presentation || !presentationRels) return [];
+  const relMap = parseRels(presentationRels);
+  const sldIdRe = /<p:sldId\b[^>]*\br:id="([^"]+)"/g;
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = sldIdRe.exec(presentation))) {
+    const rel = relMap.get(m[1]);
+    if (rel?.target) out.push(normalisePath(rel.target, "ppt"));
+  }
+  return out;
 }
 
 function parseRels(xml: string | null): Map<string, { type: string; target: string }> {

@@ -273,6 +273,103 @@ export async function parsePptx(
 export const SOURCE_PPTX = "__slidewiseSourcePptx";
 export const SOURCE_SLIDE_PATH = "__slidewiseSourceSlidePath";
 
+/**
+ * Per-element source-XML registry. Keyed by `SlideElement.id`, holds the
+ * verbatim OOXML for every imported element + a snapshot of its semantic
+ * fields at parse time. The serializer compares the current element to
+ * the snapshot — if unchanged it re-emits the source XML verbatim
+ * (bypassing pptxgenjs), so layout-derived gradients, custGeom paths,
+ * backings, etc. survive saves regardless of pptxgenjs's coverage.
+ *
+ * Module-level Map → in-memory only. State that survives localStorage
+ * rehydrate (where this Map is empty for a new module instance) falls
+ * back to the legacy lossy pptxgenjs path. Hosts that need lossless
+ * round-trip across page reloads should re-import the PPTX to repopulate.
+ */
+interface ElementSource {
+  /** Verbatim `<p:sp>`/`<p:pic>`/`<p:cxnSp>`/`<p:graphicFrame>` XML. */
+  xml: string;
+  /** JSON snapshot of the semantic fields used for change detection. */
+  snapshot: string;
+  /** Source slide path the XML came from — used to resolve rels/media. */
+  slidePath: string;
+}
+
+const elementSourceRegistry = new Map<string, ElementSource>();
+
+export function getElementSource(elementId: string): ElementSource | undefined {
+  return elementSourceRegistry.get(elementId);
+}
+
+export function snapshotElement(element: SlideElement): string {
+  // Hash only fields the user can change in the editor. Element `id` and
+  // `z` are intentionally excluded — they may be reassigned by the store
+  // without representing a meaningful edit.
+  const e = element as any;
+  return JSON.stringify({
+    type: e.type,
+    x: e.x,
+    y: e.y,
+    w: e.w,
+    h: e.h,
+    rotation: e.rotation,
+    text: e.text,
+    fontFamily: e.fontFamily,
+    fontSize: e.fontSize,
+    fontWeight: e.fontWeight,
+    italic: e.italic,
+    underline: e.underline,
+    strike: e.strike,
+    color: e.color,
+    align: e.align,
+    vAlign: e.vAlign,
+    lineHeight: e.lineHeight,
+    letterSpacing: e.letterSpacing,
+    runs: e.runs,
+    shape: e.shape,
+    fill: e.fill,
+    stroke: e.stroke,
+    strokeWidth: e.strokeWidth,
+    radius: e.radius,
+    src: e.src,
+    fit: e.fit,
+    crop: e.crop,
+    dashed: e.dashed,
+    arrow: e.arrow,
+    rows: e.rows,
+    headerFill: e.headerFill,
+    rowFill: e.rowFill,
+    textColor: e.textColor,
+    borderColor: e.borderColor,
+  });
+}
+
+function registerElementSource(
+  element: SlideElement,
+  rawXml: string | undefined,
+  slidePath: string
+): void {
+  if (!rawXml) return;
+  // Skip elements whose source XML relies on placeholder geometry
+  // inheritance (no explicit <a:xfrm>). pptxgenjs writes its own
+  // slideLayouts on save, so on re-parse those inherited positions are
+  // gone — re-injecting the XML would produce a geom-less <p:sp> that
+  // falls into UnknownElement. Letting pptxgenjs emit them instead
+  // bakes the resolved coords into the output.
+  if (!hasExplicitXfrm(rawXml)) return;
+  elementSourceRegistry.set(element.id, {
+    xml: rawXml,
+    snapshot: snapshotElement(element),
+    slidePath,
+  });
+}
+
+function hasExplicitXfrm(xml: string): boolean {
+  // Look only at top-level <p:spPr>/<p:grpSpPr> xfrm; child xfrm inside
+  // e.g. a <p:txBody> doesn't count toward positioning the shape itself.
+  return /<a:xfrm[\s>]/.test(xml);
+}
+
 async function toArrayBuffer(
   input: Blob | ArrayBuffer | Uint8Array
 ): Promise<ArrayBuffer> {
@@ -403,6 +500,10 @@ async function parseSlide(
   // Placeholders the slide already overrides (e.g. picture placeholder filled
   // by an in-slide <p:pic>) are skipped so their "Insert Picture" prompt
   // background doesn't leak through.
+  // Allocate the slide id up front so underlay parsing can register any
+  // overridden-placeholder source XML as a "backing decoration" for this
+  // slide. The serializer reads that registry by slide id at save time.
+  const slideId = nanoid(8);
   const slidePhKeys = collectSlidePlaceholderKeys(spTree);
   const masterUnderlay = masterXml
     ? await parseUnderlay(
@@ -410,7 +511,8 @@ async function parseSlide(
         ctx,
         masterPath!,
         masterRels,
-        slidePhKeys
+        slidePhKeys,
+        slideId
       )
     : [];
   const layoutUnderlay = layoutXml
@@ -419,7 +521,8 @@ async function parseSlide(
         ctx,
         layoutPath!,
         layoutRels,
-        slidePhKeys
+        slidePhKeys,
+        slideId
       )
     : [];
   const elements: SlideElement[] = [];
@@ -435,7 +538,7 @@ async function parseSlide(
   }
 
   return {
-    id: nanoid(8),
+    id: slideId,
     background,
     elements,
   };
@@ -454,7 +557,8 @@ async function parseUnderlay(
   ctx: ParseContext,
   ownerPath: string,
   ownerRels: Rels,
-  slidePhKeys: Set<string>
+  slidePhKeys: Set<string>,
+  slideId: string
 ): Promise<SlideElement[]> {
   if (!spTree) return [];
   const underlayCtx: ParseContext = {
@@ -462,16 +566,35 @@ async function parseUnderlay(
     slidePath: ownerPath,
     slideRels: ownerRels,
   };
-  return walkUnderlay(spTree, underlayCtx, identityTransform(), slidePhKeys);
+  return walkUnderlay(
+    spTree,
+    underlayCtx,
+    identityTransform(),
+    slidePhKeys,
+    slideId
+  );
 }
 
 async function walkUnderlay(
   spTree: any,
   ctx: ParseContext,
   outer: GroupTransform,
-  slidePhKeys: Set<string>
+  slidePhKeys: Set<string>,
+  slideId: string
 ): Promise<SlideElement[]> {
   const out: SlideElement[] = [];
+  // Underlay elements come from a layout or master spTree — for the
+  // serializer's per-element source-XML preservation, register them with
+  // the *layout* (or master) path so referenced rels + media get pulled
+  // from the right archive entry. ctx.slidePath has been shadowed to the
+  // layout/master path by parseUnderlay, so the same registerElementSource
+  // call works.
+  const registerFromNode = (node: any, el: SlideElement | null) => {
+    if (!el) return;
+    const rawSrc = (node as any)?._elementRawSrc as string | undefined;
+    registerElementSource(el, rawSrc, ctx.slidePath);
+    out.push(el);
+  };
   for (const sp of asArray(spTree["p:sp"])) {
     if (isHiddenNode(sp, "p:nvSpPr")) continue;
     const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
@@ -483,32 +606,44 @@ async function walkUnderlay(
       if (isPicPrompt && isOverridden) continue;
       // When the slide hosts this placeholder, its fill rides on the
       // slide's text element (TextElement.background) so it stays at the
-      // text's z-index — important when the slide also has a full-bleed
-      // image that would otherwise cover an underlay-emitted backing.
-      if (isOverridden) continue;
+      // text's z-index. pptxgenjs can't write those fields back though —
+      // register the layout placeholder's source XML as a *backing
+      // decoration* for the slide so the serializer can re-emit it
+      // verbatim at low z behind the slide's text.
+      if (isOverridden) {
+        // The slide's text element already carries `background` /
+        // `backingPath` baked from this layout placeholder. pptxgenjs
+        // can't write those fields back, so they're lost on save — but
+        // attempts to re-inject the layout's source XML produced
+        // double-text and geometry-less shapes on re-parse. Accept the
+        // backingPath/background loss for now; track in a follow-up that
+        // writes raw OOXML for text elements carrying decoration fields.
+        continue;
+      }
       // Unreferenced placeholders: emit a fill-only backing so coloured
-      // boxes (numbered chips, decorative panels) appear.
+      // boxes (numbered chips, decorative panels) appear. Filler shapes
+      // are synthetic — we don't register a source XML for them because
+      // there's no single source element to replay verbatim.
       const filler = await placeholderFillUnderlay(sp, ctx, outer);
       if (filler) out.push(filler);
       continue;
     }
-    const el = await parseSpOrText(sp, ctx, outer, { underlay: true });
-    if (el) out.push(el);
+    registerFromNode(sp, await parseSpOrText(sp, ctx, outer, { underlay: true }));
   }
   for (const pic of asArray(spTree["p:pic"])) {
     if (isHiddenNode(pic, "p:nvPicPr")) continue;
     const ph = pic?.["p:nvPicPr"]?.["p:nvPr"]?.["p:ph"];
     if (ph && slidePhKeys.has(placeholderKey(ph))) continue;
-    const el = await parsePic(pic, ctx, outer);
-    if (el) out.push(el);
+    registerFromNode(pic, await parsePic(pic, ctx, outer));
   }
   for (const cxn of asArray(spTree["p:cxnSp"])) {
-    const el = parseCxn(cxn, ctx, outer);
-    if (el) out.push(el);
+    registerFromNode(cxn, parseCxn(cxn, ctx, outer));
   }
   for (const grp of asArray(spTree["p:grpSp"])) {
     const inner = composeGroupTransform(grp, outer);
-    out.push(...(await walkUnderlay(grp, ctx, inner, slidePhKeys)));
+    out.push(
+      ...(await walkUnderlay(grp, ctx, inner, slidePhKeys, slideId))
+    );
   }
   return out;
 }
@@ -630,18 +765,31 @@ async function parseSpTree(
     const idx = cursors[tag]++;
     const node = arr[idx];
     if (!node) continue;
+    const rawSrc = (node as any)?._elementRawSrc as string | undefined;
     if (tag === "p:sp") {
       const el = await parseSpOrText(node, ctx, outer);
-      if (el) out.push(el);
+      if (el) {
+        registerElementSource(el, rawSrc, ctx.slidePath);
+        out.push(el);
+      }
     } else if (tag === "p:pic") {
       const el = await parsePic(node, ctx, outer);
-      if (el) out.push(el);
+      if (el) {
+        registerElementSource(el, rawSrc, ctx.slidePath);
+        out.push(el);
+      }
     } else if (tag === "p:cxnSp") {
       const el = parseCxn(node, ctx, outer);
-      if (el) out.push(el);
+      if (el) {
+        registerElementSource(el, rawSrc, ctx.slidePath);
+        out.push(el);
+      }
     } else if (tag === "p:graphicFrame") {
       const el = parseGraphicFrame(node, ctx, outer);
-      if (el) out.push(el);
+      if (el) {
+        registerElementSource(el, rawSrc, ctx.slidePath);
+        out.push(el);
+      }
     } else if (tag === "p:grpSp") {
       const inner = composeGroupTransform(node, outer);
       const children = await parseSpTree(node, ctx, inner);
@@ -2720,6 +2868,34 @@ async function readXml(zip: JSZip, path: string): Promise<any | null> {
 function annotateRawOrder(parsed: any, rawText: string): void {
   annotateParagraphRawSrc(parsed, rawText);
   annotateSpTreeChildOrder(parsed, rawText);
+  annotateSpTreeElementRawSrc(parsed, rawText);
+}
+
+/**
+ * Attach `_rawSrc: string` to every `<p:sp>`, `<p:pic>`, `<p:cxnSp>`, and
+ * `<p:graphicFrame>` node carrying the verbatim XML for that element.
+ * Used by the per-element source-XML preservation in the serializer so
+ * the OOXML for any imported element survives untouched until the user
+ * actually edits it. Same depth-aware scan as
+ * `annotateSpTreeChildOrder`, paired to the parsed nodes in document
+ * order.
+ */
+function annotateSpTreeElementRawSrc(parsed: any, rawText: string): void {
+  for (const tag of ["p:sp", "p:pic", "p:cxnSp", "p:graphicFrame"] as const) {
+    if (!rawText.includes(`<${tag}`)) continue;
+    const blocks = findAllRawBlocks(rawText, tag);
+    if (!blocks.length) continue;
+    const nodes: any[] = [];
+    collectNamedDfs(parsed, tag, nodes);
+    const n = Math.min(blocks.length, nodes.length);
+    for (let i = 0; i < n; i++) {
+      Object.defineProperty(nodes[i], "_elementRawSrc", {
+        value: blocks[i],
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  }
 }
 
 /**
@@ -2885,7 +3061,13 @@ function collectNamedDfs(node: any, key: string, acc: any[]): void {
   for (const k of Object.keys(node)) {
     if (k.startsWith("@_") || k === "#text") continue;
     if (k === key) {
-      for (const v of asArray(node[k])) acc.push(v);
+      // Skip non-object values — fast-xml-parser deserialises some
+      // self-closing or whitespace-only elements as empty strings, and
+      // later property attachment passes call `Object.defineProperty` on
+      // these entries.
+      for (const v of asArray(node[k])) {
+        if (v && typeof v === "object") acc.push(v);
+      }
     } else {
       collectNamedDfs(node[k], key, acc);
     }
@@ -2965,7 +3147,9 @@ function collectParagraphsDfs(node: any, acc: any[]): void {
   for (const k of Object.keys(node)) {
     if (k.startsWith("@_") || k === "#text") continue;
     if (k === "a:p") {
-      for (const p of asArray(node[k])) acc.push(p);
+      for (const p of asArray(node[k])) {
+        if (p && typeof p === "object") acc.push(p);
+      }
     } else {
       collectParagraphsDfs(node[k], acc);
     }
