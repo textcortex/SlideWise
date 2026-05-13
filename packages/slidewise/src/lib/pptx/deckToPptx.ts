@@ -343,14 +343,14 @@ async function preserveUnknowns(
   explicitSource?: Blob | ArrayBuffer | Uint8Array
 ): Promise<Blob> {
   const wrapBlob = () => new Blob([generated], { type: PPTX_MIME });
-  const unknownsBySlide = collectUnknowns(deck);
-  const pristinesBySlide = collectPristineImports(deck);
-  if (!unknownsBySlide.size && !pristinesBySlide.size) return wrapBlob();
   // Prefer the caller-supplied source (survives state cloning / localStorage
   // rehydrate); fall back to the non-enumerable attachment from parsePptx
   // for the "parse → serialize" happy path with no state in between.
   const sourceBuffer = await resolveSource(deck, explicitSource);
   if (!sourceBuffer) return wrapBlob();
+
+  const unknownsBySlide = collectUnknowns(deck);
+  const pristinesBySlide = collectPristineImports(deck);
 
   const [outZip, srcZip] = await Promise.all([
     JSZip.loadAsync(generated),
@@ -401,6 +401,21 @@ async function preserveUnknowns(
       unknownFragments
     );
   }
+
+  // Replace pptxgenjs's regenerated chrome (slide masters, layouts, theme,
+  // notes master, embedded fonts) with the source's. Without this, every
+  // background, brand bar, gradient, embedded font, and footer that lives
+  // on the master/layout disappears on save. Best-effort: bails when source
+  // and output slide size don't match so 4:3 sources don't get their
+  // masters stretched onto a 16:9 canvas.
+  await preserveDeckChrome(outZip, srcZip, deck, sourceSlidePaths);
+
+  // Per-slide `<p:bg>` preservation. pptxgenjs's slide.background only
+  // emits solid colors, so gradient / image / theme-referenced
+  // backgrounds collapse to a flat hex through the model path. Replace
+  // each output slide's `<p:bg>` with the source's verbatim XML when
+  // available so gradients survive intact.
+  await preserveSlideBackgrounds(outZip, srcZip, deck, sourceSlidePaths);
 
   // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
@@ -750,6 +765,694 @@ function normalisePath(target: string, base: string): string {
     t = t.slice(3);
   }
   return [...segments, t].filter(Boolean).join("/");
+}
+
+// -- Deck chrome preservation ----------------------------------------------
+
+/**
+ * Replace pptxgenjs's regenerated deck chrome (slide masters, layouts, theme,
+ * notes master, embedded fonts, tags, handout masters) with the originals
+ * from the source PPTX. Without this, anything that lives on the master or
+ * layout — backgrounds, brand bars, gradients, page numbers, embedded
+ * brand fonts — disappears the first time the deck is saved.
+ *
+ * Bails safely when the source's slide size doesn't match the output's
+ * (e.g. a 4:3 source written as 16:9): copying masters drawn at one
+ * aspect ratio onto slides authored at another would visually misalign
+ * the chrome. Future work: drive the output slide size from the source.
+ */
+const CHROME_PREFIXES = [
+  "ppt/slideMasters/",
+  "ppt/slideLayouts/",
+  "ppt/theme/",
+  "ppt/fonts/",
+  "ppt/notesMasters/",
+  "ppt/handoutMasters/",
+  "ppt/tags/",
+] as const;
+
+async function preserveDeckChrome(
+  outZip: JSZip,
+  srcZip: JSZip,
+  deck: Deck,
+  sourceSlidePaths: string[]
+): Promise<void> {
+  if (!(await aspectRatiosMatch(outZip, srcZip))) return;
+
+  // 1. Find every chrome path that exists in the source.
+  const srcChromePaths = listPaths(srcZip, CHROME_PREFIXES);
+  if (!srcChromePaths.length) return;
+
+  // 2. Remove pptxgenjs's chrome — we're about to overwrite with the source's,
+  //    but pptxgenjs may have left files we don't replace (e.g. its single
+  //    slideLayout1.xml when the source has 28 layouts named slideLayout1-28,
+  //    or stale slideMaster overrides in [Content_Types].xml).
+  const outChromePaths = listPaths(outZip, CHROME_PREFIXES);
+  for (const p of outChromePaths) outZip.remove(p);
+
+  // 3. Walk every chrome rels file in srcZip to discover the media payloads
+  //    those masters / layouts / themes reference. These need to come along
+  //    or the chrome XML will dangle on r:id references after the move.
+  const referencedMedia = await collectChromeMediaRefs(srcZip, srcChromePaths);
+
+  // 4. Copy the chrome files themselves verbatim. JSZip lazily defers the
+  //    actual byte copy until generateAsync, which is cheap.
+  for (const p of srcChromePaths) {
+    const f = srcZip.file(p);
+    if (!f) continue;
+    outZip.file(p, f.async("uint8array"), { binary: true });
+  }
+
+  // 5. Copy media payloads. pptxgenjs writes its own `ppt/media/imageN.*`
+  //    with an unrelated numbering, so we need to rename on collision and
+  //    rewrite the copied chrome rels to point at the renamed target.
+  const mediaRenames = new Map<string, string>(); // source full path → out full path
+  for (const srcMediaPath of referencedMedia) {
+    const srcFile = srcZip.file(srcMediaPath);
+    if (!srcFile) continue;
+    let outMediaPath = srcMediaPath;
+    if (outZip.file(outMediaPath)) {
+      const slash = srcMediaPath.lastIndexOf("/");
+      const dir = srcMediaPath.slice(0, slash + 1);
+      const base = srcMediaPath.slice(slash + 1);
+      let i = 0;
+      do {
+        outMediaPath = `${dir}slidewise_chrome_${i}_${base}`;
+        i++;
+      } while (outZip.file(outMediaPath));
+    }
+    outZip.file(outMediaPath, srcFile.async("uint8array"), { binary: true });
+    if (outMediaPath !== srcMediaPath) {
+      mediaRenames.set(srcMediaPath, outMediaPath);
+    }
+  }
+  if (mediaRenames.size) {
+    await rewriteChromeRelsForRenames(outZip, srcChromePaths, mediaRenames);
+  }
+
+  // 6. [Content_Types].xml: drop the master/layout/theme/notesMaster overrides
+  //    pptxgenjs declared (some of which point at files it never wrote — see
+  //    the slideMaster1..9 overrides emitted with only slideMaster1.xml
+  //    actually on disk) and add overrides for the files we just copied.
+  //    Font extensions need a `<Default>` entry so PowerPoint embeds them.
+  await rewriteContentTypes(outZip, srcChromePaths);
+
+  // 7. presentation.xml.rels: replace pptxgenjs's slideMaster / theme /
+  //    notesMaster rels with the source's mapping. presentation.xml's
+  //    <p:sldMasterIdLst> / <p:notesMasterIdLst> also get spliced from
+  //    the source so multi-master decks (rare but real) round-trip.
+  await rewritePresentation(outZip, srcZip);
+
+  // 8. Each slide's rels currently points at pptxgenjs's slideLayout1.xml,
+  //    which we just deleted. Re-point each slide at the original layout
+  //    its source counterpart used. New slides (added in-editor with no
+  //    source path) fall back to the first source layout.
+  await rewriteSlideLayoutRefs(outZip, srcZip, deck, sourceSlidePaths);
+}
+
+/**
+ * Replace each output slide's `<p:bg>` element with the source slide's
+ * `<p:bg>` verbatim. This is what keeps gradient / image-fill / theme-
+ * referenced backgrounds intact — pptxgenjs's slide.background only
+ * emits flat-hex solid fills, so anything fancier was collapsing on save.
+ *
+ * Image-fill backgrounds (`<p:bgPr><a:blipFill r:embed="rIdN"/></p:bgPr>`)
+ * have their r:id rewritten to a fresh slide-rels-scoped rId, with the
+ * referenced media copied across so the fill resolves.
+ */
+async function preserveSlideBackgrounds(
+  outZip: JSZip,
+  srcZip: JSZip,
+  deck: Deck,
+  sourceSlidePaths: string[]
+): Promise<void> {
+  for (let i = 0; i < deck.slides.length; i++) {
+    const slide = deck.slides[i];
+    const sourceSlidePath =
+      ((slide as unknown as Record<string, unknown>)[SOURCE_SLIDE_PATH] as
+        | string
+        | undefined) ?? sourceSlidePaths[i];
+    if (!sourceSlidePath) continue;
+    const srcSlideFile = srcZip.file(sourceSlidePath);
+    if (!srcSlideFile) continue;
+    const srcXml = await srcSlideFile.async("string");
+    const bgFragment = extractBgFragment(srcXml);
+    if (bgFragment == null) {
+      // Source slide had no explicit `<p:bg>` — it's inheriting from
+      // layout / master. Drop pptxgenjs's flat-hex bg so the inheritance
+      // chain can do its job once the original chrome is back in place.
+      await stripOutputBg(outZip, i);
+      continue;
+    }
+    await injectSlideBg(outZip, srcZip, i, sourceSlidePath, bgFragment);
+  }
+}
+
+function extractBgFragment(slideXml: string): string | null {
+  const cSldOpen = slideXml.indexOf("<p:cSld");
+  if (cSldOpen < 0) return null;
+  const cSldClose = slideXml.indexOf("</p:cSld>", cSldOpen);
+  if (cSldClose < 0) return null;
+  const scope = slideXml.slice(cSldOpen, cSldClose);
+  const bgOpen = scope.indexOf("<p:bg");
+  if (bgOpen < 0) return null;
+  // Self-closing `<p:bg/>` is legal but expresses "no background"; treat
+  // as missing so inheritance kicks back in.
+  const selfClose = /<p:bg\b[^>]*\/\s*>/.exec(scope);
+  if (selfClose && selfClose.index === bgOpen) return null;
+  const bgClose = scope.indexOf("</p:bg>", bgOpen);
+  if (bgClose < 0) return null;
+  return scope.slice(bgOpen, bgClose + "</p:bg>".length);
+}
+
+async function stripOutputBg(outZip: JSZip, slideIndex: number): Promise<void> {
+  const outPath = `ppt/slides/slide${slideIndex + 1}.xml`;
+  const file = outZip.file(outPath);
+  if (!file) return;
+  const xml = await file.async("string");
+  const updated = xml.replace(/<p:bg\b[\s\S]*?<\/p:bg>|<p:bg\b[^>]*\/\s*>/, "");
+  if (updated !== xml) outZip.file(outPath, updated);
+}
+
+async function injectSlideBg(
+  outZip: JSZip,
+  srcZip: JSZip,
+  slideIndex: number,
+  sourceSlidePath: string,
+  bgFragment: string
+): Promise<void> {
+  const outSlidePath = `ppt/slides/slide${slideIndex + 1}.xml`;
+  const outRelsPath = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
+  const outSlideFile = outZip.file(outSlidePath);
+  if (!outSlideFile) return;
+  const outXml = await outSlideFile.async("string");
+
+  let outRelsXml =
+    (await outZip.file(outRelsPath)?.async("string")) ??
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+
+  // Rewrite r:embed / r:link references inside the bg fragment so they
+  // don't collide with rIds pptxgenjs already wrote into this slide's
+  // rels. Mirrors the rId-rewrite logic in injectIntoSlide but scoped
+  // to a single fragment + slide rels.
+  let rewritten = bgFragment;
+  if (/\br:(embed|link|id)="rId\d+"/.test(bgFragment)) {
+    const outRels = parseRels(outRelsXml);
+    let nextRid =
+      [...outRels.keys()].reduce((max, id) => {
+        const m = /^rId(\d+)$/.exec(id);
+        return m ? Math.max(max, Number(m[1])) : max;
+      }, 0) + 1;
+    const srcRelsXml =
+      (await srcZip
+        .file(relsPathFor(sourceSlidePath))
+        ?.async("string")) ?? null;
+    const srcRels = parseRels(srcRelsXml);
+    const sourceDir = dirOf(sourceSlidePath);
+    const outDir = dirOf(outSlidePath);
+    const newRelLines: string[] = [];
+    const ridMap = new Map<string, string>();
+    rewritten = bgFragment.replace(
+      /\b(r:[a-zA-Z]+)="(rId\d+)"/g,
+      (_m, attr: string, srcRid: string) => {
+        const cached = ridMap.get(srcRid);
+        if (cached) return `${attr}="${cached}"`;
+        const srcRel = srcRels.get(srcRid);
+        if (!srcRel) return `${attr}="${srcRid}"`;
+        const newRid = `rId${nextRid++}`;
+        ridMap.set(srcRid, newRid);
+        let target = srcRel.target;
+        const isExternal = /^https?:\/\//i.test(target);
+        const isInternalPart = !isExternal && !target.startsWith("/");
+        if (isInternalPart) {
+          const srcFullTarget = normalisePath(target, sourceDir);
+          const srcFile = srcZip.file(srcFullTarget);
+          if (srcFile) {
+            const newTarget = uniqueTarget(target, outZip, outDir);
+            const newFullTarget = normalisePath(newTarget, outDir);
+            outZip.file(newFullTarget, srcFile.async("uint8array"), {
+              binary: true,
+            });
+            target = newTarget;
+          }
+        }
+        newRelLines.push(buildRelXml(newRid, srcRel.type, target));
+        return `${attr}="${newRid}"`;
+      }
+    );
+    if (newRelLines.length) {
+      const insertAt = outRelsXml.lastIndexOf("</Relationships>");
+      outRelsXml =
+        insertAt >= 0
+          ? outRelsXml.slice(0, insertAt) +
+            newRelLines.join("") +
+            outRelsXml.slice(insertAt)
+          : outRelsXml.replace(
+              /<Relationships[^>]*>/,
+              (m) => `${m}${newRelLines.join("")}`
+            );
+      outZip.file(outRelsPath, outRelsXml);
+    }
+  }
+
+  // Replace pptxgenjs's `<p:bg>...</p:bg>` (or self-closing equivalent) with
+  // the source fragment. When the output has no `<p:bg>` yet, insert
+  // immediately after `<p:cSld...>` so it precedes `<p:spTree>` per the
+  // OOXML schema's ordering.
+  let updated = outXml;
+  const existingBgRe = /<p:bg\b[\s\S]*?<\/p:bg>|<p:bg\b[^>]*\/\s*>/;
+  if (existingBgRe.test(outXml)) {
+    updated = outXml.replace(existingBgRe, rewritten);
+  } else {
+    const cSldOpenMatch = /<p:cSld\b[^>]*>/.exec(outXml);
+    if (cSldOpenMatch) {
+      const idx = cSldOpenMatch.index + cSldOpenMatch[0].length;
+      updated = outXml.slice(0, idx) + rewritten + outXml.slice(idx);
+    }
+  }
+  if (updated !== outXml) outZip.file(outSlidePath, updated);
+}
+
+function listPaths(zip: JSZip, prefixes: readonly string[]): string[] {
+  const out: string[] = [];
+  zip.forEach((relPath) => {
+    for (const prefix of prefixes) {
+      if (relPath.startsWith(prefix)) {
+        out.push(relPath);
+        return;
+      }
+    }
+  });
+  return out;
+}
+
+async function collectChromeMediaRefs(
+  srcZip: JSZip,
+  chromePaths: string[]
+): Promise<Set<string>> {
+  const refs = new Set<string>();
+  for (const p of chromePaths) {
+    if (!p.endsWith(".rels")) continue;
+    const xml = await srcZip.file(p)?.async("string");
+    if (!xml) continue;
+    const rels = parseRels(xml);
+    // The owning XML lives at e.g. `ppt/slideMasters/slideMaster1.xml`,
+    // its rels at `ppt/slideMasters/_rels/slideMaster1.xml.rels`. Targets
+    // are relative to the XML's directory.
+    const xmlPath = p.replace("/_rels/", "/").replace(/\.rels$/, "");
+    const xmlDir = dirOf(xmlPath);
+    for (const { target } of rels.values()) {
+      if (/^https?:\/\//i.test(target)) continue;
+      const full = normalisePath(target, xmlDir);
+      // Pull media but also fonts (sometimes in `ppt/fonts/` already
+      // captured by chrome prefixes), embeddings, and any other
+      // chrome-adjacent payload — we err on the side of copying so
+      // brand-bar logos and embedded font glyphs survive.
+      if (
+        full.startsWith("ppt/media/") ||
+        full.startsWith("ppt/embeddings/") ||
+        full.startsWith("ppt/charts/")
+      ) {
+        refs.add(full);
+      }
+    }
+  }
+  return refs;
+}
+
+async function rewriteChromeRelsForRenames(
+  outZip: JSZip,
+  chromePaths: string[],
+  renames: Map<string, string>
+): Promise<void> {
+  for (const p of chromePaths) {
+    if (!p.endsWith(".rels")) continue;
+    const xml = await outZip.file(p)?.async("string");
+    if (!xml) continue;
+    const xmlPath = p.replace("/_rels/", "/").replace(/\.rels$/, "");
+    const xmlDir = dirOf(xmlPath);
+    let changed = false;
+    const updated = xml.replace(/Target="([^"]+)"/g, (m, target: string) => {
+      if (/^https?:\/\//i.test(target)) return m;
+      const full = normalisePath(target, xmlDir);
+      const renamed = renames.get(full);
+      if (!renamed) return m;
+      changed = true;
+      return `Target="${relativeTarget(xmlDir, renamed)}"`;
+    });
+    if (changed) outZip.file(p, updated);
+  }
+}
+
+function relativeTarget(fromDir: string, toPath: string): string {
+  const fromSegs = fromDir.split("/").filter(Boolean);
+  const toSegs = toPath.split("/").filter(Boolean);
+  let i = 0;
+  while (i < fromSegs.length && i < toSegs.length && fromSegs[i] === toSegs[i]) {
+    i++;
+  }
+  const up = fromSegs.length - i;
+  const rest = toSegs.slice(i).join("/");
+  return up > 0 ? `${"../".repeat(up)}${rest}` : rest;
+}
+
+const CONTENT_TYPE_BY_DIR: Record<string, string> = {
+  "ppt/slideMasters/":
+    "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml",
+  "ppt/slideLayouts/":
+    "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml",
+  "ppt/theme/":
+    "application/vnd.openxmlformats-officedocument.theme+xml",
+  "ppt/notesMasters/":
+    "application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml",
+  "ppt/handoutMasters/":
+    "application/vnd.openxmlformats-officedocument.presentationml.handoutMaster+xml",
+  "ppt/tags/":
+    "application/vnd.openxmlformats-officedocument.presentationml.tags+xml",
+};
+
+async function rewriteContentTypes(
+  outZip: JSZip,
+  srcChromePaths: string[]
+): Promise<void> {
+  const file = outZip.file("[Content_Types].xml");
+  if (!file) return;
+  let xml = await file.async("string");
+
+  // Drop every existing Override under the chrome prefixes — pptxgenjs
+  // sometimes declares masters / layouts it never wrote, and we're about
+  // to declare the real set from source.
+  xml = xml.replace(
+    /<Override\b[^/]*PartName="\/(ppt\/(?:slideMasters|slideLayouts|theme|notesMasters|handoutMasters|tags)\/[^"]+)"[^/]*\/>/g,
+    ""
+  );
+
+  // Build a fresh set of Override entries for chrome XML files we copied.
+  const additions: string[] = [];
+  const seenParts = new Set<string>();
+  // Re-scan existing xml to avoid duplicate part declarations.
+  const existingPartRe = /PartName="\/([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = existingPartRe.exec(xml))) seenParts.add(m[1]);
+
+  for (const path of srcChromePaths) {
+    if (path.endsWith(".rels")) continue;
+    if (!path.endsWith(".xml")) continue;
+    const dirMatch = Object.keys(CONTENT_TYPE_BY_DIR).find((d) =>
+      path.startsWith(d)
+    );
+    if (!dirMatch) continue;
+    if (seenParts.has(path)) continue;
+    additions.push(
+      `<Override PartName="/${path}" ContentType="${CONTENT_TYPE_BY_DIR[dirMatch]}"/>`
+    );
+    seenParts.add(path);
+  }
+
+  // Embedded fonts: declare the `.fntdata` extension as a Default once.
+  const hasFonts = srcChromePaths.some((p) => p.startsWith("ppt/fonts/"));
+  if (hasFonts && !/Extension="fntdata"/i.test(xml)) {
+    additions.push(
+      `<Default Extension="fntdata" ContentType="application/x-fontdata"/>`
+    );
+  }
+
+  if (!additions.length) {
+    outZip.file("[Content_Types].xml", xml);
+    return;
+  }
+
+  const closeIdx = xml.lastIndexOf("</Types>");
+  if (closeIdx < 0) return;
+  const updated =
+    xml.slice(0, closeIdx) + additions.join("") + xml.slice(closeIdx);
+  outZip.file("[Content_Types].xml", updated);
+}
+
+const REL_TYPE_SLIDE_MASTER =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
+const REL_TYPE_THEME =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+const REL_TYPE_NOTES_MASTER =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster";
+const REL_TYPE_HANDOUT_MASTER =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/handoutMaster";
+
+async function rewritePresentation(
+  outZip: JSZip,
+  srcZip: JSZip
+): Promise<void> {
+  const outRelsFile = outZip.file("ppt/_rels/presentation.xml.rels");
+  const srcRelsFile = srcZip.file("ppt/_rels/presentation.xml.rels");
+  const outPresFile = outZip.file("ppt/presentation.xml");
+  const srcPresFile = srcZip.file("ppt/presentation.xml");
+  if (!outRelsFile || !srcRelsFile || !outPresFile || !srcPresFile) return;
+
+  const [outRelsXml, srcRelsXml, outPresXml, srcPresXml] = await Promise.all([
+    outRelsFile.async("string"),
+    srcRelsFile.async("string"),
+    outPresFile.async("string"),
+    srcPresFile.async("string"),
+  ]);
+  const outRels = parseRels(outRelsXml);
+  const srcRels = parseRels(srcRelsXml);
+
+  // 1. Drop pptxgenjs's chrome rels — slideMaster / theme / notesMaster /
+  //    handoutMaster — and remember their rIds so we can scrub them out of
+  //    `<p:sldMasterIdLst>` etc. in presentation.xml.
+  const droppedRids = new Set<string>();
+  const keptRels: Array<[string, { type: string; target: string }]> = [];
+  for (const [id, rel] of outRels) {
+    if (
+      rel.type === REL_TYPE_SLIDE_MASTER ||
+      rel.type === REL_TYPE_THEME ||
+      rel.type === REL_TYPE_NOTES_MASTER ||
+      rel.type === REL_TYPE_HANDOUT_MASTER
+    ) {
+      droppedRids.add(id);
+    } else {
+      keptRels.push([id, rel]);
+    }
+  }
+
+  // 2. Allocate fresh rIds for the source's chrome rels in the output's
+  //    rId namespace, and remember the mapping so we can rewrite
+  //    presentation.xml's <p:sldMasterId r:id="..."/> entries.
+  let nextRid =
+    [...outRels.keys(), ...srcRels.keys()].reduce((max, id) => {
+      const n = /^rId(\d+)$/.exec(id);
+      return n ? Math.max(max, Number(n[1])) : max;
+    }, 0) + 1;
+  const srcToOutRid = new Map<string, string>();
+  const newChromeRels: string[] = [];
+  for (const [srcId, rel] of srcRels) {
+    if (
+      rel.type !== REL_TYPE_SLIDE_MASTER &&
+      rel.type !== REL_TYPE_THEME &&
+      rel.type !== REL_TYPE_NOTES_MASTER &&
+      rel.type !== REL_TYPE_HANDOUT_MASTER
+    ) {
+      continue;
+    }
+    const outId = `rId${nextRid++}`;
+    srcToOutRid.set(srcId, outId);
+    newChromeRels.push(buildRelXml(outId, rel.type, rel.target));
+  }
+
+  // 3. Rebuild presentation.xml.rels: kept slide / props rels + new chrome rels.
+  const rebuiltRels =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+    keptRels.map(([id, r]) => buildRelXml(id, r.type, r.target)).join("") +
+    newChromeRels.join("") +
+    `</Relationships>`;
+  outZip.file("ppt/_rels/presentation.xml.rels", rebuiltRels);
+
+  // 4. Splice <p:sldMasterIdLst> and <p:notesMasterIdLst> from source into
+  //    output's presentation.xml, with r:id values remapped to the new
+  //    rIds allocated above. Anything else in the output (sldIdLst, sldSz,
+  //    defaultTextStyle, etc.) is left alone — those describe the slide
+  //    set pptxgenjs just wrote.
+  let pres = outPresXml;
+  pres = replaceListElement(
+    pres,
+    "p:sldMasterIdLst",
+    extractListElement(srcPresXml, "p:sldMasterIdLst"),
+    srcToOutRid
+  );
+  pres = replaceListElement(
+    pres,
+    "p:notesMasterIdLst",
+    extractListElement(srcPresXml, "p:notesMasterIdLst"),
+    srcToOutRid
+  );
+  // handoutMasterIdLst is rare but cheap to preserve.
+  pres = replaceListElement(
+    pres,
+    "p:handoutMasterIdLst",
+    extractListElement(srcPresXml, "p:handoutMasterIdLst"),
+    srcToOutRid
+  );
+
+  // 5. Carry over `<p:embeddedFontLst>` verbatim so PowerPoint knows which
+  //    embedded fonts to install on open. Font payloads under ppt/fonts/
+  //    were already copied as part of the chrome sweep.
+  const embeddedFonts = extractListElement(srcPresXml, "p:embeddedFontLst");
+  if (embeddedFonts) {
+    pres = replaceListElement(pres, "p:embeddedFontLst", embeddedFonts, srcToOutRid);
+  }
+  outZip.file("ppt/presentation.xml", pres);
+}
+
+function extractListElement(xml: string, tag: string): string | null {
+  const open = xml.indexOf(`<${tag}`);
+  if (open < 0) return null;
+  // Self-closing form (`<p:sldMasterIdLst/>`) is legal but uninteresting.
+  const selfCloseMatch = new RegExp(`<${tag}\\b[^>]*/\\s*>`).exec(xml);
+  if (selfCloseMatch && selfCloseMatch.index === open) return null;
+  const close = xml.indexOf(`</${tag}>`, open);
+  if (close < 0) return null;
+  return xml.slice(open, close + tag.length + 3);
+}
+
+function replaceListElement(
+  xml: string,
+  tag: string,
+  newFragment: string | null,
+  ridRemap: Map<string, string>
+): string {
+  if (!newFragment) return xml;
+  const remapped = newFragment.replace(
+    /\br:id="(rId\d+)"/g,
+    (_m, srcRid: string) => {
+      const out = ridRemap.get(srcRid);
+      return out ? `r:id="${out}"` : `r:id="${srcRid}"`;
+    }
+  );
+  const open = xml.indexOf(`<${tag}`);
+  if (open < 0) {
+    // Tag not in output → insert just before <p:sldIdLst> if possible,
+    // otherwise just before </p:presentation>.
+    const sldIdLst = xml.indexOf("<p:sldIdLst");
+    if (sldIdLst >= 0) {
+      return xml.slice(0, sldIdLst) + remapped + xml.slice(sldIdLst);
+    }
+    const closePres = xml.lastIndexOf("</p:presentation>");
+    return closePres >= 0
+      ? xml.slice(0, closePres) + remapped + xml.slice(closePres)
+      : xml;
+  }
+  const selfCloseMatch = new RegExp(`<${tag}\\b[^>]*/\\s*>`).exec(xml);
+  if (selfCloseMatch && selfCloseMatch.index === open) {
+    return (
+      xml.slice(0, selfCloseMatch.index) +
+      remapped +
+      xml.slice(selfCloseMatch.index + selfCloseMatch[0].length)
+    );
+  }
+  const close = xml.indexOf(`</${tag}>`, open);
+  if (close < 0) return xml;
+  return xml.slice(0, open) + remapped + xml.slice(close + tag.length + 3);
+}
+
+async function rewriteSlideLayoutRefs(
+  outZip: JSZip,
+  srcZip: JSZip,
+  deck: Deck,
+  sourceSlidePaths: string[]
+): Promise<void> {
+  // Pre-compute a default fallback layout target for new slides that have
+  // no source counterpart: the first slideLayout the source ships.
+  let fallbackLayout: string | undefined;
+  srcZip.forEach((relPath) => {
+    if (fallbackLayout) return;
+    if (
+      relPath.startsWith("ppt/slideLayouts/") &&
+      relPath.endsWith(".xml") &&
+      !relPath.includes("/_rels/")
+    ) {
+      fallbackLayout = relPath;
+    }
+  });
+
+  for (let i = 0; i < deck.slides.length; i++) {
+    const slide = deck.slides[i];
+    const slideRelsPath = `ppt/slides/_rels/slide${i + 1}.xml.rels`;
+    const outSlideRelsXml = await outZip.file(slideRelsPath)?.async("string");
+    if (!outSlideRelsXml) continue;
+
+    const sourceSlidePath =
+      ((slide as unknown as Record<string, unknown>)[SOURCE_SLIDE_PATH] as
+        | string
+        | undefined) ?? sourceSlidePaths[i];
+    let layoutTargetFull: string | undefined;
+    if (sourceSlidePath) {
+      const srcSlideRelsPath = relsPathFor(sourceSlidePath);
+      const srcSlideRelsXml = await srcZip
+        .file(srcSlideRelsPath)
+        ?.async("string");
+      if (srcSlideRelsXml) {
+        const srcRels = parseRels(srcSlideRelsXml);
+        for (const rel of srcRels.values()) {
+          if (
+            rel.type ===
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout"
+          ) {
+            layoutTargetFull = normalisePath(
+              rel.target,
+              dirOf(sourceSlidePath)
+            );
+            break;
+          }
+        }
+      }
+    }
+    if (!layoutTargetFull && fallbackLayout) {
+      layoutTargetFull = fallbackLayout;
+    }
+    if (!layoutTargetFull) continue;
+
+    // Rewrite the layout target in the output's slide rels. The slide XML
+    // itself lives at ppt/slides/slideN.xml, so targets there are
+    // relative to ppt/slides/.
+    const newTarget = relativeTarget("ppt/slides", layoutTargetFull);
+    const updated = outSlideRelsXml.replace(
+      /(<Relationship\b[^/]*Type="[^"]*slideLayout"[^/]*Target=")([^"]+)("[^/]*\/>)/,
+      `$1${newTarget}$3`
+    );
+    if (updated !== outSlideRelsXml) {
+      outZip.file(slideRelsPath, updated);
+    }
+  }
+}
+
+async function aspectRatiosMatch(
+  outZip: JSZip,
+  srcZip: JSZip
+): Promise<boolean> {
+  const [outPres, srcPres] = await Promise.all([
+    outZip.file("ppt/presentation.xml")?.async("string"),
+    srcZip.file("ppt/presentation.xml")?.async("string"),
+  ]);
+  if (!outPres || !srcPres) return false;
+  const outSz = parseSldSz(outPres);
+  const srcSz = parseSldSz(srcPres);
+  if (!outSz || !srcSz) return false;
+  const outRatio = outSz.cx / outSz.cy;
+  const srcRatio = srcSz.cx / srcSz.cy;
+  // ~1% tolerance covers floating-point drift; PPTX aspect ratios are
+  // exact integer EMU.
+  return Math.abs(outRatio - srcRatio) / outRatio < 0.01;
+}
+
+function parseSldSz(xml: string): { cx: number; cy: number } | null {
+  const m = /<p:sldSz\b[^/]*\bcx="(\d+)"[^/]*\bcy="(\d+)"/.exec(xml);
+  if (!m) {
+    const m2 = /<p:sldSz\b[^/]*\bcy="(\d+)"[^/]*\bcx="(\d+)"/.exec(xml);
+    if (!m2) return null;
+    return { cx: Number(m2[2]), cy: Number(m2[1]) };
+  }
+  return { cx: Number(m[1]), cy: Number(m[2]) };
 }
 
 const PPTX_MIME =
