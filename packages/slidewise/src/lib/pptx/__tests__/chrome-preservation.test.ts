@@ -138,4 +138,50 @@ describe("deck chrome preservation", () => {
     expect(slide2).toContain('<a:schemeClr val="tx1"/>');
     expect(slide2).not.toContain('<a:srgbClr val="151515"/>');
   });
+
+  it.skipIf(!hasEon)(
+    "source bytes survive structuredClone (host state cloning)",
+    async () => {
+      // Mirrors what every editor reducer does: deck is spread / cloned on
+      // every edit. The non-enumerable SOURCE_PPTX attachment is stripped
+      // by structuredClone, so chrome / EMF preservation has to find the
+      // source via the enumerable `sourcePptxId` cache lookup instead.
+      const source = await loadFixture("eon-deck.pptx");
+      const deck = await parsePptx(source);
+      expect(deck.sourcePptxId).toBeTruthy();
+
+      // Round-trip through structuredClone and an object spread — same
+      // operations the store's `snap()` and reducers perform.
+      const cloned = structuredClone(deck);
+      const edited = {
+        ...cloned,
+        title: cloned.title + " [edited]",
+        slides: cloned.slides.map((s) => ({ ...s })),
+      };
+      // Non-enumerable attachments are gone; the enumerable id remains.
+      expect(
+        (edited as unknown as Record<string, unknown>)["__slidewiseSourcePptx"]
+      ).toBeUndefined();
+      expect(edited.sourcePptxId).toBe(deck.sourcePptxId);
+
+      // Save with NO explicit source — preservation must still kick in
+      // via the module-level cache keyed by sourcePptxId.
+      const blob = await serializeDeck(edited);
+      const out = await JSZip.loadAsync(await blob.arrayBuffer());
+
+      let layoutCount = 0;
+      let fontCount = 0;
+      out.forEach((p) => {
+        if (
+          p.startsWith("ppt/slideLayouts/") &&
+          p.endsWith(".xml") &&
+          !p.includes("/_rels/")
+        )
+          layoutCount++;
+        if (p.startsWith("ppt/fonts/") && !p.endsWith("/")) fontCount++;
+      });
+      expect(layoutCount).toBe(28);
+      expect(fontCount).toBe(5);
+    }
+  );
 });
