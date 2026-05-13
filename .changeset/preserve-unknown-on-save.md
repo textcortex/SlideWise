@@ -1,5 +1,5 @@
 ---
-"@textcortex/slidewise": minor
+"@textcortex/slidewise": patch
 ---
 
 **Stop silently dropping `UnknownElement` on save.**
