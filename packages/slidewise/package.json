@@ -48,6 +48,8 @@
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.5",
     "@fontsource-variable/geist-mono": "^5.2.5",
+    "echarts": "^6.0.0",
+    "emf-converter": "^1.1.6",
     "fast-xml-parser": "^5.7.2",
     "framer-motion": "^12.38.0",
     "jszip": "^3.10.1",

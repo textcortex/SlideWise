@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   SlideElement,
   TextElement,
@@ -9,6 +9,7 @@ import type {
   TableElement,
   IconElement,
   EmbedElement,
+  ChartElement,
   UnknownElement,
 } from "@/lib/types";
 
@@ -36,6 +37,8 @@ export function ElementView({
       return <IconView el={el} />;
     case "embed":
       return <EmbedView el={el} />;
+    case "chart":
+      return <ChartView el={el} />;
     case "unknown":
       return <UnknownView el={el} />;
   }
@@ -554,10 +557,33 @@ function LineView({ el }: { el: LineElement }) {
 
 function TableView({ el }: { el: TableElement }) {
   const cols = el.rows[0]?.length ?? 1;
+  const rowCount = el.rows.length;
   // PPTX-faithful: contiguous cells, no inter-cell gap, no rounded corners.
   // Cells share their dividers via inset box-shadows so we draw a single
   // grid line between adjacent cells instead of doubling-up borders.
   const stroke = el.borderColor ?? "rgba(0, 0, 0, 0.12)";
+  const hasHeader = el.hasHeader ?? true;
+  const bandRows = el.bandRows ?? false;
+  const cellFill = (ri: number, ci: number): string => {
+    if (hasHeader && ri === 0) return el.headerFill;
+    if (el.lastRowFill && ri === rowCount - 1 && rowCount > 1) return el.lastRowFill;
+    if (el.firstColFill && ci === 0) return el.firstColFill;
+    if (el.lastColFill && ci === cols - 1) return el.lastColFill;
+    if (bandRows && el.rowAltFill) {
+      // Banding counts body rows only: with a header, body row 0 (slide row 1)
+      // is band-1; without one, slide row 0 is band-1.
+      const bodyIdx = hasHeader ? ri - 1 : ri;
+      return bodyIdx % 2 === 1 ? el.rowAltFill : el.rowFill;
+    }
+    return el.rowFill;
+  };
+  const cellColor = (ri: number, ci: number): string => {
+    if (hasHeader && ri === 0 && el.headerTextColor) return el.headerTextColor;
+    if (el.firstColTextColor && ci === 0 && !(hasHeader && ri === 0)) {
+      return el.firstColTextColor;
+    }
+    return el.textColor;
+  };
   return (
     <div
       style={{
@@ -576,13 +602,16 @@ function TableView({ el }: { el: TableElement }) {
           <div
             key={`${ri}-${ci}`}
             style={{
-              background: ri === 0 ? el.headerFill : el.rowFill,
-              color: el.textColor,
+              background: cellFill(ri, ci),
+              color: cellColor(ri, ci),
               fontSize: el.fontSize,
               padding: "12px 16px",
               display: "flex",
               alignItems: "center",
-              fontWeight: ri === 0 ? 600 : 400,
+              fontWeight:
+                (hasHeader && ri === 0) || (el.firstColFill && ci === 0)
+                  ? 600
+                  : 400,
               boxSizing: "border-box",
               minWidth: 0,
               minHeight: 0,
@@ -591,7 +620,7 @@ function TableView({ el }: { el: TableElement }) {
               borderRight:
                 ci < cols - 1 ? `1px solid ${stroke}` : undefined,
               borderBottom:
-                ri < el.rows.length - 1 ? `1px solid ${stroke}` : undefined,
+                ri < rowCount - 1 ? `1px solid ${stroke}` : undefined,
             }}
           >
             {cell}
@@ -673,4 +702,171 @@ function EmbedView({ el }: { el: EmbedElement }) {
       </div>
     </div>
   );
+}
+
+/**
+ * Render a parsed chart via Apache ECharts, lazy-loaded on mount so the
+ * library only ships when a deck actually contains charts. Disposes its
+ * instance on unmount / element change so re-imports don't leak. The
+ * source `<p:graphicFrame>` XML is preserved on `el.ooxmlXml` for save
+ * round-trips — the serializer re-emits it verbatim.
+ */
+function ChartView({ el }: { el: ChartElement }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let instance: { dispose(): void; resize(): void } | null = null;
+    (async () => {
+      try {
+        const echarts = await import("echarts");
+        if (cancelled || !ref.current) return;
+        const option = buildChartOption(el);
+        instance = echarts.init(ref.current);
+        // `notMerge: true` so series/colours never merge with a prior render
+        // (ECharts merges by index by default; that masks colour updates).
+        (
+          instance as unknown as {
+            setOption: (o: unknown, notMerge?: boolean) => void;
+          }
+        ).setOption(option, true);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Chart render failed");
+      }
+    })();
+    return () => {
+      cancelled = true;
+      instance?.dispose();
+    };
+  }, [el]);
+
+  if (error) {
+    return (
+      <div
+        style={{
+          width: "100%",
+          height: "100%",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#FFFFFF",
+          border: "1px dashed rgba(0,0,0,0.15)",
+          fontSize: 12,
+          color: "#6B7280",
+        }}
+      >
+        Chart: {error}
+      </div>
+    );
+  }
+  return <div ref={ref} style={{ width: "100%", height: "100%" }} />;
+}
+
+/**
+ * Translate a Slidewise ChartElement into an ECharts option object. Handles
+ * bar / column / line / area / pie / doughnut, including stacked + percent
+ * stacked variants. Value labels are surfaced when the source deck had
+ * `<c:showVal val="1"/>` on at least one series.
+ */
+function buildChartOption(el: ChartElement) {
+  const palette = el.series.map((s, i) => s.color ?? defaultPaletteColor(i));
+  const isPercent = el.grouping === "percentStacked";
+  const valueFormatter = makeValueFormatter(el.valueFormat, isPercent);
+
+  if (el.kind === "pie" || el.kind === "doughnut") {
+    const data = el.categories.map((cat, i) => ({
+      name: cat || `Slice ${i + 1}`,
+      value: el.series[0]?.values[i] ?? 0,
+    }));
+    return {
+      color: palette,
+      title: el.title ? { text: el.title, left: "center", top: 4 } : undefined,
+      tooltip: { trigger: "item", valueFormatter },
+      legend: { bottom: 4 },
+      series: [
+        {
+          type: "pie",
+          radius: el.kind === "doughnut" ? ["45%", "75%"] : "70%",
+          data,
+          label: el.showDataLabels
+            ? { formatter: (p: { value: number }) => valueFormatter(p.value) }
+            : { show: false },
+        },
+      ],
+    };
+  }
+
+  const isHorizontal = el.kind === "bar"; // "column" + everything else: vertical
+  const xAxis = isHorizontal
+    ? { type: "value", axisLabel: { formatter: valueFormatter } }
+    : { type: "category", data: el.categories };
+  const yAxis = isHorizontal
+    ? { type: "category", data: el.categories }
+    : { type: "value", axisLabel: { formatter: valueFormatter } };
+
+  const stackKey =
+    el.grouping === "stacked" || el.grouping === "percentStacked"
+      ? "total"
+      : undefined;
+
+  const series = el.series.map((s, i) => {
+    const color = s.color ?? defaultPaletteColor(i);
+    const base = {
+      name: s.name,
+      type: el.kind === "line" ? "line" : el.kind === "area" ? "line" : "bar",
+      data: s.values.map((v) => (v === null ? 0 : v)),
+      // Pin the colour explicitly so ECharts can't reassign via palette
+      // cycling when multiple series share the same `name` (PowerPoint
+      // decks routinely do this — same label, distinct colour fills).
+      itemStyle: { color },
+      ...(el.kind === "area" ? { areaStyle: { color } } : {}),
+      ...(el.kind === "line"
+        ? { lineStyle: { color }, symbol: "circle", symbolSize: 6 }
+        : {}),
+      ...(stackKey ? { stack: stackKey } : {}),
+      label: el.showDataLabels
+        ? {
+            show: true,
+            position: stackKey ? "inside" : "top",
+            formatter: (p: { value: number }) => valueFormatter(p.value),
+            fontSize: 11,
+            color: stackKey ? "#FFFFFF" : "#111111",
+          }
+        : { show: false },
+    };
+    return base;
+  });
+
+  return {
+    color: palette,
+    title: el.title ? { text: el.title, left: "center", top: 4 } : undefined,
+    tooltip: { trigger: "axis", valueFormatter },
+    legend: { bottom: 4, type: "scroll" },
+    grid: { left: 56, right: 24, top: el.title ? 36 : 16, bottom: 56 },
+    xAxis,
+    yAxis,
+    series,
+  };
+}
+
+function defaultPaletteColor(i: number): string {
+  // Office-ish accent rotation, used when a series omits explicit fill.
+  const palette = ["#4F81BD", "#C0504D", "#9BBB59", "#8064A2", "#4BACC6", "#F79646"];
+  return palette[i % palette.length];
+}
+
+function makeValueFormatter(formatCode: string | undefined, percent: boolean) {
+  return (value: number) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "";
+    if (percent) return `${Math.round(value * 100)}%`;
+    if (formatCode && formatCode.includes("$")) {
+      const decimals = (formatCode.match(/0\.(0+)/)?.[1] ?? "").length;
+      return `$${value.toLocaleString(undefined, {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
+      })}`;
+    }
+    return value.toLocaleString();
+  };
 }

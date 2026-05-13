@@ -9,6 +9,7 @@ export type ElementType =
   | "table"
   | "icon"
   | "embed"
+  | "chart"
   | "unknown";
 
 export type EnterAnim =
@@ -174,6 +175,32 @@ export interface TableElement extends BaseElement {
    * cell. Defaults to a faint grey when omitted.
    */
   borderColor?: string;
+  /**
+   * Optional alternate-row fill, applied to every other body row when
+   * `bandRows` is true. Imported from `<a:tblPr bandRow="1">` paired with
+   * the referenced table style's `band1H`/`band2H` definitions.
+   */
+  rowAltFill?: string;
+  /**
+   * Optional emphasised fill for the first column (`<a:tblPr firstCol="1">`).
+   */
+  firstColFill?: string;
+  /**
+   * Optional emphasised fill for the last column (`<a:tblPr lastCol="1">`).
+   */
+  lastColFill?: string;
+  /**
+   * Optional emphasised fill for the totals (last) row (`<a:tblPr lastRow="1">`).
+   */
+  lastRowFill?: string;
+  /** Whether the first row renders with header emphasis. */
+  hasHeader?: boolean;
+  /** Whether banded-row alternation should be applied. */
+  bandRows?: boolean;
+  /** Header text colour override. */
+  headerTextColor?: string;
+  /** First-column text colour override. */
+  firstColTextColor?: string;
 }
 
 export interface IconElement extends BaseElement {
@@ -204,6 +231,50 @@ export interface UnknownElement extends BaseElement {
   label?: string;
 }
 
+/** Discrete chart families the renderer knows how to draw. */
+export type ChartKind = "bar" | "column" | "line" | "pie" | "doughnut" | "area";
+
+/** Bar/column grouping mode. PPTX values: standard / stacked / percentStacked. */
+export type ChartGrouping = "standard" | "stacked" | "percentStacked";
+
+export interface ChartSeries {
+  /** Display name from `<c:tx><c:strRef><c:strCache>` (or "<c:tx><c:v>"). */
+  name: string;
+  /** Per-category values, parallel to ChartElement.categories. */
+  values: (number | null)[];
+  /** Per-series fill colour (CSS hex). */
+  color?: string;
+}
+
+/**
+ * A chart imported from `<p:graphicFrame><c:chart>`. The categories + series
+ * are parsed out of the chart part so the renderer can draw the chart live
+ * (via a lazy-loaded ECharts import). The original OOXML is also stashed on
+ * `ooxmlXml` so save round-trips preserve the source chart part verbatim —
+ * we don't yet emit chart XML from in-editor edits.
+ */
+export interface ChartElement extends BaseElement {
+  type: "chart";
+  kind: ChartKind;
+  grouping?: ChartGrouping;
+  /** X-axis / pie-slice labels. */
+  categories: string[];
+  series: ChartSeries[];
+  /** Whether the chart was shown with value labels in PowerPoint. */
+  showDataLabels?: boolean;
+  /** Chart title (when `<c:title>` carries one). */
+  title?: string;
+  /** Optional axis number-format string (PPTX `formatCode`, e.g. "$#,##0.0"). */
+  valueFormat?: string;
+  /**
+   * Preserved source OOXML for the wrapping `<p:graphicFrame>`. The
+   * serializer re-emits it verbatim on save so the chart's binary embedded
+   * Excel and styling survive round-trips. Field is optional so charts
+   * created in-app (no source XML) still serialize.
+   */
+  ooxmlXml?: string;
+}
+
 export type SlideElement =
   | TextElement
   | ShapeElement
@@ -212,6 +283,7 @@ export type SlideElement =
   | TableElement
   | IconElement
   | EmbedElement
+  | ChartElement
   | UnknownElement;
 
 export interface Slide {
