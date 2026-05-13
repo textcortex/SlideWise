@@ -1280,15 +1280,19 @@ async function parsePic(
   if (ext === "emf" || ext === "wmf") {
     // No raster sibling shipped — decode the metafile in-browser via
     // emf-converter (Canvas-based EMF/WMF parser). Returns null when no
-    // canvas API is available (e.g. SSR / Node tests without jsdom);
-    // we fall back to the legacy diagnostic-skip in that case so consumers
-    // still detect dropped vector metafiles.
+    // canvas API is available (e.g. SSR / Node tests without jsdom).
+    // Fall back to UnknownElement so the source XML (with its original
+    // EMF rId) survives round-trip verbatim — PowerPoint can render the
+    // metafile natively even when Slidewise can't preview it. Returning
+    // null here used to drop the whole `<p:pic>` from the deck which,
+    // combined with a slide-level catch upstream, could wipe everything
+    // on the same slide.
     const decoded = await decodeMetafileToDataUrl(file, ext);
     if (!decoded) {
       ctx.diagnostics.warnings.push(
-        `Skipped ${ext.toUpperCase()} image at ${fullPath} — vector metafile decode unavailable in this environment.`
+        `Preserving ${ext.toUpperCase()} image at ${fullPath} as UnknownElement — vector metafile decode unavailable in this environment.`
       );
-      return null;
+      return toUnknown(pic, "p:pic", ctx, outer);
     }
     // decoded is `data:image/png;base64,…` — strip prefix to match the
     // common path below.
