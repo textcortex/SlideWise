@@ -21,12 +21,18 @@ const blob = await serializeDeck(deck, { source: buffer });
 
 The `parsePptx → serializeDeck` happy path (no state in between, no editor) keeps working unchanged via a non-enumerable attachment fallback. `parsePptx` also accepts `Uint8Array` directly now so the server-side round-trip works without extra allocations.
 
-### What this fix *doesn't* cover
+### Per-element source-XML preservation
 
-This release preserves OOXML that the importer couldn't model. It does **not** retrofit pptxgenjs to emit Slidewise's newer parser fields (CSS `radial-gradient` fills, `ShapeElement.path` custom geometries, `TextElement.backingPath` / `background` / `padding`, `TableElement.borderColor`). Decks that exercise those fields (like brand chapter slides with gradient panels, custGeom logos, or tinted body placeholders) still lose fidelity on `Save` until the serializer learns to write those as raw OOXML — tracked as a follow-up.
+The serializer also captures the verbatim `<p:sp>`/`<p:pic>`/`<p:cxnSp>`/`<p:graphicFrame>` XML for every imported element with explicit geometry (`<a:xfrm>`). On save, each unedited element is re-emitted from its source XML — bypassing pptxgenjs entirely — so CSS `radial-gradient` fills, `<a:custGeom>` paths, brand wordmarks, and any other native-typed element with fields pptxgenjs doesn't speak survive saves with zero loss. The serializer compares the current element to a snapshot taken at parse time; edited elements still route through pptxgenjs (best-effort), pristine ones replay verbatim.
+
+The preserved fragments are injected at the start of `<p:spTree>` (decoration layer, low z); `UnknownElement` payloads stay at the end (high z, content layer). Per-fragment rels resolve against whichever archive entry the element originated from (slide / layout / master), so layout-derived gradient panels and brand marks bring their referenced media along correctly.
 
 ### Behaviour summary
 
-- Decks with charts / SmartArt / group shapes / OLE / math / complex tables: **round-trip cleanly now**.
-- Decks built entirely from text + simple shapes + raster images: unchanged (no overhead — preservation is a no-op when there are zero unknowns).
-- Decks heavy on imported brand visuals (custGeom, gradient fills, layout-derived backings): still partially lossy on save. Use `serializeDeck` with explicit `source` so at least the preservation path runs for any `UnknownElement` you do have.
+- Decks with charts / SmartArt / group shapes / OLE / math / complex tables: **round-trip cleanly**.
+- Decks heavy on imported brand visuals (gradient fills, custGeom logos / icons, layout-derived decoration): **also round-trip cleanly** as long as the host passes `source` to `serializeDeck`. Unedited elements replay their source XML verbatim no matter how many save cycles they go through.
+- Decks built entirely from text + simple shapes + raster images: unchanged (no overhead — both preservation paths no-op when there's nothing to preserve).
+
+### Known gaps
+
+`TextElement.backingPath` / `background` (baked from overridden layout placeholders) still lose their visual on save — those fields don't have an isolated source `<p:sp>` to replay, and re-injecting the layout placeholder introduces stub text and geom-resolution issues on re-parse. Tracked as a follow-up.
