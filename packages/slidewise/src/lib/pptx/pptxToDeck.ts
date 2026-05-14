@@ -305,7 +305,20 @@ export async function parsePptx(
     diagnostics.warnings.push("PPTX contained no slides; created an empty one.");
   }
 
-  const deck: Deck = { version: CURRENT_DECK_VERSION, title, slides };
+  // Stamp the deck with an enumerable id and stash the source bytes in a
+  // module-level cache keyed by that id. The id survives `{...deck}`,
+  // `structuredClone`, and `JSON.parse(JSON.stringify(deck))`, so any host
+  // state pipeline that does shallow / deep clones still resolves source
+  // bytes on save. The non-enumerable `SOURCE_PPTX` attachment is kept as
+  // a redundant fallback for callers that hold the deck object directly.
+  const sourcePptxId = nanoid(12);
+  sourceBufferCache.set(sourcePptxId, sourceBuffer);
+  const deck: Deck = {
+    version: CURRENT_DECK_VERSION,
+    title,
+    slides,
+    sourcePptxId,
+  };
   Object.defineProperty(deck, SOURCE_PPTX, {
     value: sourceBuffer,
     enumerable: false,
@@ -323,6 +336,20 @@ export async function parsePptx(
  * package; the contract is enforced at the parse/serialize boundary. */
 export const SOURCE_PPTX = "__slidewiseSourcePptx";
 export const SOURCE_SLIDE_PATH = "__slidewiseSourceSlidePath";
+
+/**
+ * Module-level cache of source PPTX bytes, keyed by `Deck.sourcePptxId`.
+ * Populated on `parsePptx`; read on `serializeDeck` when the caller didn't
+ * pass `options.source` and the non-enumerable `SOURCE_PPTX` attachment
+ * has been stripped (which happens the moment any reducer spreads the deck
+ * or any history snapshot is taken). In-memory only — survives clones
+ * within a session but not page reloads.
+ */
+const sourceBufferCache = new Map<string, ArrayBuffer>();
+
+export function getCachedSourceBuffer(id: string): ArrayBuffer | undefined {
+  return sourceBufferCache.get(id);
+}
 
 /**
  * Per-element source-XML registry. Keyed by `SlideElement.id`, holds the

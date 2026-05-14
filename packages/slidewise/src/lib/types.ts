@@ -302,6 +302,17 @@ export interface Deck {
   version: number;
   title: string;
   slides: Slide[];
+  /**
+   * Opaque identifier the importer stamps when a deck is parsed from a real
+   * PPTX. Slidewise keeps the source bytes in a module-level cache keyed by
+   * this id so verbatim master / layout / theme / font / EMF preservation
+   * still works after the host's state library has spread / cloned the deck
+   * (which strips non-enumerable attachments). This field is enumerable so
+   * it survives `structuredClone` and `JSON.parse(JSON.stringify(deck))`;
+   * the cache itself is in-memory only, so cross-session round-trip still
+   * needs the host to re-attach source bytes via `serializeDeck({ source })`.
+   */
+  sourcePptxId?: string;
 }
 
 export type ElementDraft<T extends SlideElement = SlideElement> = T extends SlideElement

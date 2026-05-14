@@ -19,6 +19,7 @@ import { pxToInches, pxToPoints } from "./units";
 import {
   SOURCE_PPTX,
   SOURCE_SLIDE_PATH,
+  getCachedSourceBuffer,
   getElementSource,
   snapshotElement,
 } from "./pptxToDeck";
@@ -434,6 +435,16 @@ async function resolveSource(
     }
     return explicit.arrayBuffer();
   }
+  // 1. Module-level cache keyed by Deck.sourcePptxId — survives spread,
+  //    structuredClone, and JSON round-trip within the session, so any
+  //    reducer-driven host (Zustand, Redux, useState, etc.) keeps the
+  //    chrome / EMF / slide-bg preservation pipeline alive.
+  if (deck.sourcePptxId) {
+    const cached = getCachedSourceBuffer(deck.sourcePptxId);
+    if (cached) return cached;
+  }
+  // 2. Legacy non-enumerable attachment from parsePptx. Only present when
+  //    the deck object hasn't been spread / cloned since import.
   const attached = (deck as unknown as Record<string, unknown>)[SOURCE_PPTX];
   return attached instanceof ArrayBuffer ? attached : undefined;
 }
