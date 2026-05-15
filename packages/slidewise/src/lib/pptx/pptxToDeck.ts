@@ -313,6 +313,12 @@ export async function parsePptx(
   // a redundant fallback for callers that hold the deck object directly.
   const sourcePptxId = nanoid(12);
   sourceBufferCache.set(sourcePptxId, sourceBuffer);
+  // Mirror to IndexedDB best-effort so the bytes survive page reloads.
+  // Fire-and-forget — host code doesn't need to await this for parse to
+  // resolve, and a write failure (private mode, quota exceeded) is
+  // recoverable: serializeDeck will fall back to options.source or the
+  // SOURCE_PPTX attachment if the IndexedDB layer comes up empty later.
+  void idbPutSource(sourcePptxId, sourceBuffer).catch(() => {});
   const deck: Deck = {
     version: CURRENT_DECK_VERSION,
     title,
@@ -343,12 +349,114 @@ export const SOURCE_SLIDE_PATH = "__slidewiseSourceSlidePath";
  * pass `options.source` and the non-enumerable `SOURCE_PPTX` attachment
  * has been stripped (which happens the moment any reducer spreads the deck
  * or any history snapshot is taken). In-memory only — survives clones
- * within a session but not page reloads.
+ * within a session.
+ *
+ * For cross-session survival (page reloads, where the in-memory cache is
+ * empty for a fresh module instance), bytes are also persisted to
+ * IndexedDB under the same `sourcePptxId` key. `getCachedSourceBufferAsync`
+ * checks both layers; the sync `getCachedSourceBuffer` accessor only
+ * returns the in-memory entry (useful for non-async callers, but won't
+ * hydrate from disk).
  */
 const sourceBufferCache = new Map<string, ArrayBuffer>();
 
 export function getCachedSourceBuffer(id: string): ArrayBuffer | undefined {
   return sourceBufferCache.get(id);
+}
+
+export async function getCachedSourceBufferAsync(
+  id: string
+): Promise<ArrayBuffer | undefined> {
+  const inMemory = sourceBufferCache.get(id);
+  if (inMemory) return inMemory;
+  const fromDisk = await idbGetSource(id);
+  if (fromDisk) {
+    // Promote to in-memory so subsequent saves don't pay IDB latency.
+    sourceBufferCache.set(id, fromDisk);
+  }
+  return fromDisk ?? undefined;
+}
+
+// ---------------------------------------------------------------------------
+// IndexedDB-backed source persistence
+//
+// Hosts that mutate the deck through reducer pipelines (Zustand, Redux,
+// useState, Immer) AND persist the deck to localStorage / sessionStorage
+// AND rehydrate on page reload lose access to source bytes — the in-memory
+// cache is empty for the fresh module instance, and the host's persisted
+// deck JSON doesn't carry the bytes themselves.
+//
+// To make `serializeDeck` work across reloads without forcing every host
+// to wire source persistence, we mirror the in-memory cache to IndexedDB
+// keyed by `sourcePptxId`. Writes are best-effort and fire-and-forget;
+// reads happen lazily inside `serializeDeck`. Falls back cleanly in
+// non-browser environments (SSR, Node tests).
+// ---------------------------------------------------------------------------
+
+const IDB_DB_NAME = "slidewise-pptx";
+const IDB_STORE_NAME = "source-bytes";
+const IDB_DB_VERSION = 1;
+
+function getIDB(): IDBFactory | null {
+  if (typeof indexedDB === "undefined") return null;
+  return indexedDB;
+}
+
+function openSourceDb(): Promise<IDBDatabase | null> {
+  const idb = getIDB();
+  if (!idb) return Promise.resolve(null);
+  return new Promise<IDBDatabase | null>((resolve) => {
+    const req = idb.open(IDB_DB_NAME, IDB_DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE_NAME)) {
+        db.createObjectStore(IDB_STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+    req.onblocked = () => resolve(null);
+  });
+}
+
+async function idbPutSource(id: string, bytes: ArrayBuffer): Promise<void> {
+  const db = await openSourceDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE_NAME, "readwrite");
+      tx.objectStore(IDB_STORE_NAME).put(bytes, id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+  db.close();
+}
+
+async function idbGetSource(id: string): Promise<ArrayBuffer | undefined> {
+  const db = await openSourceDb();
+  if (!db) return undefined;
+  return new Promise<ArrayBuffer | undefined>((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE_NAME, "readonly");
+      const req = tx.objectStore(IDB_STORE_NAME).get(id);
+      req.onsuccess = () => {
+        const v = req.result;
+        db.close();
+        resolve(v instanceof ArrayBuffer ? v : undefined);
+      };
+      req.onerror = () => {
+        db.close();
+        resolve(undefined);
+      };
+    } catch {
+      db.close();
+      resolve(undefined);
+    }
+  });
 }
 
 /**
@@ -371,12 +479,43 @@ interface ElementSource {
   snapshot: string;
   /** Source slide path the XML came from — used to resolve rels/media. */
   slidePath: string;
+  /** True iff the source XML carried an explicit `<a:xfrm>`. Pristine
+   *  re-injection requires this (else the shape has no geometry and the
+   *  template's resolved positions are lost); patch-mode handles the
+   *  no-xfrm case by always splicing the edited geometry into the patched
+   *  XML, so it can still operate on placeholder-inherited shapes. */
+  hasXfrm: boolean;
 }
 
 const elementSourceRegistry = new Map<string, ElementSource>();
 
 export function getElementSource(elementId: string): ElementSource | undefined {
   return elementSourceRegistry.get(elementId);
+}
+
+export interface ElementSourceWithSnapshot {
+  xml: string;
+  snapshot: Record<string, unknown>;
+  slidePath: string;
+  hasXfrm: boolean;
+}
+
+/**
+ * Like getElementSource but pre-parses the snapshot JSON. Used by the
+ * patch-mode save path so it can diff field-by-field without re-parsing
+ * the snapshot string for every element on every save.
+ */
+export function getElementSourceParsed(
+  elementId: string
+): ElementSourceWithSnapshot | undefined {
+  const entry = elementSourceRegistry.get(elementId);
+  if (!entry) return undefined;
+  return {
+    xml: entry.xml,
+    snapshot: JSON.parse(entry.snapshot) as Record<string, unknown>,
+    slidePath: entry.slidePath,
+    hasXfrm: entry.hasXfrm,
+  };
 }
 
 export function snapshotElement(element: SlideElement): string {
@@ -428,17 +567,19 @@ function registerElementSource(
   slidePath: string
 ): void {
   if (!rawXml) return;
-  // Skip elements whose source XML relies on placeholder geometry
-  // inheritance (no explicit <a:xfrm>). pptxgenjs writes its own
-  // slideLayouts on save, so on re-parse those inherited positions are
-  // gone — re-injecting the XML would produce a geom-less <p:sp> that
-  // falls into UnknownElement. Letting pptxgenjs emit them instead
-  // bakes the resolved coords into the output.
-  if (!hasExplicitXfrm(rawXml)) return;
+  // Register every element with source XML, even placeholder-inherited
+  // shapes that don't carry an explicit <a:xfrm>. The pristine pass
+  // continues to require an xfrm (re-injecting without one would produce
+  // a geom-less shape on re-parse), but patch-mode handles the no-xfrm
+  // case by always splicing the current geometry into the patched
+  // output — that keeps themed fills / fonts on placeholder-inherited
+  // elements survivable across edits.
+  const hasXfrm = hasExplicitXfrm(rawXml);
   elementSourceRegistry.set(element.id, {
     xml: rawXml,
     snapshot: snapshotElement(element),
     slidePath,
+    hasXfrm,
   });
 }
 

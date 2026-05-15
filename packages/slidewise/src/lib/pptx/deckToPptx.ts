@@ -19,10 +19,11 @@ import { pxToInches, pxToPoints } from "./units";
 import {
   SOURCE_PPTX,
   SOURCE_SLIDE_PATH,
-  getCachedSourceBuffer,
+  getCachedSourceBufferAsync,
   getElementSource,
   snapshotElement,
 } from "./pptxToDeck";
+import { tryPatchEditedElement } from "./patchEdited";
 
 /**
  * Serialize a Slidewise Deck to a real PPTX blob.
@@ -61,8 +62,21 @@ export async function serializeDeck(
   pptx.title = deck.title || "Untitled";
   pptx.layout = "LAYOUT_WIDE"; // 13.333 × 7.5 in
 
+  // Patch-mode save: for each edited element whose change pattern we know
+  // how to splice into the source OOXML (text content, geometry), generate
+  // a patched fragment up front. addSlide skips those elements (so
+  // pptxgenjs doesn't write a lossy version), and preserveUnknowns
+  // injects the patched fragment alongside pristines. Anything not
+  // patchable (color edits, font changes, run-level restyling, new
+  // elements) still flows through pptxgenjs as before.
+  const patchedBySlide = collectPatched(deck);
+  const skipElementIds = new Set<string>();
+  for (const group of patchedBySlide.values()) {
+    for (const id of group.elementIds) skipElementIds.add(id);
+  }
+
   for (const slide of deck.slides) {
-    addSlide(pptx, slide);
+    addSlide(pptx, slide, skipElementIds);
   }
 
   // Use arraybuffer (universal: works in Node + browser, accepted by JSZip
@@ -70,10 +84,14 @@ export async function serializeDeck(
   const generated = (await pptx.write({
     outputType: "arraybuffer",
   })) as ArrayBuffer;
-  return preserveUnknowns(generated, deck, options.source);
+  return preserveUnknowns(generated, deck, options.source, patchedBySlide);
 }
 
-function addSlide(pptx: pptxgen, slide: Slide): void {
+function addSlide(
+  pptx: pptxgen,
+  slide: Slide,
+  skipElementIds: Set<string>
+): void {
   const s = pptx.addSlide();
   s.background = { color: hexNoHash(slide.background) };
 
@@ -84,6 +102,9 @@ function addSlide(pptx: pptxgen, slide: Slide): void {
     // verbatim, sidestepping pptxgenjs's lossy translation of
     // gradient / custGeom / backing fields.
     if (isPristineImportedElement(el)) continue;
+    // Skip elements covered by patch-mode — preserveUnknowns will splice
+    // the patched OOXML into the slide.
+    if (skipElementIds.has(el.id)) continue;
     try {
       addElement(s, el);
     } catch (err) {
@@ -341,7 +362,8 @@ function addEmbed(s: pptxgen.Slide, el: EmbedElement): void {
 async function preserveUnknowns(
   generated: ArrayBuffer,
   deck: Deck,
-  explicitSource?: Blob | ArrayBuffer | Uint8Array
+  explicitSource?: Blob | ArrayBuffer | Uint8Array,
+  patchedBySlide?: Map<number, PatchedGroup>
 ): Promise<Blob> {
   const wrapBlob = () => new Blob([generated], { type: PPTX_MIME });
   // Prefer the caller-supplied source (survives state cloning / localStorage
@@ -352,6 +374,7 @@ async function preserveUnknowns(
 
   const unknownsBySlide = collectUnknowns(deck);
   const pristinesBySlide = collectPristineImports(deck);
+  const patched = patchedBySlide ?? new Map<number, PatchedGroup>();
 
   const [outZip, srcZip] = await Promise.all([
     JSZip.loadAsync(generated),
@@ -366,11 +389,13 @@ async function preserveUnknowns(
   const slideIndices = new Set<number>([
     ...unknownsBySlide.keys(),
     ...pristinesBySlide.keys(),
+    ...patched.keys(),
   ]);
   const sortedIndices = [...slideIndices].sort((a, b) => a - b);
   for (const slideIndex of sortedIndices) {
     const unknownGroup = unknownsBySlide.get(slideIndex);
     const pristineGroup = pristinesBySlide.get(slideIndex);
+    const patchedGroup = patched.get(slideIndex);
     const generatedSlidePath = `ppt/slides/slide${slideIndex + 1}.xml`;
     const generatedRelsPath = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
     if (!outZip.file(generatedSlidePath)) continue;
@@ -387,10 +412,15 @@ async function preserveUnknowns(
             sourcePath: slideSourcePath,
           }))
         : [];
-    if (
-      !unknownFragments.length &&
-      !(pristineGroup?.fragments.length ?? 0)
-    ) {
+    // Patched fragments share injection mechanics with pristines (verbatim
+    // XML keyed off a sourcePath for r:id resolution + media copy) — they
+    // just carry edited content instead of the source content. Prepend
+    // them so they sit at the same z layer as the pristines they replaced.
+    const allPristines: PristineFragment[] = [
+      ...(pristineGroup?.fragments ?? []),
+      ...(patchedGroup?.fragments ?? []),
+    ];
+    if (!unknownFragments.length && !allPristines.length) {
       continue;
     }
     await injectIntoSlide(
@@ -398,7 +428,7 @@ async function preserveUnknowns(
       srcZip,
       generatedSlidePath,
       generatedRelsPath,
-      pristineGroup?.fragments ?? [],
+      allPristines,
       unknownFragments
     );
   }
@@ -435,12 +465,13 @@ async function resolveSource(
     }
     return explicit.arrayBuffer();
   }
-  // 1. Module-level cache keyed by Deck.sourcePptxId — survives spread,
-  //    structuredClone, and JSON round-trip within the session, so any
-  //    reducer-driven host (Zustand, Redux, useState, etc.) keeps the
-  //    chrome / EMF / slide-bg preservation pipeline alive.
+  // 1. In-memory cache keyed by Deck.sourcePptxId, with IndexedDB fallback
+  //    that survives page reloads. The id is enumerable so it survives
+  //    structuredClone, object spread, and JSON round-trip — any
+  //    reducer-driven host (Zustand, Redux, useState, Immer) keeps the
+  //    preservation pipeline alive across edits AND reloads.
   if (deck.sourcePptxId) {
-    const cached = getCachedSourceBuffer(deck.sourcePptxId);
+    const cached = await getCachedSourceBufferAsync(deck.sourcePptxId);
     if (cached) return cached;
   }
   // 2. Legacy non-enumerable attachment from parsePptx. Only present when
@@ -472,6 +503,40 @@ interface PristineGroup {
   fragments: PristineFragment[];
 }
 
+interface PatchedGroup {
+  fragments: PristineFragment[];
+  /** Ids of elements whose edits were absorbed by the patch fragments —
+   *  addSlide must skip these so pptxgenjs doesn't emit a parallel
+   *  (and lossy) copy. */
+  elementIds: Set<string>;
+}
+
+/**
+ * For each slide, walk its elements and try to patch every edited one.
+ * "Edited" means the snapshot taken at parse time differs from the
+ * current values; "patchable" means the change pattern is one
+ * `tryPatchEditedElement` covers (text content, geometry). Charts and
+ * UnknownElements are skipped — they use their own re-injection paths.
+ */
+function collectPatched(deck: Deck): Map<number, PatchedGroup> {
+  const out = new Map<number, PatchedGroup>();
+  for (let i = 0; i < deck.slides.length; i++) {
+    const slide = deck.slides[i];
+    const fragments: PristineFragment[] = [];
+    const elementIds = new Set<string>();
+    for (const el of slide.elements) {
+      if (el.type === "unknown" || el.type === "chart") continue;
+      const patched = tryPatchEditedElement(el);
+      if (!patched) continue;
+      fragments.push({ xml: patched.xml, sourcePath: patched.sourcePath });
+      elementIds.add(el.id);
+    }
+    if (!fragments.length) continue;
+    out.set(i, { fragments, elementIds });
+  }
+  return out;
+}
+
 function collectPristineImports(deck: Deck): Map<number, PristineGroup> {
   const out = new Map<number, PristineGroup>();
   for (let i = 0; i < deck.slides.length; i++) {
@@ -484,6 +549,11 @@ function collectPristineImports(deck: Deck): Map<number, PristineGroup> {
       if (el.type === "unknown" || el.type === "chart") continue;
       const src = getElementSource(el.id);
       if (!src) continue;
+      // Placeholder-inherited shapes (no explicit xfrm in source) can't be
+      // pristine-re-injected — pptxgenjs's regenerated layouts wouldn't
+      // resolve their position. Patch-mode handles them separately by
+      // splicing in geometry. Skip pristine here.
+      if (!src.hasXfrm) continue;
       if (src.snapshot !== snapshotElement(el)) continue;
       fragments.push({ xml: src.xml, sourcePath: src.slidePath });
     }
