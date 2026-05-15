@@ -73,6 +73,41 @@ describe("patch-mode saves preserve theme refs on text edits", () => {
   );
 
   it.skipIf(!hasEon)(
+    "produces well-formed XML when the source has self-closing <p:spPr/>",
+    async () => {
+      // eon-deck slide 10 has placeholders whose slide-level spPr is empty
+      // (purely inheriting from layout). The importer registers them
+      // without an explicit xfrm; patch-mode has to splice xfrm INSIDE
+      // the spPr container, not after a self-closing tag. A previous
+      // version of this code emitted `<p:spPr/><a:xfrm>…` which is
+      // invalid OOXML — PowerPoint silently dropped the shape.
+      const buf = await readFile(path.join(attachmentsDir, "eon-deck-v1.pptx"));
+      const source = buf.buffer.slice(
+        buf.byteOffset,
+        buf.byteOffset + buf.byteLength
+      ) as ArrayBuffer;
+      const deck = await parsePptx(source);
+      const slide10 = deck.slides[9];
+      // Edit every text element on the slide and confirm none of them
+      // produce malformed XML.
+      for (const el of slide10.elements) {
+        if (el.type === "text") (el as TextElement).text += "!";
+      }
+      const blob = await serializeDeck(deck, { source });
+      const out = await JSZip.loadAsync(await blob.arrayBuffer());
+      const xml = await out.file("ppt/slides/slide10.xml")!.async("string");
+      // Every shape's spPr must be either self-closing OR balanced.
+      // No `<p:spPr/><a:xfrm` anywhere — that's the malformed pattern.
+      expect(xml).not.toMatch(/<p:spPr\b[^>]*\/\s*>\s*<a:xfrm/);
+      // Sanity: opening and closing p:spPr counts must match (treating
+      // self-closing as a balanced pair on its own).
+      const open = (xml.match(/<p:spPr\b[^/]*>/g) ?? []).length;
+      const close = (xml.match(/<\/p:spPr>/g) ?? []).length;
+      expect(open).toBe(close);
+    }
+  );
+
+  it.skipIf(!hasEon)(
     "moves an element via geometry-only patch, keeping fill / themed color verbatim",
     async () => {
       const buf = await readFile(path.join(attachmentsDir, "eon-deck-v1.pptx"));

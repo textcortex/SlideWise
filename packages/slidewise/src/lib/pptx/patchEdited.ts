@@ -66,33 +66,89 @@ export function tryPatchEditedElement(el: SlideElement): PatchResult | null {
   // structure that pptxgenjs CAN write — but at the cost of losing themed
   // colors, so a separate (future) patch path that rebuilds the txBody
   // from runs while preserving paragraph-level pPr would help.
+  let patched: string | null = null;
   if (needsText && el.type === "text") {
     const txt = (el as TextElement).text;
     const runs = (el as TextElement).runs;
     if (runs && runs.length > 1 && !runsAreHomogeneous(runs)) {
       return null;
     }
-    let xml = patchSingleParagraphText(src.xml, txt, runs);
-    if (xml == null) return null;
+    patched = patchSingleParagraphText(src.xml, txt, runs);
+    if (patched == null) return null;
     // Splice geometry whenever it changed OR when the source had none
     // (placeholder-inherited shapes — without an explicit xfrm in the
     // saved output the layout's resolved position would be ambiguous).
     if (needsGeom || !src.hasXfrm) {
-      const geomed = patchGeometry(xml, el);
+      const geomed = patchGeometry(patched, el);
       if (geomed == null) return null;
-      xml = geomed;
+      patched = geomed;
     }
-    return { xml, sourcePath: src.slidePath };
+  } else if (needsGeom && !needsText) {
+    // Pure geometry change on any element type.
+    patched = patchGeometry(src.xml, el);
+    if (patched == null) return null;
   }
 
-  // Pure geometry change on any element type.
-  if (needsGeom && !needsText) {
-    const xml = patchGeometry(src.xml, el);
-    if (xml == null) return null;
-    return { xml, sourcePath: src.slidePath };
-  }
+  if (patched == null) return null;
 
-  return null;
+  // Final safety net: if anything in the patch path produced malformed
+  // OOXML (mismatched tag counts, broken nesting), PowerPoint may silently
+  // drop the entire shape on open — far worse than pptxgenjs's lossy
+  // emitter. Fall back to pptxgenjs whenever the structure looks off.
+  if (!looksStructurallySound(src.xml, patched)) return null;
+
+  return { xml: patched, sourcePath: src.slidePath };
+}
+
+/**
+ * Cheap structural sanity check: compare counts of major OOXML tag pairs
+ * between source and patched. Any drift means the patch garbled the
+ * structure and we should fall back to pptxgenjs rather than ship broken
+ * XML to PowerPoint.
+ *
+ * Not a full XML validator — we'd pay parser cost on every element on
+ * every save. Catches the regex edge cases that have bitten us
+ * (self-closing `<p:spPr/>`, mismatched rPr capture, etc.) without the
+ * overhead.
+ */
+function looksStructurallySound(src: string, patched: string): boolean {
+  const tagsToCheck = [
+    "p:sp",
+    "p:pic",
+    "p:graphicFrame",
+    "p:cxnSp",
+    "p:spPr",
+    "p:txBody",
+    "a:p",
+    "a:r",
+    "a:t",
+    "a:xfrm",
+  ];
+  for (const tag of tagsToCheck) {
+    const open = countMatches(patched, new RegExp(`<${tag}\\b[^/]*>`, "g"));
+    const close = countMatches(patched, new RegExp(`</${tag}>`, "g"));
+    const selfClose = countMatches(
+      patched,
+      new RegExp(`<${tag}\\b[^>]*\\/>`, "g")
+    );
+    if (open !== close) return false;
+    // Track the same in the source — patch shouldn't have produced more
+    // top-level shape containers than source had (which would mean the
+    // patch fragment now wraps stuff it shouldn't).
+    const srcOpen = countMatches(src, new RegExp(`<${tag}\\b[^/]*>`, "g"));
+    const srcSelfClose = countMatches(
+      src,
+      new RegExp(`<${tag}\\b[^>]*\\/>`, "g")
+    );
+    if (tag === "p:sp" || tag === "p:pic" || tag === "p:graphicFrame") {
+      if (open + selfClose !== srcOpen + srcSelfClose) return false;
+    }
+  }
+  return true;
+}
+
+function countMatches(s: string, re: RegExp): number {
+  return (s.match(re) ?? []).length;
 }
 
 function diffFields(
@@ -236,13 +292,18 @@ function patchGeometry(xml: string, el: SlideElement): string | null {
   if (/<a:xfrm\b/.test(xml)) {
     return xml.replace(/<a:xfrm\b[\s\S]*?<\/a:xfrm>|<a:xfrm\b[^/]*\/>/, newXfrm);
   }
-  // No xfrm in the source spPr (placeholder-inherited) — inject one.
+  // Self-closing `<p:spPr/>` first — convert to open/close and put xfrm
+  // INSIDE. Must come before the open-tag branch because the open-tag
+  // regex (`<p:spPr\b[^>]*>`) also matches `<p:spPr/>` (the `/` is a
+  // legal character in `[^>]*`), and inserting xfrm after `<p:spPr/>`
+  // would put it OUTSIDE the spPr container — invalid OOXML that
+  // PowerPoint silently drops the shape over.
+  if (/<p:spPr\b[^>]*\/\s*>/.test(xml)) {
+    return xml.replace(/<p:spPr\b[^>]*\/\s*>/, `<p:spPr>${newXfrm}</p:spPr>`);
+  }
+  // Open/close form: insert immediately after the opening tag.
   if (/<p:spPr\b[^>]*>/.test(xml)) {
     return xml.replace(/<p:spPr\b[^>]*>/, (m) => `${m}${newXfrm}`);
-  }
-  // Self-closing `<p:spPr/>` — convert to open/close and inject.
-  if (/<p:spPr\s*\/>/.test(xml)) {
-    return xml.replace(/<p:spPr\s*\/>/, `<p:spPr>${newXfrm}</p:spPr>`);
   }
   return null;
 }
