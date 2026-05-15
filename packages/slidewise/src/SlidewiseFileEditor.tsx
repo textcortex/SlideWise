@@ -83,8 +83,20 @@ export interface SlidewiseFileEditorProps {
   initialSlideId?: string;
   /** Render the built-in top bar. Default `true`. */
   showTopBar?: boolean;
-  /** Render the floating bottom toolbar. Default `true`. */
+  /** Render the floating bottom toolbar. Default `true` in edit, `false` in preview. */
   showBottomToolbar?: boolean;
+  /**
+   * High-level chrome preset. `"preview"` hides the bottom toolbar and the
+   * add-slide button and trims the top bar to title + play. Defaults to
+   * `"edit"`. See `SlidewiseEditorProps.mode`.
+   */
+  mode?: "edit" | "preview";
+  /** Hide the "New Slide" button at the bottom of the side rail. */
+  hideAddButton?: boolean;
+  /** Hide slide-number badges on side-rail thumbnails. */
+  hideSlideNumbers?: boolean;
+  /** Hide the leading "Smart" pill in the top bar title. */
+  hideSmart?: boolean;
   /**
    * Override the bundled Geist font; sets `--font-geist-sans` on the editor
    * root.
@@ -219,6 +231,10 @@ export const SlidewiseFileEditor = forwardRef<
     initialSlideId,
     showTopBar,
     showBottomToolbar,
+    mode,
+    hideAddButton,
+    hideSlideNumbers,
+    hideSmart,
     fontFamily,
     icons,
     labels,
@@ -397,6 +413,10 @@ export const SlidewiseFileEditor = forwardRef<
         initialSlideId={initialSlideId}
         showTopBar={showTopBar}
         showBottomToolbar={showBottomToolbar}
+        mode={mode}
+        hideAddButton={hideAddButton}
+        hideSlideNumbers={hideSlideNumbers}
+        hideSmart={hideSmart}
         fontFamily={fontFamily}
         icons={icons}
         labels={labels}

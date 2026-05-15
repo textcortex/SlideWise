@@ -9,9 +9,11 @@ import {
   useCanvasConfig,
   resolveSlideBackground,
 } from "@/compound/CanvasContext";
+import { useReadOnly } from "@/compound/ReadOnlyContext";
 
 export function Canvas() {
   const store = useEditorStore();
+  const readOnly = useReadOnly();
   const slide = useEditor((s) => s.currentSlide());
   const tool = useEditor((s) => s.tool);
   const setTool = useEditor((s) => s.setTool);
@@ -57,6 +59,7 @@ export function Canvas() {
 
   // keyboard
   useEffect(() => {
+    if (readOnly) return;
     function onKey(e: KeyboardEvent) {
       if (editingId) return;
       const target = e.target as HTMLElement;
@@ -102,6 +105,7 @@ export function Canvas() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
+    readOnly,
     editingId,
     selectedIds,
     deleteElement,
@@ -137,6 +141,7 @@ export function Canvas() {
   >(null);
 
   function startCreate(e: React.MouseEvent) {
+    if (readOnly) return;
     if (tool === "select") return;
     const start = clientToSlide(e.clientX, e.clientY);
     setDraftRect({ x: start.x, y: start.y, w: 1, h: 1, type: tool });
@@ -176,6 +181,7 @@ export function Canvas() {
   }
 
   function onElementDown(e: React.MouseEvent, el: SlideElement) {
+    if (readOnly) return;
     if (tool !== "select") return;
     if (editingId === el.id) return;
     e.stopPropagation();
@@ -231,15 +237,17 @@ export function Canvas() {
         overflow: "hidden",
         background:
           "radial-gradient(circle at 50% 30%, var(--canvas-bg-from) 0%, var(--canvas-bg-to) 100%)",
-        cursor: tool !== "select" ? "crosshair" : "default",
+        cursor: readOnly ? "default" : tool !== "select" ? "crosshair" : "default",
       }}
       onMouseDown={(e) => {
+        if (readOnly) return;
         if (e.target === e.currentTarget) clearSelection();
       }}
     >
       <div
         ref={surfaceRef}
         onMouseDown={(e) => {
+          if (readOnly) return;
           if (e.target === e.currentTarget) {
             clearSelection();
             startCreate(e);
@@ -273,8 +281,12 @@ export function Canvas() {
               return (
                 <div
                   key={el.id}
-                  onMouseDown={(e) => onElementDown(e, el)}
+                  onMouseDown={(e) => {
+                    if (readOnly) return;
+                    onElementDown(e, el);
+                  }}
                   onDoubleClick={() => {
+                    if (readOnly) return;
                     if (el.type === "text") setEditingId(el.id);
                   }}
                   style={{
@@ -284,7 +296,12 @@ export function Canvas() {
                     width: el.w,
                     height: el.h,
                     transform: `rotate(${el.rotation}deg)`,
-                    cursor: tool === "select" ? "move" : "crosshair",
+                    pointerEvents: readOnly ? "none" : "auto",
+                    cursor: readOnly
+                      ? "default"
+                      : tool === "select"
+                        ? "move"
+                        : "crosshair",
                   }}
                 >
                   <ElementView
@@ -321,23 +338,24 @@ export function Canvas() {
           )}
         </div>
 
-        {selectedIds.map((id) => {
-          const el = slide.elements.find((e) => e.id === id);
-          if (!el) return null;
-          return (
-            <SelectionFrame
-              key={id}
-              el={el}
-              scale={scale}
-              editing={editingId === id}
-              onChange={(patch) => updateElement(id, patch)}
-              onCommitStart={() => pushHistory()}
-            />
-          );
-        })}
+        {!readOnly &&
+          selectedIds.map((id) => {
+            const el = slide.elements.find((e) => e.id === id);
+            if (!el) return null;
+            return (
+              <SelectionFrame
+                key={id}
+                el={el}
+                scale={scale}
+                editing={editingId === id}
+                onChange={(patch) => updateElement(id, patch)}
+                onCommitStart={() => pushHistory()}
+              />
+            );
+          })}
       </div>
 
-      {selectedIds.length === 1 && (
+      {!readOnly && selectedIds.length === 1 && (
         <FloatingToolbar
           element={slide.elements.find((e) => e.id === selectedIds[0])!}
           scale={scale}

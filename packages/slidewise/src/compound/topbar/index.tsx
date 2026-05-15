@@ -30,6 +30,8 @@ export interface TopBarProps {
    * ```
    */
   hide?: TopBarSlotId[];
+  /** Hide the leading "Smart" pill on the title. */
+  hideSmart?: boolean;
   className?: string;
   style?: CSSProperties;
 }
@@ -55,7 +57,7 @@ export interface TopBarProps {
  * intermixed with host UI, drop down to `<Slidewise.TopBar.Root>` and the
  * named subparts directly.
  */
-function DefaultTopBar({ hide, className, style }: TopBarProps = {}) {
+function DefaultTopBar({ hide, hideSmart, className, style }: TopBarProps = {}) {
   const hidden = new Set(hide ?? []);
   return (
     <Root className={className} style={style}>
@@ -65,7 +67,7 @@ function DefaultTopBar({ hide, className, style }: TopBarProps = {}) {
           {!hidden.has("redo") && <Redo />}
         </Group>
       )}
-      {!hidden.has("title") && <Title />}
+      {!hidden.has("title") && <Title hideSmart={hideSmart} />}
       {!hidden.has("themeToggle") && <ThemeToggle />}
       {!hidden.has("save") && <Save />}
       {!hidden.has("play") && <Play />}

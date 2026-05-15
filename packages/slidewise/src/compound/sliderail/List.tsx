@@ -29,6 +29,10 @@ import { Number as SlideNumber } from "./Number";
 export interface SlideRailListProps {
   className?: string;
   style?: CSSProperties;
+  /** Omit the per-thumbnail number badge from default rows. */
+  hideNumber?: boolean;
+  /** Pixel width forwarded to the default `<Thumbnail />`. Ignored when a render-prop child is provided. */
+  thumbnailWidth?: number;
   /**
    * Optional render-prop. Receives each slide + its zero-based index;
    * return the row content. When omitted, the default row layout
@@ -37,7 +41,13 @@ export interface SlideRailListProps {
   children?: (slide: Slide, index: number) => ReactNode;
 }
 
-export function List({ className, style, children }: SlideRailListProps) {
+export function List({
+  className,
+  style,
+  hideNumber,
+  thumbnailWidth,
+  children,
+}: SlideRailListProps) {
   const slides = useEditor((s) => s.deck.slides);
 
   return (
@@ -57,8 +67,8 @@ export function List({ className, style, children }: SlideRailListProps) {
           <div key={slide.id}>{children(slide, index)}</div>
         ) : (
           <Item key={slide.id} slide={slide}>
-            <Thumbnail />
-            <SlideNumber />
+            <Thumbnail width={thumbnailWidth} />
+            {!hideNumber && <SlideNumber />}
           </Item>
         )
       )}

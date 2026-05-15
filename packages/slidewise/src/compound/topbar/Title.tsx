@@ -17,9 +17,11 @@ import { useLabels } from "../LabelsContext";
 export interface TopBarTitleProps {
   className?: string;
   style?: CSSProperties;
+  /** Hide the leading "Smart" pill. */
+  hideSmart?: boolean;
 }
 
-export function Title({ className, style }: TopBarTitleProps = {}) {
+export function Title({ className, style, hideSmart }: TopBarTitleProps = {}) {
   const title = useEditor((s) => s.deck.title);
   const setTitle = useEditor((s) => s.setTitle);
   const icons = useIcons();
@@ -43,23 +45,25 @@ export function Title({ className, style }: TopBarTitleProps = {}) {
         ...style,
       }}
     >
-      <span
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: 4,
-          padding: "3px 8px",
-          background: "var(--smart-grad)",
-          color: "var(--smart-fg)",
-          borderRadius: 999,
-          fontSize: 11,
-          fontWeight: 600,
-          letterSpacing: 0.2,
-        }}
-      >
-        {icons.smart ?? <Sparkles size={11} />}
-        {labels.smart}
-      </span>
+      {!hideSmart && (
+        <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            padding: "3px 8px",
+            background: "var(--smart-grad)",
+            color: "var(--smart-fg)",
+            borderRadius: 999,
+            fontSize: 11,
+            fontWeight: 600,
+            letterSpacing: 0.2,
+          }}
+        >
+          {icons.smart ?? <Sparkles size={11} />}
+          {labels.smart}
+        </span>
+      )}
       <input
         aria-label={labels.titleAriaLabel}
         value={title}
