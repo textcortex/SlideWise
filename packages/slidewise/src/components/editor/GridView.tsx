@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Plus, X } from "lucide-react";
 import { useEditor } from "@/lib/StoreProvider";
+import { useReadOnly } from "@/compound/ReadOnlyContext";
 import { SlideView } from "./SlideView";
 import { SLIDE_W } from "@/lib/types";
 
@@ -16,6 +17,7 @@ export function GridView() {
   const selectSlide = useEditor((s) => s.selectSlide);
   const addSlide = useEditor((s) => s.addSlide);
   const setView = useEditor((s) => s.setView);
+  const readOnly = useReadOnly();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -191,40 +193,43 @@ export function GridView() {
             );
           })}
 
-          <button
-            onClick={() => addSlide()}
-            aria-label="Add new slide"
-            style={{
-              width: thumbW,
-              aspectRatio: `${SLIDE_W} / 1080`,
-              borderRadius: 14,
-              border: "2px dashed var(--border-dashed)",
-              background: "transparent",
-              color: "var(--ink-muted)",
-              cursor: "pointer",
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 8,
-              fontSize: 13,
-              fontWeight: 500,
-              transition: "border-color 120ms, color 120ms, background 120ms",
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.borderColor = "var(--accent)";
-              e.currentTarget.style.color = "var(--accent)";
-              e.currentTarget.style.background = "var(--accent-soft)";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.borderColor = "var(--border-dashed)";
-              e.currentTarget.style.color = "var(--ink-muted)";
-              e.currentTarget.style.background = "transparent";
-            }}
-          >
-            <Plus size={20} />
-            New Slide
-          </button>
+          {!readOnly && (
+            <button
+              onClick={() => addSlide()}
+              aria-label="Add new slide"
+              style={{
+                width: thumbW,
+                aspectRatio: `${SLIDE_W} / 1080`,
+                borderRadius: 14,
+                border: "2px dashed var(--border-dashed)",
+                background: "transparent",
+                color: "var(--ink-muted)",
+                cursor: "pointer",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 8,
+                fontSize: 13,
+                fontWeight: 500,
+                transition:
+                  "border-color 120ms, color 120ms, background 120ms",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = "var(--accent)";
+                e.currentTarget.style.color = "var(--accent)";
+                e.currentTarget.style.background = "var(--accent-soft)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = "var(--border-dashed)";
+                e.currentTarget.style.color = "var(--ink-muted)";
+                e.currentTarget.style.background = "transparent";
+              }}
+            >
+              <Plus size={20} />
+              New Slide
+            </button>
+          )}
         </div>
       </div>
     </div>

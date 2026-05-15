@@ -59,14 +59,36 @@ export interface SlidewiseEditorProps {
   onSaveError?: (err: Error) => void;
   /** Reserved for future use; not enforced yet. */
   readOnly?: boolean;
+  /**
+   * High-level preset for the editor chrome. Defaults to `"edit"`.
+   *
+   * - `"edit"` — full editor: top bar, side rail with add-slide button +
+   *   slide numbers, bottom tool selector.
+   * - `"preview"` — read-only chrome: hides the bottom tool selector and
+   *   the add-slide button, sets `readOnly`, and trims the top bar to
+   *   just the title and play button. Per-flag props below still win
+   *   when explicitly set, so hosts can layer on top of the preset
+   *   (e.g. `mode="preview" showBottomToolbar`).
+   *
+   * Canvas-level edit prevention (selection, drag, text editing) is
+   * not yet wired to `readOnly`; today the preset only changes the
+   * editor chrome.
+   */
+  mode?: "edit" | "preview";
   /** "light" or "dark"; defaults to "light". Ignored after first render. */
   theme?: "light" | "dark";
   /** Slide id to land on; falls back to the first slide. */
   initialSlideId?: string;
   /** Render the built-in top bar (title, undo/redo, save, play). Default true. */
   showTopBar?: boolean;
-  /** Render the floating bottom toolbar (tool selector). Default true. */
+  /** Render the floating bottom toolbar (tool selector). Default true in edit, false in preview. */
   showBottomToolbar?: boolean;
+  /** Hide the "New Slide" button at the bottom of the side rail. Default false in edit, true in preview. */
+  hideAddButton?: boolean;
+  /** Hide the slide-number badges on side-rail thumbnails. Default false. */
+  hideSlideNumbers?: boolean;
+  /** Hide the leading "Smart" pill in the top bar title. Default false in edit, true in preview. */
+  hideSmart?: boolean;
   /** Override the bundled Geist font; sets `--font-geist-sans` on the root. */
   fontFamily?: string;
   /**
@@ -149,10 +171,14 @@ export const SlidewiseEditor = forwardRef<
     onSaveSuccess,
     onSaveError,
     readOnly,
+    mode = "edit",
     theme,
     initialSlideId,
     showTopBar = true,
-    showBottomToolbar = true,
+    showBottomToolbar,
+    hideAddButton,
+    hideSlideNumbers,
+    hideSmart,
     fontFamily,
     reduceMotion,
     transition,
@@ -165,6 +191,12 @@ export const SlidewiseEditor = forwardRef<
   },
   ref
 ) {
+  const isPreview = mode === "preview";
+  const effectiveReadOnly = readOnly ?? isPreview;
+  const effectiveShowBottomToolbar = showBottomToolbar ?? !isPreview;
+  const effectiveHideAddButton = hideAddButton ?? isPreview;
+  const effectiveHideSmart = hideSmart ?? isPreview;
+
   const rootProps: SlidewiseRootProps = {
     deck,
     onChange,
@@ -178,7 +210,7 @@ export const SlidewiseEditor = forwardRef<
     onSaveStart,
     onSaveSuccess,
     onSaveError,
-    readOnly,
+    readOnly: effectiveReadOnly,
     theme,
     initialSlideId,
     fontFamily,
@@ -194,12 +226,20 @@ export const SlidewiseEditor = forwardRef<
 
   return (
     <Root {...rootProps} ref={ref}>
-      {showTopBar && <TopBar />}
+      {showTopBar && (
+        <TopBar
+          hide={isPreview ? ["themeToggle", "export"] : undefined}
+          hideSmart={effectiveHideSmart}
+        />
+      )}
       <Body>
-        <SlideRail />
+        <SlideRail
+          hideAddButton={effectiveHideAddButton}
+          hideNumbers={hideSlideNumbers}
+        />
         <CanvasFrame>
           <Canvas />
-          {showBottomToolbar && <BottomToolbar />}
+          {effectiveShowBottomToolbar && <BottomToolbar />}
         </CanvasFrame>
       </Body>
     </Root>

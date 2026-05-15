@@ -39,6 +39,8 @@ const STORAGE_KEY = "slidewise-deck";
 
 type DemoId =
   | "default"
+  | "preview-mode"
+  | "sidebar-only"
   | "no-bottom-toolbar"
   | "right-panel"
   | "retheme"
@@ -59,6 +61,18 @@ const DEMOS: Demo[] = [
     label: "Default",
     description:
       "<SlidewiseEditor /> renders the standard tree — top bar, slide rail, canvas, and bottom toolbar.",
+  },
+  {
+    id: "preview-mode",
+    label: "Preview mode",
+    description:
+      "<SlidewiseEditor mode=\"preview\" /> — fully inert. Top bar shows only Title + Play, no add-slide button, no bottom toolbar, no element selection / drag / text edit on the canvas.",
+  },
+  {
+    id: "sidebar-only",
+    label: "Sidebar only",
+    description:
+      "Compound API rendering only the side rail with hideAddButton + hideNumbers. Useful as a slide-picker embed.",
   },
   {
     id: "no-bottom-toolbar",
@@ -411,6 +425,42 @@ function DemoSurface({ demoId, deck, editorRef, onSave, onExport }: DemoProps) {
         onSave={onSave}
         onExport={onExport}
       />
+    );
+  }
+
+  if (demoId === "preview-mode") {
+    return (
+      <SlidewiseEditor
+        ref={editorRef}
+        deck={deck}
+        mode="preview"
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      />
+    );
+  }
+
+  if (demoId === "sidebar-only") {
+    return (
+      <Root
+        ref={editorRef}
+        deck={deck}
+        readOnly
+        onChange={onChangeLog}
+        onSave={onSave}
+        onExport={onExport}
+      >
+        <Body>
+          <SlideRail
+            hideHeader
+            hideAddButton
+            hideNumbers
+            width={420}
+            thumbnailWidth={372}
+          />
+        </Body>
+      </Root>
     );
   }
 

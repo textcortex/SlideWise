@@ -16,6 +16,10 @@ export interface SlideRailProps {
   hideHeader?: boolean;
   /** Omit the "New Slide" button. */
   hideAddButton?: boolean;
+  /** Omit the per-thumbnail slide-number badge. */
+  hideNumbers?: boolean;
+  /** Pixel width for each slide thumbnail. Defaults to 132. */
+  thumbnailWidth?: number;
 }
 
 /**
@@ -38,11 +42,13 @@ function DefaultSlideRail({
   width,
   hideHeader,
   hideAddButton,
+  hideNumbers,
+  thumbnailWidth,
 }: SlideRailProps = {}) {
   return (
     <Root className={className} style={style} width={width}>
       {!hideHeader && <Header />}
-      <List />
+      <List hideNumber={hideNumbers} thumbnailWidth={thumbnailWidth} />
       {!hideAddButton && <AddButton />}
     </Root>
   );
