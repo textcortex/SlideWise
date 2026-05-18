@@ -3,6 +3,7 @@ import {
   useEffect,
   useId,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -15,6 +16,7 @@ import {
   useEditorStore,
 } from "@/lib/StoreProvider";
 import { collectFontFamilies, ensureGoogleFontsLoaded } from "@/lib/fonts";
+import { resolveJsonDeck } from "@/lib/schema/json";
 import type { Deck } from "@/lib/types";
 import { GridView } from "@/components/editor/GridView";
 import { PlayMode } from "@/components/editor/PlayMode";
@@ -39,8 +41,22 @@ export interface SlidewiseRootProps {
    * Deck to load on mount. Pass a new reference only when you intend to
    * reset the editor's state (e.g. discard changes, load a different file)
    * — passing a new reference on every `onChange` would loop.
+   *
+   * One of `deck` or `jsonDeck` is required.
    */
-  deck: Deck;
+  deck?: Deck;
+  /**
+   * Deck supplied as JSON — either a `Deck` object or a JSON string. This is
+   * the AI-facing entry point: feed model output directly without manually
+   * calling `JSON.parse` or `migrate()`. The input is parsed (if a string)
+   * and run through `migrate()` to upgrade older schema versions.
+   *
+   * Takes precedence over `deck` when both are provided. Like `deck`, the
+   * value should only change when you intentionally want to reset the
+   * editor's state — pass a stable reference (or stable string) on subsequent
+   * renders to avoid re-loading on every commit.
+   */
+  jsonDeck?: Deck | string;
   /** Fires after every committed mutation. */
   onChange?: (deck: Deck) => void;
   /** Fires when the user invokes save (top bar button or imperative API). */
@@ -222,14 +238,29 @@ export interface SlidewiseRootHandle {
  * which is just `<Slidewise.Root>` rendering the standard layout.
  */
 export const Root = forwardRef<SlidewiseRootHandle, PropsWithChildren<SlidewiseRootProps>>(
-  function SlidewiseRoot(props, ref) {
+  function SlidewiseRoot({ deck, jsonDeck, ...rest }, ref) {
+    const resolvedDeck = useMemo(
+      () => resolveInputDeck(deck, jsonDeck),
+      [deck, jsonDeck]
+    );
     return (
-      <EditorStoreProvider initialDeck={props.deck}>
-        <RootInner {...props} forwardedRef={ref} />
+      <EditorStoreProvider initialDeck={resolvedDeck}>
+        <RootInner {...rest} deck={resolvedDeck} forwardedRef={ref} />
       </EditorStoreProvider>
     );
   }
 );
+
+function resolveInputDeck(
+  deck: Deck | undefined,
+  jsonDeck: Deck | string | undefined
+): Deck {
+  if (jsonDeck !== undefined) return resolveJsonDeck(jsonDeck);
+  if (deck !== undefined) return deck;
+  throw new Error(
+    "Slidewise: <Root> requires either a `deck` or `jsonDeck` prop."
+  );
+}
 
 function RootInner({
   deck,
@@ -258,7 +289,9 @@ function RootInner({
   style,
   children,
   forwardedRef,
-}: PropsWithChildren<SlidewiseRootProps> & {
+}: PropsWithChildren<Omit<SlidewiseRootProps, "deck" | "jsonDeck">> & {
+  /** Resolved deck — always provided by the outer `Root`. */
+  deck: Deck;
   forwardedRef: Ref<SlidewiseRootHandle>;
 }) {
   const store = useEditorStore();

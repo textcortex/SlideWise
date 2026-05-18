@@ -30,8 +30,25 @@ export interface SlidewiseEditorProps {
    * `onChange` — that would loop. Hold the deck in a stable ref, and
    * only pass a new one when you intentionally want to reset the editor
    * (e.g. discard changes, load a different file).
+   *
+   * One of `deck` or `jsonDeck` is required.
    */
-  deck: Deck;
+  deck?: Deck;
+  /**
+   * Deck supplied as JSON — either a `Deck` object or a JSON string. This
+   * is the AI-facing entry point: feed model output directly without
+   * manually calling `JSON.parse` or `migrate()`. The value is parsed (if
+   * a string) and run through `migrate()` so older schema versions are
+   * upgraded transparently.
+   *
+   * Takes precedence over `deck` when both are provided. Pass a stable
+   * reference (or stable string) on subsequent renders — changing it
+   * resets the editor's internal state, same as swapping `deck`.
+   *
+   * The JSON shape is the public `Deck` type exported from this package.
+   * Use it as the schema your LLM targets when generating new decks.
+   */
+  jsonDeck?: Deck | string;
   /** Fires after every committed mutation; receives the updated deck. */
   onChange?: (deck: Deck) => void;
   /** Fires when the user clicks "Save" in the top bar. */
@@ -159,6 +176,7 @@ export const SlidewiseEditor = forwardRef<
 >(function SlidewiseEditor(
   {
     deck,
+    jsonDeck,
     onChange,
     onSave,
     onExport,
@@ -199,6 +217,7 @@ export const SlidewiseEditor = forwardRef<
 
   const rootProps: SlidewiseRootProps = {
     deck,
+    jsonDeck,
     onChange,
     onSave,
     onExport,
