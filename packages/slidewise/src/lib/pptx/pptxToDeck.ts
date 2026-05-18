@@ -90,6 +90,12 @@ interface ParseContext {
   diagnostics: ParseDiagnostics;
   zip: JSZip;
   slidePath: string;
+  /**
+   * 1-based slide index used to materialise `<a:fld type="slidenum">` field
+   * placeholders. Master/layout slidenum fields inherit this slide's value
+   * when they show through the underlay.
+   */
+  slideNumber: number;
   slideRels: Rels;
   fit: Fit;
   theme: ThemeColors;
@@ -278,10 +284,12 @@ export async function parsePptx(
     await readTableStyles(zip, presentationRels);
 
   const slides: Slide[] = [];
-  for (const slidePath of slidePaths) {
+  for (let si = 0; si < slidePaths.length; si++) {
+    const slidePath = slidePaths[si];
     const slide = await parseSlide(
       zip,
       slidePath,
+      si + 1,
       diagnostics,
       fit,
       tableStyles,
@@ -408,7 +416,10 @@ export function snapshotElement(element: SlideElement): string {
     fill: e.fill,
     stroke: e.stroke,
     strokeWidth: e.strokeWidth,
+    strokeDash: e.strokeDash,
     radius: e.radius,
+    paragraphs: e.paragraphs,
+    padding: e.padding,
     src: e.src,
     fit: e.fit,
     crop: e.crop,
@@ -466,6 +477,7 @@ async function toArrayBuffer(
 async function parseSlide(
   zip: JSZip,
   slidePath: string,
+  slideNumber: number,
   diagnostics: ParseDiagnostics,
   fit: Fit,
   tableStyles: Map<string, TableStyleRaw>,
@@ -536,6 +548,7 @@ async function parseSlide(
     diagnostics,
     zip,
     slidePath,
+    slideNumber,
     slideRels,
     fit,
     theme,
@@ -587,16 +600,27 @@ async function parseSlide(
   // slide. The serializer reads that registry by slide id at save time.
   const slideId = nanoid(8);
   const slidePhKeys = collectSlidePlaceholderKeys(spTree);
-  const masterUnderlay = masterXml
-    ? await parseUnderlay(
-        masterXml["p:sldMaster"]?.["p:cSld"]?.["p:spTree"],
-        ctx,
-        masterPath!,
-        masterRels,
-        slidePhKeys,
-        slideId
-      )
-    : [];
+  // showMasterSp on either the slide or its layout (default 1) suppresses the
+  // slide master's decorative shapes. The title slide in this deck sets it
+  // on the layout to hide the master's tick/corner marks.
+  const slideShowMaster =
+    sld?.["@_showMasterSp"] !== "0" && sld?.["@_showMasterSp"] !== 0;
+  const layoutSldEl = layoutXml?.["p:sldLayout"];
+  const layoutShowMaster =
+    layoutSldEl?.["@_showMasterSp"] !== "0" &&
+    layoutSldEl?.["@_showMasterSp"] !== 0;
+  const includeMasterUnderlay = slideShowMaster && layoutShowMaster;
+  const masterUnderlay =
+    masterXml && includeMasterUnderlay
+      ? await parseUnderlay(
+          masterXml["p:sldMaster"]?.["p:cSld"]?.["p:spTree"],
+          ctx,
+          masterPath!,
+          masterRels,
+          slidePhKeys,
+          slideId
+        )
+      : [];
   const layoutUnderlay = layoutXml
     ? await parseUnderlay(
         layoutXml["p:sldLayout"]?.["p:cSld"]?.["p:spTree"],
@@ -948,15 +972,63 @@ async function parseSpOrText(
   const prstGeom = sp?.["p:spPr"]?.["a:prstGeom"];
   const presetName = prstGeom?.["@_prst"];
   const custGeom = sp?.["p:spPr"]?.["a:custGeom"];
-  const customPath = custGeom ? parseCustGeomPath(custGeom) : undefined;
+  const flipH = xfrm?.["@_flipH"] === "1";
+  const flipV = xfrm?.["@_flipV"] === "1";
+  let customPath = custGeom ? parseCustGeomPath(custGeom) : undefined;
+  // Parametric preset arcs (<a:prstGeom prst="arc">) carry their start/end
+  // angles in <a:avLst><a:gd>. Synthesise an SVG arc path so they render as
+  // the curve they actually describe instead of falling back to the bounding
+  // rectangle. flipH/flipV bake into the path coords so the shape's rotation
+  // value still drives a single CSS rotate.
+  if (!customPath && presetName === "arc") {
+    customPath = buildArcPath(prstGeom, flipH, flipV);
+  }
+  // Parametric chevron/pentagon arrow shapes drive the slide template's
+  // process-bar visuals; the spec gives the polygon's 6 vertices in terms of
+  // a single `adj` percentage (0..100% of the shorter side) controlling the
+  // left-side notch depth.
+  if (
+    !customPath &&
+    geom &&
+    (presetName === "chevron" ||
+      presetName === "homePlate" ||
+      presetName === "pentagon")
+  ) {
+    customPath = buildChevronPath(
+      prstGeom,
+      presetName,
+      geom.w,
+      geom.h,
+      flipH,
+      flipV
+    );
+  }
+  // Cube: three-face isometric box. The OOXML preset emits front/top/right as
+  // separate sub-paths sharing edges at the inner corner — encoding all three
+  // as `M…Z` sub-paths in one SVG <path> draws the 3D outline (inner edges
+  // appear because each face is stroked independently).
+  if (!customPath && geom && presetName === "cube") {
+    customPath = buildCubePath(prstGeom, geom.w, geom.h, flipH, flipV);
+  }
+  // Ellipse/circle: synthesise the silhouette so a text-bearing oval (central
+  // hub of a process diagram, lozenge labels, etc.) keeps its rounded shape
+  // when isText routes it through the text branch. Without a backing path,
+  // we'd render only a rectangular text box and lose the visual.
+  if (
+    !customPath &&
+    geom &&
+    (presetName === "ellipse" || presetName === "circle")
+  ) {
+    customPath = buildEllipsePath(geom.w, geom.h);
+  }
 
   // Lines are sometimes authored as <p:sp prst="line">.
   if (presetName === "line" || presetName === "straightConnector1") {
-    const flipV = xfrm?.["@_flipV"] === "1";
     return makeLineFromGeometry(
       geom,
       sp?.["p:spPr"]?.["a:ln"],
       ctx,
+      flipH,
       flipV
     );
   }
@@ -973,7 +1045,30 @@ async function parseSpOrText(
   void opts;
 
   if (isText) {
-    return makeTextElement(sp, txBody, geom, ctx, ph, layoutPh, masterPh);
+    const el = makeTextElement(sp, txBody, geom, ctx, ph, layoutPh, masterPh);
+    // PowerPoint nests text inside non-rectangular shapes (chevrons, cubes,
+    // arcs, custom glyphs) for things like process bars and badge labels.
+    // When the slide-level shape carries a path-based silhouette plus a
+    // fill, render it as the text element's backing — otherwise we'd keep
+    // the text but drop the shape entirely.
+    if (customPath) {
+      const fill =
+        extractShapeFill(sp?.["p:spPr"], ctx.theme) ??
+        resolveStyleFillRef(sp, ctx);
+      if (fill && fill !== "transparent") {
+        el.backingPath = {
+          d: customPath.d,
+          viewW: customPath.viewW,
+          viewH: customPath.viewH,
+          fill,
+          fillRule: customPath.fillRule,
+        };
+        // The path now owns the rendered fill — drop any flat background
+        // the placeholder-fallback path may have set so we don't double up.
+        el.background = undefined;
+      }
+    }
+    return el;
   }
 
   // Fill / stroke. Use placeholder-inherited spPr if slide spPr is empty.
@@ -990,6 +1085,15 @@ async function parseSpOrText(
   const strokeWidthEmu =
     !lineHasNoFill && lineProps?.["@_w"]
       ? Number(lineProps["@_w"])
+      : undefined;
+  const strokeDashRaw = lineHasNoFill
+    ? undefined
+    : lineProps?.["a:prstDash"]?.["@_val"];
+  const strokeDash =
+    typeof strokeDashRaw === "string" &&
+    strokeDashRaw.length > 0 &&
+    strokeDashRaw !== "solid"
+      ? strokeDashRaw
       : undefined;
 
   const kind = mapPrstToKind(presetName);
@@ -1010,6 +1114,7 @@ async function parseSpOrText(
       strokeWidth: strokeWidthEmu
         ? Math.max(1, Math.round(emuToPx(strokeWidthEmu) * ctx.fit.scale))
         : undefined,
+      strokeDash,
       ...(customPath ? { path: customPath } : {}),
     };
     return fallback;
@@ -1039,6 +1144,7 @@ async function parseSpOrText(
     strokeWidth: strokeWidthEmu
       ? Math.max(1, Math.round(emuToPx(strokeWidthEmu) * ctx.fit.scale))
       : undefined,
+    strokeDash,
     radius,
   };
   return shape;
@@ -1119,7 +1225,8 @@ function makeTextElement(
     fallbackPPr,
     ctx.themeFonts,
     listStyle,
-    autoFit
+    autoFit,
+    ctx.slideNumber
   );
   const first = text.runs[0];
   // Each layer of the inheritance chain may set @algn independently — a
@@ -1203,6 +1310,63 @@ function makeTextElement(
       : 0,
     ...(hasMixedFormatting ? { runs } : {}),
   };
+  // Surface per-paragraph layout when any paragraph carries a hanging-indent
+  // pair (marL + negative indent) — that's the signal for a bulleted list
+  // where wrapped lines should align under the text after the bullet, not
+  // back at column 0. Other paragraphs in the same element ride along so
+  // they keep their alignment/spacing.
+  const wantsPerParagraph = text.paragraphs.some(
+    (pp) =>
+      (pp.marL ?? 0) !== 0 || (pp.indent ?? 0) !== 0 || pp.align !== undefined
+  );
+  if (wantsPerParagraph && text.paragraphs.length > 0) {
+    el.paragraphs = text.paragraphs.map((pp, ppi) => {
+      // `extractRuns` appends a trailing "\n" to the last run of every
+      // non-final paragraph so the flat-text renderer still sees paragraph
+      // breaks. In paragraph-aware rendering each item is its own block, so
+      // the trailing newline would render an extra blank line — strip it.
+      const pRuns: TextRun[] = pp.runs.map((r, ri) => {
+        let raw = r.text;
+        const isLast = ri === pp.runs.length - 1;
+        if (isLast && raw.endsWith("\n")) raw = raw.slice(0, -1);
+        return {
+          text: raw,
+          fontFamily: r.fontFamily,
+          fontSize: r.fontSize
+            ? Math.max(6, Math.round(r.fontSize * scale))
+            : undefined,
+          fontWeight: r.bold ? 700 : r.bold === false ? 400 : undefined,
+          italic: r.italic,
+          underline: r.underline,
+          strike: r.strike,
+          color: r.color,
+          letterSpacing: r.letterSpacing
+            ? Math.round(r.letterSpacing * scale)
+            : undefined,
+        };
+      });
+      return {
+        text: pp.text,
+        marL:
+          pp.marL !== undefined
+            ? Math.round(emuToPx(pp.marL) * ctx.fit.scale)
+            : undefined,
+        indent:
+          pp.indent !== undefined
+            ? Math.round(emuToPx(pp.indent) * ctx.fit.scale)
+            : undefined,
+        align: pp.align,
+        runs: pRuns.length ? pRuns : undefined,
+        // Drop the first paragraph's spaceBefore — the outer flex container
+        // already vertically anchors the block, so a leading gap reads as
+        // an alignment bug.
+        spaceBefore:
+          ppi === 0 || pp.spaceBeforePoints === undefined
+            ? undefined
+            : Math.round(pointsToPx(pp.spaceBeforePoints) * ctx.fit.scale),
+      };
+    });
+  }
   // Inner padding from <a:bodyPr lIns/tIns/rIns/bIns>. PowerPoint applies
   // these as text-box insets (the typographic equivalent of CSS padding).
   // Default values in OOXML are 91440 / 45720 / 91440 / 45720 EMU. The
@@ -1223,11 +1387,22 @@ function makeTextElement(
   const tIns = readIns("tIns", 45720);
   const rIns = readIns("rIns", 91440);
   const bIns = readIns("bIns", 45720);
+  // PowerPoint constrains text wrap to the shape's inscribed `txRect`, not
+  // its bounding box. For non-rectangular presets (chevron's left notch +
+  // right arrow tip), that pulls the usable text area inward — without
+  // this, a centred long phrase overflows into the icon/arrow regions.
+  // Only the inscribed-rectangle insets we can derive from `adj` are added;
+  // the explicit bodyPr insets stay on top.
+  const presetTxRect = inscribedTextInsets(
+    sp?.["p:spPr"]?.["a:prstGeom"],
+    geom.w,
+    geom.h
+  );
   const padding = {
-    l: Math.round(emuToPx(lIns) * ctx.fit.scale),
-    t: Math.round(emuToPx(tIns) * ctx.fit.scale),
-    r: Math.round(emuToPx(rIns) * ctx.fit.scale),
-    b: Math.round(emuToPx(bIns) * ctx.fit.scale),
+    l: Math.round(emuToPx(lIns) * ctx.fit.scale) + presetTxRect.l,
+    t: Math.round(emuToPx(tIns) * ctx.fit.scale) + presetTxRect.t,
+    r: Math.round(emuToPx(rIns) * ctx.fit.scale) + presetTxRect.r,
+    b: Math.round(emuToPx(bIns) * ctx.fit.scale) + presetTxRect.b,
   };
   if (padding.l || padding.t || padding.r || padding.b) {
     el.padding = padding;
@@ -1526,14 +1701,22 @@ function parseCxn(
   const xfrm = cxn?.["p:spPr"]?.["a:xfrm"];
   const geom = readGeometry(xfrm, ctx.fit, outer);
   if (!geom) return null;
+  const flipH = xfrm?.["@_flipH"] === "1";
   const flipV = xfrm?.["@_flipV"] === "1";
-  return makeLineFromGeometry(geom, cxn?.["p:spPr"]?.["a:ln"], ctx, flipV);
+  return makeLineFromGeometry(
+    geom,
+    cxn?.["p:spPr"]?.["a:ln"],
+    ctx,
+    flipH,
+    flipV
+  );
 }
 
 function makeLineFromGeometry(
   geom: { x: number; y: number; w: number; h: number; rotation: number },
   lineProps: any,
   ctx: ParseContext,
+  flipH: boolean,
   flipV: boolean
 ): LineElement {
   const stroke = resolveColor(lineProps?.["a:solidFill"], ctx.theme) ?? "#0E1330";
@@ -1555,9 +1738,15 @@ function makeLineFromGeometry(
   const isArrowType = (t: unknown) =>
     typeof t === "string" && t.length > 0 && t !== "none";
   const arrow = isArrowType(headType) || isArrowType(tailType);
+  // Lines use signed w/h to encode direction: a positive pair draws from the
+  // bounding box's top-left to bottom-right; a flip inverts that axis so the
+  // line slopes the other way. PPTX `<a:xfrm flipH/flipV="1"/>` does the
+  // same — propagate both, not just flipV (slides like the 7-S diagram use
+  // flipH liberally on the connecting struts).
+  const rawW = flipH ? -geom.w : geom.w;
   const rawH = flipV ? -geom.h : geom.h;
-  const w = geom.w === 0 ? 1 : geom.w;
-  const h = Math.abs(rawH) === 0 ? 1 : rawH;
+  const w = Math.abs(rawW) === 0 ? (flipH ? -1 : 1) : rawW;
+  const h = Math.abs(rawH) === 0 ? (flipV ? -1 : 1) : rawH;
   const line: LineElement = {
     id: nanoid(8),
     type: "line",
@@ -2540,10 +2729,26 @@ function extractShapeFill(spPr: any, theme: ThemeColors): string | undefined {
     if (pathNode) {
       const pathType = pathNode["@_path"];
       const ftr = pathNode["a:fillToRect"];
-      const lIn = Number(ftr?.["@_l"] ?? 0) / 1000;
-      const tIn = Number(ftr?.["@_t"] ?? 0) / 1000;
-      const rIn = Number(ftr?.["@_r"] ?? 0) / 1000;
-      const bIn = Number(ftr?.["@_b"] ?? 0) / 1000;
+      // ST_PositiveFixedPercentage accepts either thousandths-of-percent as an
+      // integer (e.g. 100000 = 100%) or a percentage literal ("100%"). The
+      // latter is what PowerPoint emits in modern files; parseFloat("0%") → 0.
+      const parsePct = (v: unknown): number => {
+        if (v === undefined || v === null) return 0;
+        if (typeof v === "number") return v / 1000;
+        if (typeof v === "string") {
+          if (v.endsWith("%")) {
+            const n = parseFloat(v);
+            return Number.isFinite(n) ? n : 0;
+          }
+          const n = Number(v);
+          return Number.isFinite(n) ? n / 1000 : 0;
+        }
+        return 0;
+      };
+      const lIn = parsePct(ftr?.["@_l"]);
+      const tIn = parsePct(ftr?.["@_t"]);
+      const rIn = parsePct(ftr?.["@_r"]);
+      const bIn = parsePct(ftr?.["@_b"]);
       const focusX = clampPct((lIn + (100 - rIn)) / 2);
       const focusY = clampPct((tIn + (100 - bIn)) / 2);
       // path="circle" — a true geometric circle in CSS terms (so the blob
@@ -2773,6 +2978,16 @@ interface RunInfo {
   letterSpacing?: number;
 }
 
+interface ParagraphInfo {
+  text: string;
+  runs: RunInfo[];
+  align?: "left" | "center" | "right";
+  marL?: number;
+  indent?: number;
+  /** `<a:spcBef><a:spcPts val="…"/>`: 100ths of a point. */
+  spaceBeforePoints?: number;
+}
+
 function extractRuns(
   txBody: any,
   theme: ThemeColors,
@@ -2780,18 +2995,21 @@ function extractRuns(
   fallbackPPr?: any,
   themeFonts: ThemeFonts = {},
   listStyle: (any | undefined)[][] = [],
-  autoFit?: AutoFit
+  autoFit?: AutoFit,
+  slideNumber?: number
 ): {
   runs: RunInfo[];
   plain: string;
   align?: "left" | "center" | "right";
   lineHeightPct?: number;
+  paragraphs: ParagraphInfo[];
 } {
   const runs: RunInfo[] = [];
   let align: "left" | "center" | "right" | undefined;
   let lineHeightPct: number | undefined;
   const paragraphs = asArray(txBody?.["a:p"]);
   const pieces: string[] = [];
+  const paragraphInfos: ParagraphInfo[] = [];
   const autoNumCounters = new Map<number, number>();
   let prevAutoKey: string | undefined;
 
@@ -2802,11 +3020,36 @@ function extractRuns(
     const levelChain = listStyle[lvl] ?? [];
     const findLevel = (k: string): any =>
       [pPr, ...levelChain, fallbackPPr].find((s) => s?.[k] !== undefined);
+    // PPTX hanging-indent: `marL` is left margin from the bodyPr area;
+    // `indent` is the first-line indent (negative = bullet hangs left of
+    // wrapped text). Both are EMU, inherited along the pPr → list → fallback
+    // chain. Captured per-paragraph so the renderer can apply CSS
+    // padding-left + text-indent on each line of items.
+    const readEmu = (key: string): number | undefined => {
+      const src = [pPr, ...levelChain, fallbackPPr].find(
+        (s) => s?.[`@_${key}`] !== undefined
+      );
+      const raw = src?.[`@_${key}`];
+      return raw !== undefined ? Number(raw) : undefined;
+    };
+    const paraMarL = readEmu("marL");
+    const paraIndent = readEmu("indent");
+    const paraAlign =
+      readAlign(pPr) ??
+      readAlign(levelChain.find((s) => s?.["@_algn"])) ??
+      readAlign(fallbackPPr);
+    // `<a:spcBef><a:spcPts val="600"/></a:spcBef>` → 6 points before this
+    // paragraph. The other variant `<a:spcPct val="100000"/>` is line-height
+    // and is read separately above.
+    const spcBefSrc = [pPr, ...levelChain, fallbackPPr].find(
+      (s) => s?.["a:spcBef"] !== undefined
+    );
+    const spcBefPts =
+      spcBefSrc?.["a:spcBef"]?.["a:spcPts"]?.["@_val"] !== undefined
+        ? Number(spcBefSrc["a:spcBef"]["a:spcPts"]["@_val"]) / 100
+        : undefined;
     if (!align) {
-      align =
-        readAlign(pPr) ??
-        readAlign(levelChain.find((s) => s?.["@_algn"])) ??
-        readAlign(fallbackPPr);
+      align = paraAlign;
     }
     if (lineHeightPct === undefined) {
       const src = findLevel("a:lnSpc");
@@ -2836,8 +3079,19 @@ function extractRuns(
     const paragraphText: string[] = [];
     if (prefix.text) paragraphText.push(prefix.text);
 
-    const onRun = (r: any) => {
+    const onRun = (r: any, isFld: boolean) => {
       const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+      // PowerPoint stores field placeholders as <a:fld type="…"> with a
+      // template literal in <a:t> (e.g. "‹#›" for slidenum). The literal is
+      // only meant for design-time display; renderers replace it with the
+      // resolved value. We only handle slidenum here — datetime fields keep
+      // whatever literal the author embedded since we don't know the locale
+      // they intended.
+      if (isFld && r?.["@_type"] === "slidenum" && slideNumber !== undefined) {
+        const num = String(slideNumber);
+        built.run.text = num;
+        built.text = num;
+      }
       if (autoFit?.fontScale && built.run.fontSize) {
         built.run.fontSize *= autoFit.fontScale;
       }
@@ -2859,10 +3113,10 @@ function extractRuns(
         }
         const source = entry.kind === "r" ? rs : flds;
         const r = source[entry.index];
-        if (r) onRun(r);
+        if (r) onRun(r, entry.kind === "fld");
       }
     } else {
-      for (const r of rs) onRun(r);
+      for (const r of rs) onRun(r, false);
     }
 
     // Prepend the bullet prefix to the first run of this paragraph so it
@@ -2879,12 +3133,21 @@ function extractRuns(
     }
 
     pieces.push(paragraphText.join(""));
+    paragraphInfos.push({
+      text: paragraphText.join(""),
+      runs: runs.slice(paraStart),
+      align: paraAlign,
+      marL: paraMarL,
+      indent: paraIndent,
+      spaceBeforePoints: spcBefPts,
+    });
   }
   return {
     runs,
     plain: pieces.join("\n"),
     align,
     lineHeightPct,
+    paragraphs: paragraphInfos,
   };
 }
 
@@ -3086,15 +3349,41 @@ function paragraphChildOrder(
   p: any
 ): { kind: "r" | "br" | "fld"; index: number }[] {
   const raw = (p as any)?._rawSrc as string | undefined;
-  if (raw) return paragraphChildOrderFromRaw(raw);
-  // No raw available (paragraph has no <a:br/> and pre-PR-2 readXml didn't
-  // attach it). Fall back to the order implied by the parsed arrays: all
-  // runs, then all fields. Document order across these tag types is lost
-  // by fast-xml-parser, but the typical PPTX paragraph has either runs or
-  // a field, not both, so this matches reality in practice.
+  if (raw) {
+    const order = paragraphChildOrderFromRaw(raw);
+    // Defensive: if the raw scan missed the <a:br>s (e.g. a paragraph block
+    // that didn't get its _rawSrc paired correctly), the parsed `a:br` array
+    // is still authoritative for COUNT. Fall back to the heuristic ordering
+    // so the breaks aren't dropped — losing them turns "FOO\nBAR" into
+    // "FOOBAR" which looks like a wrap bug rather than a missing newline.
+    const expectedBr = asArray(p?.["a:br"]).length;
+    const seenBr = order.filter((e) => e.kind === "br").length;
+    if (expectedBr > 0 && seenBr < expectedBr) {
+      return paragraphChildOrderHeuristic(p);
+    }
+    return order;
+  }
+  return paragraphChildOrderHeuristic(p);
+}
+
+function paragraphChildOrderHeuristic(
+  p: any
+): { kind: "r" | "br" | "fld"; index: number }[] {
+  // Exact interleaving is lost (fast-xml-parser groups by tag), but a forced
+  // line break (<a:br/>) between two runs is far more common than e.g. two
+  // consecutive runs followed by two consecutive breaks — emit runs and
+  // breaks alternately, then dump any remainder. Better than silently
+  // dropping breaks (which causes "FOO\nBAR" to collapse into "FOOBAR").
   const out: { kind: "r" | "br" | "fld"; index: number }[] = [];
-  asArray(p?.["a:r"]).forEach((_, i) => out.push({ kind: "r", index: i }));
-  asArray(p?.["a:fld"]).forEach((_, i) => out.push({ kind: "fld", index: i }));
+  const rs = asArray(p?.["a:r"]);
+  const brs = asArray(p?.["a:br"]);
+  const flds = asArray(p?.["a:fld"]);
+  const maxRun = Math.max(rs.length, brs.length);
+  for (let i = 0; i < maxRun; i++) {
+    if (i < rs.length) out.push({ kind: "r", index: i });
+    if (i < brs.length) out.push({ kind: "br", index: i });
+  }
+  flds.forEach((_, i) => out.push({ kind: "fld", index: i }));
   return out;
 }
 
@@ -3342,6 +3631,202 @@ function mergeRPrChain(...candidates: (any | undefined)[]): any | undefined {
  * null only for shapes we genuinely cannot represent at all (the caller then
  * falls back to a colored rect to preserve visibility).
  */
+/**
+ * Synthesise an SVG arc path from <a:prstGeom prst="arc">. The two adjustment
+ * values are start/end angles in 60000ths of a degree; defaults per spec are
+ * adj1=270° (top of ellipse) and adj2=0° (right). The sweep runs clockwise
+ * from adj1 to adj2 — same direction as SVG's sweepFlag=1 since both
+ * conventions place 0° at east with angles increasing toward south.
+ */
+function buildArcPath(prstGeom: any, flipH: boolean, flipV: boolean): ShapePath {
+  // Use a generous coordinate space so non-scaling-stroke renders sub-pixel
+  // sharp; the path is mapped onto the element's bounding box at draw time.
+  const W = 1000;
+  const H = 1000;
+  const adjBy = (name: string, fallback: number): number => {
+    const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+      (g: any) => g?.["@_name"] === name
+    );
+    const fmla: string | undefined = adj?.["@_fmla"];
+    const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
+    return m ? Number(m[1]) : fallback;
+  };
+  const a1Deg = adjBy("adj1", 16200000) / 60000;
+  const a2Deg = adjBy("adj2", 0) / 60000;
+  const cx = W / 2;
+  const cy = H / 2;
+  const rx = W / 2;
+  const ry = H / 2;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const point = (deg: number): [number, number] => {
+    const r = toRad(deg);
+    let x = cx + rx * Math.cos(r);
+    let y = cy + ry * Math.sin(r);
+    if (flipH) x = W - x;
+    if (flipV) y = H - y;
+    return [x, y];
+  };
+  const sweep = ((a2Deg - a1Deg) % 360 + 360) % 360;
+  const largeArc = sweep > 180 ? 1 : 0;
+  // flipH/flipV each reverse the rotational direction once; XOR decides
+  // whether the SVG sweep stays clockwise (1) or flips to counter-clockwise.
+  const sweepFlag = flipH !== flipV ? 0 : 1;
+  const [sx, sy] = point(a1Deg);
+  const [ex, ey] = point(a2Deg);
+  const d = `M ${sx.toFixed(2)} ${sy.toFixed(2)} A ${rx} ${ry} 0 ${largeArc} ${sweepFlag} ${ex.toFixed(2)} ${ey.toFixed(2)}`;
+  return { d, viewW: W, viewH: H };
+}
+
+/**
+ * Inscribed-text-rectangle insets (in canvas pixels) for the parametric
+ * presets whose `txRect` differs from the bounding box. Returned zeroes for
+ * any preset whose text rectangle IS the bounding box (rect, ellipse, etc.).
+ */
+function inscribedTextInsets(
+  prstGeom: any,
+  w: number,
+  h: number
+): { l: number; t: number; r: number; b: number } {
+  const zero = { l: 0, t: 0, r: 0, b: 0 };
+  const prst = prstGeom?.["@_prst"];
+  if (!prst) return zero;
+  if (prst === "chevron" || prst === "homePlate" || prst === "pentagon") {
+    const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+      (g: any) => g?.["@_name"] === "adj"
+    );
+    const fmla: string | undefined = adj?.["@_fmla"];
+    const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
+    const adjVal = m ? Number(m[1]) : 50000;
+    const ss = Math.min(Math.max(1, w), Math.max(1, h));
+    const indent = Math.round(Math.min(w, (ss * adjVal) / 100000));
+    // chevron / pentagon: left-side notch and right-side arrow tip equally
+    // shrink the txRect by `indent` on either side. homePlate has the arrow
+    // tip only on the right, the left edge stays at 0.
+    return prst === "homePlate"
+      ? { l: 0, t: 0, r: indent, b: 0 }
+      : { l: indent, t: 0, r: indent, b: 0 };
+  }
+  return zero;
+}
+
+/**
+ * Build an SVG ellipse path inscribed in the bounding box. Two 180° elliptical
+ * arcs traced back-to-back produce a closed oval that fills any rectangular
+ * box; preserveAspectRatio="none" on the renderer's <svg> stretches a fixed
+ * coordinate system to match.
+ */
+function buildEllipsePath(w: number, h: number): ShapePath {
+  const W = Math.max(1, w);
+  const H = Math.max(1, h);
+  const rx = W / 2;
+  const ry = H / 2;
+  const d = `M 0 ${ry} A ${rx} ${ry} 0 1 1 ${W} ${ry} A ${rx} ${ry} 0 1 1 0 ${ry} Z`;
+  return { d, viewW: W, viewH: H };
+}
+
+/**
+ * Build an SVG polygon path for the chevron / pentagon / homePlate presets.
+ * Each is an arrow-shaped polygon parameterised by a single `adj`:
+ *   - chevron: arrow-with-notch — points {(0,0), (x2,0), (W,vc), (x2,H), (0,H), (x1,vc)}.
+ *   - pentagon: solid arrow — chevron without the inner left notch.
+ *   - homePlate: house-plate (5 points) — chevron's right half.
+ * `adj` is interpreted per the spec as a percentage of the shorter side
+ * (`ss = min(W, H)`), capped at 100% of the shape's width.
+ */
+function buildChevronPath(
+  prstGeom: any,
+  preset: string,
+  w: number,
+  h: number,
+  flipH: boolean,
+  flipV: boolean
+): ShapePath {
+  const W = Math.max(1, w);
+  const H = Math.max(1, h);
+  const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+    (g: any) => g?.["@_name"] === "adj"
+  );
+  const fmla: string | undefined = adj?.["@_fmla"];
+  const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
+  const adjVal = m ? Number(m[1]) : 50000;
+  const ss = Math.min(W, H);
+  const maxX = W;
+  const x1 = Math.min(maxX, (ss * adjVal) / 100000);
+  const x2 = Math.max(0, W - x1);
+  const vc = H / 2;
+  const pts: [number, number][] =
+    preset === "homePlate"
+      ? [
+          [0, 0],
+          [x2, 0],
+          [W, vc],
+          [x2, H],
+          [0, H],
+        ]
+      : preset === "pentagon"
+        ? [
+            [0, 0],
+            [x2, 0],
+            [W, vc],
+            [x2, H],
+            [0, H],
+          ]
+        : [
+            [0, 0],
+            [x2, 0],
+            [W, vc],
+            [x2, H],
+            [0, H],
+            [x1, vc],
+          ];
+  const mapped = pts.map(([x, y]) => [
+    flipH ? W - x : x,
+    flipV ? H - y : y,
+  ]);
+  const d =
+    "M " +
+    mapped.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(" L ") +
+    " Z";
+  return { d, viewW: W, viewH: H };
+}
+
+/**
+ * Build an SVG path for the cube preset. `adj` (default 25%) controls the
+ * apparent depth — it's a percentage of the shorter side that becomes both
+ * the top-face height and the right-face width. The path emits three
+ * sub-paths (front, top, right) so each face is independently stroked,
+ * giving the 3D-edge appearance even without per-face shading.
+ */
+function buildCubePath(
+  prstGeom: any,
+  w: number,
+  h: number,
+  flipH: boolean,
+  flipV: boolean
+): ShapePath {
+  const W = Math.max(1, w);
+  const H = Math.max(1, h);
+  const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+    (g: any) => g?.["@_name"] === "adj"
+  );
+  const fmla: string | undefined = adj?.["@_fmla"];
+  const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
+  const adjVal = m ? Number(m[1]) : 25000;
+  const ss = Math.min(W, H);
+  const d1 = Math.min(W, H) - 1;
+  const y1 = Math.max(0, Math.min(d1, (ss * adjVal) / 100000));
+  const x4 = Math.max(0, W - y1);
+  const y4 = Math.max(0, H - y1);
+  const fx = (x: number) => (flipH ? W - x : x);
+  const fy = (y: number) => (flipV ? H - y : y);
+  const pt = (x: number, y: number) => `${fx(x).toFixed(2)} ${fy(y).toFixed(2)}`;
+  // Front face (A → F → E → G), top (A → B → C → G), right (G → C → D → E).
+  const front = `M ${pt(0, y1)} L ${pt(0, H)} L ${pt(x4, H)} L ${pt(x4, y1)} Z`;
+  const top = `M ${pt(0, y1)} L ${pt(y1, 0)} L ${pt(W, 0)} L ${pt(x4, y1)} Z`;
+  const right = `M ${pt(x4, y1)} L ${pt(W, 0)} L ${pt(W, y4)} L ${pt(x4, H)} Z`;
+  return { d: `${front} ${top} ${right}`, viewW: W, viewH: H };
+}
+
 function mapPrstToKind(prst?: string): ShapeKind | null {
   if (!prst) return null;
   switch (prst) {
