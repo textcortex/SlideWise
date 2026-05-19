@@ -102,6 +102,22 @@ export interface TextElement extends BaseElement {
    * collapses runs back to the flat representation.
    */
   runs?: TextRun[];
+  /**
+   * Optional per-paragraph layout metadata. PPTX bullets use a hanging-indent
+   * pattern (`marL` positive, `indent` negative) so the bullet hangs out to
+   * the left of the wrapped text. Splitting the text into paragraphs lets the
+   * renderer apply `padding-left` + `text-indent` per paragraph rather than
+   * collapsing every wrap line back to column 0.
+   */
+  paragraphs?: Array<{
+    text: string;
+    marL?: number;
+    indent?: number;
+    align?: "left" | "center" | "right";
+    runs?: TextRun[];
+    /** Space before paragraph in canvas pixels (from PPTX `<a:spcBef>`). */
+    spaceBefore?: number;
+  }>;
 }
 
 export type ShapeKind =
@@ -118,6 +134,12 @@ export interface ShapeElement extends BaseElement {
   fill: string;
   stroke?: string;
   strokeWidth?: number;
+  /**
+   * Raw PPTX `<a:prstDash val="…">` style for the stroke (e.g. "dot", "dash",
+   * "dashDot", "lgDash", "sysDot"). Only the patterned values are honoured;
+   * absent or "solid" renders as a continuous stroke.
+   */
+  strokeDash?: string;
   radius?: number;
   /**
    * Optional vector path, set when the shape was imported from a PPTX
