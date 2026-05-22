@@ -13,6 +13,7 @@ import type {
   IconElement,
   EmbedElement,
   ChartElement,
+  GroupElement,
   UnknownElement,
 } from "@/lib/types";
 import { pxToInches, pxToPoints } from "./units";
@@ -23,6 +24,19 @@ import {
   getElementSource,
   snapshotElement,
 } from "./pptxToDeck";
+import {
+  synthesiseShape,
+  synthesiseGroup,
+  synthesiseChart,
+  synthesiseSlideBg,
+  synthesiseEmbeddedFonts,
+  effectLstXml,
+  parseFill,
+  RID_MARKER_RE,
+  slidewiseShapeName,
+  type MediaPayload,
+  type SynthChartResult,
+} from "./pptxWriters";
 
 /**
  * Serialize a Slidewise Deck to a real PPTX blob.
@@ -53,16 +67,44 @@ export interface SerializeOptions {
   source?: Blob | ArrayBuffer | Uint8Array;
 }
 
+/**
+ * Per-serialize-call registry of synthesised OOXML the post-processor needs
+ * to inject. Populated by `addSlide`, drained by `preserveUnknowns`. Reset
+ * at the start of each `serializeDeck` so concurrent calls don't bleed.
+ */
+interface SynthSlideEntry {
+  /** Shape / group XML (high-z content) for this slide. */
+  shapeXml: string[];
+  /** In-app chart parts for this slide. */
+  charts: SynthChartResult[];
+  /** Media payloads to drop into `ppt/media/` referenced from the slide. */
+  media: MediaPayload[];
+  /** Effect XML to splice into pptxgenjs-emitted shapes by `cNvPr.name`. */
+  effectsByName: Map<string, string>;
+}
+
+const synthBySlide = new Map<number, SynthSlideEntry>();
+function synthForSlide(i: number): SynthSlideEntry {
+  let e = synthBySlide.get(i);
+  if (!e) {
+    e = { shapeXml: [], charts: [], media: [], effectsByName: new Map() };
+    synthBySlide.set(i, e);
+  }
+  return e;
+}
+
 export async function serializeDeck(
   deck: Deck,
   options: SerializeOptions = {}
 ): Promise<Blob> {
+  synthBySlide.clear();
+
   const pptx = new pptxgen();
   pptx.title = deck.title || "Untitled";
   pptx.layout = "LAYOUT_WIDE"; // 13.333 × 7.5 in
 
-  for (const slide of deck.slides) {
-    addSlide(pptx, slide);
+  for (let i = 0; i < deck.slides.length; i++) {
+    addSlide(pptx, deck.slides[i], i);
   }
 
   // Use arraybuffer (universal: works in Node + browser, accepted by JSZip
@@ -73,10 +115,14 @@ export async function serializeDeck(
   return preserveUnknowns(generated, deck, options.source);
 }
 
-function addSlide(pptx: pptxgen, slide: Slide): void {
+function addSlide(pptx: pptxgen, slide: Slide, slideIndex: number): void {
   const s = pptx.addSlide();
-  s.background = { color: hexNoHash(slide.background) };
+  // pptxgenjs only understands flat-hex slide backgrounds. For richer forms
+  // (gradients / image fills) we leave a sentinel hex here and overwrite the
+  // emitted `<p:bg>` in post-process.
+  s.background = { color: hexNoHash(extractSolidColor(slide.background)) };
 
+  const synth = synthForSlide(slideIndex);
   const sorted = [...slide.elements].sort((a, b) => a.z - b.z);
   for (const el of sorted) {
     // Skip elements whose imported OOXML survived this far AND haven't
@@ -84,8 +130,12 @@ function addSlide(pptx: pptxgen, slide: Slide): void {
     // verbatim, sidestepping pptxgenjs's lossy translation of
     // gradient / custGeom / backing fields.
     if (isPristineImportedElement(el)) continue;
+    if (shouldSynthesise(el)) {
+      synthesiseInto(synth, el);
+      continue;
+    }
     try {
-      addElement(s, el);
+      addElement(s, el, synth);
     } catch (err) {
       console.warn(
         `[slidewise/pptx] failed to write element ${el.id} (${el.type}):`,
@@ -95,25 +145,93 @@ function addSlide(pptx: pptxgen, slide: Slide): void {
   }
 }
 
+/**
+ * Does this element need synthesised OOXML rather than pptxgenjs's emitter?
+ * The synth path handles gradient/image fills, custGeom paths, in-app charts,
+ * groups — everything the public API allows that pptxgenjs would silently
+ * collapse to a solid colour or drop entirely.
+ */
+function shouldSynthesise(el: SlideElement): boolean {
+  if (el.type === "shape") {
+    if (el.path) return true;
+    const parsed = parseFill(el.fill);
+    if (parsed && (parsed.kind === "linear" || parsed.kind === "radial" || parsed.kind === "image")) {
+      return true;
+    }
+    return false;
+  }
+  if (el.type === "group") return true;
+  if (el.type === "chart" && !el.ooxmlXml) return true;
+  return false;
+}
+
+function synthesiseInto(synth: SynthSlideEntry, el: SlideElement): void {
+  if (el.type === "shape") {
+    const out = synthesiseShape(el);
+    synth.shapeXml.push(out.xml);
+    for (const m of out.media) synth.media.push(m);
+    return;
+  }
+  if (el.type === "group") {
+    const out = synthesiseGroup(el as GroupElement, (child) =>
+      renderGroupChild(child)
+    );
+    synth.shapeXml.push(out.xml);
+    for (const m of out.media) synth.media.push(m);
+    return;
+  }
+  if (el.type === "chart") {
+    const out = synthesiseChart(el as ChartElement);
+    synth.charts.push(out);
+    return;
+  }
+}
+
+/**
+ * Render a single child for `<p:grpSp>`. We only synthesise shapes/charts
+ * inside groups for v1 — text / image / line children remain renderable
+ * inside the group at the *renderer* layer, but the PPTX writer emits them
+ * as solid-fill rect placeholders so the group has a valid spTree. This is
+ * the documented "deferred sub-case" for PR 5.
+ */
+function renderGroupChild(
+  child: SlideElement
+): { xml: string; media: MediaPayload[] } | null {
+  if (child.type === "shape") {
+    return synthesiseShape(child);
+  }
+  if (child.type === "group") {
+    return synthesiseGroup(child as GroupElement, (c) => renderGroupChild(c));
+  }
+  // Other element types inside a group: fall back to a transparent rect so
+  // the group's child list stays valid. The text/image content is lost on
+  // round-trip — that's the PR-5 follow-up.
+  return null;
+}
+
 function isPristineImportedElement(el: SlideElement): boolean {
   const src = getElementSource(el.id);
   if (!src) return false;
   return src.snapshot === snapshotElement(el);
 }
 
-function addElement(s: pptxgen.Slide, el: SlideElement): void {
+function addElement(
+  s: pptxgen.Slide,
+  el: SlideElement,
+  synth: SynthSlideEntry
+): void {
   switch (el.type) {
     case "text":
-      addText(s, el);
+      addText(s, el, synth);
       return;
     case "shape":
-      addShape(s, el);
+      addShape(s, el, synth);
       return;
     case "image":
       addImage(s, el);
       return;
     case "line":
-      addLine(s, el);
+      addLine(s, el, synth);
       return;
     case "table":
       addTable(s, el);
@@ -131,12 +249,24 @@ function addElement(s: pptxgen.Slide, el: SlideElement): void {
       // re-emit the source verbatim so the chart and its embedded Excel
       // survive open/save.
       return;
+    case "group":
+      // Groups are handled by the synth path before reaching here.
+      return;
     case "unknown":
       // Preserved by preserveUnknowns() after pptxgenjs writes the zip.
       // The post-process step injects el.ooxmlXml into the matching
       // slide's <p:spTree> and copies any media the fragment referenced.
       return;
   }
+}
+
+/** Pull a solid colour out of a fill string if there is one, otherwise
+ *  `#FFFFFF` so the synth path's `<p:bg>` replacement has something benign
+ *  to overwrite. */
+function extractSolidColor(fill: string | undefined): string {
+  const parsed = parseFill(fill);
+  if (parsed && parsed.kind === "solid") return parsed.color;
+  return "#FFFFFF";
 }
 
 function geometry(el: SlideElement): {
@@ -155,10 +285,32 @@ function geometry(el: SlideElement): {
   };
 }
 
-function addText(s: pptxgen.Slide, el: TextElement): void {
+function addText(
+  s: pptxgen.Slide,
+  el: TextElement,
+  synth: SynthSlideEntry
+): void {
+  // Tag the shape so the post-processor can splice effect XML by name.
+  if (el.shadow || el.glow) {
+    synth.effectsByName.set(
+      slidewiseShapeName(el.id),
+      effectLstXml(el.shadow, el.glow)
+    );
+  }
+  // TextElement.background fills the text box's bounding rect (PPTX
+  // importer sets this from layout-placeholder fills, AI-authored decks
+  // use it for boxed-bullet / tinted-card layouts). pptxgenjs only
+  // accepts solid hex via `fill`. Skip non-hex strings (gradients,
+  // url(...)) — those rare cases need a synth shape underlay, which is
+  // PR 2 territory and not common on text boxes.
+  const bgHex =
+    el.background && /^#[0-9a-fA-F]{6}$/.test(el.background)
+      ? hexNoHash(el.background)
+      : undefined;
   const baseOpts = {
     ...geometry(el),
     fontFace: el.fontFamily,
+    objectName: el.shadow || el.glow ? slidewiseShapeName(el.id) : undefined,
     fontSize: pxToPoints(el.fontSize),
     color: hexNoHash(el.color),
     bold: el.fontWeight >= 600,
@@ -167,6 +319,7 @@ function addText(s: pptxgen.Slide, el: TextElement): void {
     strike: el.strike ? ("sngStrike" as const) : undefined,
     align: el.align,
     valign: el.vAlign,
+    fill: bgHex ? { color: bgHex } : undefined,
     charSpacing: el.letterSpacing
       ? Math.round(el.letterSpacing * 100)
       : undefined,
@@ -220,24 +373,54 @@ const SHAPE_MAP: Record<ShapeKind, string> = {
   star: "star5",
 };
 
-function addShape(s: pptxgen.Slide, el: ShapeElement): void {
+function addShape(
+  s: pptxgen.Slide,
+  el: ShapeElement,
+  synth: SynthSlideEntry
+): void {
   const shapeName = SHAPE_MAP[el.shape] ?? "rect";
+  if (el.shadow || el.glow) {
+    synth.effectsByName.set(
+      slidewiseShapeName(el.id),
+      effectLstXml(el.shadow, el.glow)
+    );
+  }
   // pptxgenjs accepts shape names as strings; the typed ShapeType enum is
   // also exposed. Pass via `as unknown as` to bypass strict enum typing.
   s.addShape(shapeName as unknown as Parameters<typeof s.addShape>[0], {
     ...geometry(el),
-    fill: { color: hexNoHash(el.fill) },
+    fill: { color: hexNoHash(extractSolidColor(el.fill)) },
     line: el.stroke
       ? {
           color: hexNoHash(el.stroke),
           width: el.strokeWidth ?? 1,
+          dashType: shapeDashType(el),
         }
       : { type: "none" },
     rectRadius:
       el.shape === "rounded" && el.radius != null
         ? clamp01(el.radius / Math.min(el.w, el.h))
         : undefined,
+    objectName: el.shadow || el.glow ? slidewiseShapeName(el.id) : undefined,
   });
+}
+
+function lineDashType(
+  el: LineElement
+): "solid" | "dash" | "dashDot" | "lgDash" | "sysDash" | "sysDot" {
+  const dt = el.dashType ?? (el.dashed ? "dash" : "solid");
+  if (dt === "dot") return "sysDot";
+  return dt;
+}
+
+function shapeDashType(
+  el: ShapeElement
+): "solid" | "dash" | "dashDot" | "lgDash" | "sysDash" | "sysDot" | undefined {
+  // Our public `DashType` includes plain "dot" (OOXML allows it) but
+  // pptxgenjs's enum doesn't; alias dot → sysDot so the legacy enum is happy.
+  if (!el.dashType) return undefined;
+  if (el.dashType === "dot") return "sysDot";
+  return el.dashType;
 }
 
 function addImage(s: pptxgen.Slide, el: ImageElement): void {
@@ -258,7 +441,17 @@ function addImage(s: pptxgen.Slide, el: ImageElement): void {
   s.addImage(opts);
 }
 
-function addLine(s: pptxgen.Slide, el: LineElement): void {
+function addLine(
+  s: pptxgen.Slide,
+  el: LineElement,
+  synth: SynthSlideEntry
+): void {
+  if (el.shadow || el.glow) {
+    synth.effectsByName.set(
+      slidewiseShapeName(el.id),
+      effectLstXml(el.shadow, el.glow)
+    );
+  }
   s.addShape(
     "line" as unknown as Parameters<typeof s.addShape>[0],
     {
@@ -266,9 +459,10 @@ function addLine(s: pptxgen.Slide, el: LineElement): void {
       line: {
         color: hexNoHash(el.stroke),
         width: el.strokeWidth,
-        dashType: el.dashed ? "dash" : "solid",
+        dashType: lineDashType(el),
         endArrowType: el.arrow ? "triangle" : "none",
       },
+      objectName: el.shadow || el.glow ? slidewiseShapeName(el.id) : undefined,
     }
   );
 }
@@ -343,19 +537,50 @@ async function preserveUnknowns(
   deck: Deck,
   explicitSource?: Blob | ArrayBuffer | Uint8Array
 ): Promise<Blob> {
-  const wrapBlob = () => new Blob([generated], { type: PPTX_MIME });
   // Prefer the caller-supplied source (survives state cloning / localStorage
   // rehydrate); fall back to the non-enumerable attachment from parsePptx
   // for the "parse → serialize" happy path with no state in between.
   const sourceBuffer = await resolveSource(deck, explicitSource);
-  if (!sourceBuffer) return wrapBlob();
+
+  // Synthesised OOXML from the writer always needs post-processing — even
+  // when there's no source PPTX, gradients / custGeom / charts / embedded
+  // fonts have to be spliced into the generated zip.
+  const hasSynth =
+    synthBySlide.size > 0 ||
+    deck.slides.some(
+      (s) => {
+        const parsed = parseFill(s.background);
+        return parsed && parsed.kind !== "solid";
+      }
+    ) ||
+    (deck.fonts && deck.fonts.length > 0);
+
+  if (!sourceBuffer && !hasSynth) {
+    // Still strip dangling Content_Types overrides — pptxgenjs declares
+    // slideMaster1..N for every slide but only writes slideMaster1.xml.
+    // PowerPoint refuses to open the file when declared parts are missing
+    // (Keynote is lenient and just warns). Always sanitise.
+    const outZip = await JSZip.loadAsync(generated);
+    await pruneDanglingContentTypes(outZip);
+    return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+  }
+  if (!sourceBuffer && hasSynth) {
+    // No source: still run the synth-only post-process. The chrome / EMF /
+    // slide-bg replay paths short-circuit on a null source archive.
+    const outZip = await JSZip.loadAsync(generated);
+    await applySynth(outZip, deck);
+    await applySynthSlideBackgrounds(outZip, deck);
+    await applyEmbeddedFontsFromJson(outZip, deck);
+    await pruneDanglingContentTypes(outZip);
+    return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+  }
 
   const unknownsBySlide = collectUnknowns(deck);
   const pristinesBySlide = collectPristineImports(deck);
 
   const [outZip, srcZip] = await Promise.all([
     JSZip.loadAsync(generated),
-    JSZip.loadAsync(sourceBuffer),
+    JSZip.loadAsync(sourceBuffer as ArrayBuffer),
   ]);
 
   // The source's slide-XML paths (in deck order). Used as a fallback when
@@ -417,6 +642,18 @@ async function preserveUnknowns(
   // each output slide's `<p:bg>` with the source's verbatim XML when
   // available so gradients survive intact.
   await preserveSlideBackgrounds(outZip, srcZip, deck, sourceSlidePaths);
+
+  // Synthesised content (custGeom shapes, gradient fills, in-app charts,
+  // groups, effect splices) — applied after source preservation so we never
+  // overwrite the source's pristine fragments. JSON gradient backgrounds
+  // only fire when the source preserve found nothing (preserveSlideBackgrounds
+  // already wrote any source-provided bg).
+  await applySynth(outZip, deck);
+  await applySynthSlideBackgrounds(outZip, deck);
+  // Embedded fonts from deck.fonts only fire when chrome preservation didn't
+  // copy any — avoids duplicating font entries when both source + deck.fonts
+  // are set.
+  await applyEmbeddedFontsFromJson(outZip, deck);
 
   // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
@@ -1496,4 +1733,373 @@ function isDataUrl(src: string): boolean {
 
 function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n));
+}
+
+// -- Synthesised-OOXML post-process (PRs 1–7) ------------------------------
+
+/**
+ * Splice the synthesised shape / group / chart OOXML accumulated in
+ * `synthBySlide` into the generated zip. Rewrites marker rIds to fresh
+ * per-slide rIds and writes media + chart parts as needed.
+ */
+async function applySynth(outZip: JSZip, deck: Deck): Promise<void> {
+  for (let i = 0; i < deck.slides.length; i++) {
+    const synth = synthBySlide.get(i);
+    if (!synth) continue;
+    const slidePath = `ppt/slides/slide${i + 1}.xml`;
+    const relsPath = `ppt/slides/_rels/slide${i + 1}.xml.rels`;
+    const slideFile = outZip.file(slidePath);
+    if (!slideFile) continue;
+    let slideXml = await slideFile.async("string");
+
+    let relsXml =
+      (await outZip.file(relsPath)?.async("string")) ??
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+
+    const rels = parseRels(relsXml);
+    let nextRid = highestRid(rels) + 1;
+    const newRelLines: string[] = [];
+
+    // Combine shape/group XML with chart graphicFrames. Marker rIds embed
+    // their owning element id, so we walk shape XML in emission order and
+    // pair each *first-seen* marker with a media payload of the matching
+    // scope. That keeps multi-image shapes correct without a separate map.
+    const mediaQueue = [...synth.media];
+    const consumeMedia = (): MediaPayload | undefined => mediaQueue.shift();
+    const shapeBlobs: string[] = [];
+    for (const shapeXml of synth.shapeXml) {
+      let rewritten = shapeXml;
+      const markers = unique(shapeXml.match(RID_MARKER_RE) ?? []);
+      for (const marker of markers) {
+        const rid = `rId${nextRid++}`;
+        rewritten = rewritten.replaceAll(marker, rid);
+        const media = consumeMedia();
+        if (media) {
+          outZip.file(media.fullPath, media.data, { binary: true });
+          newRelLines.push(buildRelXml(rid, media.relType, media.relTarget));
+        }
+      }
+      shapeBlobs.push(rewritten);
+    }
+
+    // Charts: rewrite marker rIds, write part + rels, register Content_Types.
+    for (const chart of synth.charts) {
+      const ridMarkers = unique(chart.graphicFrameXml.match(RID_MARKER_RE) ?? []);
+      let frame = chart.graphicFrameXml;
+      for (const marker of ridMarkers) {
+        const rid = `rId${nextRid++}`;
+        frame = frame.replaceAll(marker, rid);
+        // Slide rels target is relative to ppt/slides. Chart part lives at
+        // ppt/charts/chartSW_X.xml.
+        const target = `../charts/${chart.partPath.replace(/^ppt\/charts\//, "")}`;
+        newRelLines.push(
+          buildRelXml(
+            rid,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+            target
+          )
+        );
+      }
+      outZip.file(chart.partPath, chart.chartXml);
+      outZip.file(chart.partRelsPath, chart.chartRelsXml);
+      await registerChartContentType(outZip, chart.partPath);
+      shapeBlobs.push(frame);
+    }
+
+    if (shapeBlobs.length) {
+      // Prepend at the low-z position (right after `<p:grpSpPr/>`) so
+      // synth shapes — gradient panels, custGeom backdrops, the underlay
+      // for text-on-tint cards — sit BELOW the text/images pptxgenjs
+      // already wrote. Appending at `</p:spTree>` would put them on top
+      // and cover the very content they're supposed to back.
+      const insertAt = findSpTreeContentInsertionPoint(slideXml);
+      if (insertAt >= 0) {
+        slideXml =
+          slideXml.slice(0, insertAt) +
+          shapeBlobs.join("") +
+          slideXml.slice(insertAt);
+      } else {
+        const close = slideXml.lastIndexOf("</p:spTree>");
+        if (close >= 0) {
+          slideXml =
+            slideXml.slice(0, close) +
+            shapeBlobs.join("") +
+            slideXml.slice(close);
+        }
+      }
+    }
+
+    // PR 7: splice `<a:effectLst>` into pptxgenjs-emitted shapes by name.
+    if (synth.effectsByName.size) {
+      slideXml = spliceEffectsByName(slideXml, synth.effectsByName);
+    }
+
+    if (newRelLines.length) {
+      const insertAt = relsXml.lastIndexOf("</Relationships>");
+      relsXml =
+        insertAt >= 0
+          ? relsXml.slice(0, insertAt) +
+            newRelLines.join("") +
+            relsXml.slice(insertAt)
+          : relsXml.replace(
+              /<Relationships[^>]*>/,
+              (m) => `${m}${newRelLines.join("")}`
+            );
+      outZip.file(relsPath, relsXml);
+    }
+    outZip.file(slidePath, slideXml);
+  }
+}
+
+function unique<T>(arr: T[]): T[] {
+  return Array.from(new Set(arr));
+}
+
+async function registerChartContentType(
+  outZip: JSZip,
+  partPath: string
+): Promise<void> {
+  const ctFile = outZip.file("[Content_Types].xml");
+  if (!ctFile) return;
+  const xml = await ctFile.async("string");
+  if (xml.includes(`PartName="/${partPath}"`)) return;
+  const override = `<Override PartName="/${partPath}" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>`;
+  const close = xml.lastIndexOf("</Types>");
+  if (close < 0) return;
+  outZip.file(
+    "[Content_Types].xml",
+    xml.slice(0, close) + override + xml.slice(close)
+  );
+}
+
+/**
+ * Splice an `<a:effectLst>...</a:effectLst>` block into each `<p:sp>` /
+ * `<p:cxnSp>` whose `<p:cNvPr name="..."/>` matches one of the keys.
+ * Inserts the block just before `</p:spPr>`, replacing any existing
+ * effectLst inside the same spPr.
+ */
+function spliceEffectsByName(
+  slideXml: string,
+  effectsByName: Map<string, string>
+): string {
+  // Match whole `<p:sp>…</p:sp>` blocks (so we don't accidentally consume
+  // the outer `<p:nvGrpSpPr>` cNvPr's tail into the next shape's spPr).
+  return slideXml.replace(
+    /<p:sp\b[\s\S]*?<\/p:sp>/g,
+    (sp: string) => {
+      const nameMatch = /<p:cNvPr\b[^>]*?name="([^"]*)"/.exec(sp);
+      if (!nameMatch || !nameMatch[1]) return sp;
+      const eff = effectsByName.get(nameMatch[1]);
+      if (!eff) return sp;
+      // Insert just before the FIRST `</p:spPr>` inside the shape; that's
+      // the spPr that owns the visual properties. Strip any existing empty
+      // effectLst before splicing.
+      const cleaned = sp.replace(/<a:effectLst\s*\/>/, "");
+      const at = cleaned.indexOf("</p:spPr>");
+      if (at < 0) return sp;
+      return cleaned.slice(0, at) + eff + cleaned.slice(at);
+    }
+  );
+}
+
+/**
+ * Write JSON-defined gradient / image slide backgrounds (PR 3). Only fires
+ * when the source-PPTX bg preservation pass left the slide's `<p:bg>` empty
+ * — that ensures source bytes always win.
+ */
+async function applySynthSlideBackgrounds(
+  outZip: JSZip,
+  deck: Deck
+): Promise<void> {
+  for (let i = 0; i < deck.slides.length; i++) {
+    const slide = deck.slides[i];
+    const parsed = parseFill(slide.background);
+    if (!parsed) continue;
+    if (parsed.kind === "solid") continue;
+    const slidePath = `ppt/slides/slide${i + 1}.xml`;
+    const relsPath = `ppt/slides/_rels/slide${i + 1}.xml.rels`;
+    const slideFile = outZip.file(slidePath);
+    if (!slideFile) continue;
+    let slideXml = await slideFile.async("string");
+
+    // If the slide already has a non-solid `<p:bg>` (source preservation
+    // wrote one), leave it alone. Solid `<p:bg>` from pptxgenjs gets
+    // overwritten below — that's what we want.
+    const existing = /<p:bg\b[\s\S]*?<\/p:bg>|<p:bg\b[^>]*\/\s*>/.exec(slideXml);
+    if (existing) {
+      // Detect "this is a richer bg than solid" by looking for gradFill /
+      // blipFill / pattFill — those come from source preservation.
+      if (/<a:gradFill|<a:blipFill|<a:pattFill/.test(existing[0])) continue;
+    }
+
+    const synth = synthesiseSlideBg(slide);
+    if (!synth.xml) continue;
+    let bgXml = synth.xml;
+
+    let relsXml =
+      (await outZip.file(relsPath)?.async("string")) ??
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+    if (synth.media.length) {
+      const rels = parseRels(relsXml);
+      let nextRid = highestRid(rels) + 1;
+      const newRelLines: string[] = [];
+      const markers = unique(bgXml.match(RID_MARKER_RE) ?? []);
+      for (let mi = 0; mi < markers.length; mi++) {
+        const rid = `rId${nextRid++}`;
+        bgXml = bgXml.replaceAll(markers[mi], rid);
+        const media = synth.media[mi];
+        if (!media) break;
+        outZip.file(media.fullPath, media.data, { binary: true });
+        newRelLines.push(buildRelXml(rid, media.relType, media.relTarget));
+      }
+      if (newRelLines.length) {
+        const at = relsXml.lastIndexOf("</Relationships>");
+        relsXml =
+          at >= 0
+            ? relsXml.slice(0, at) + newRelLines.join("") + relsXml.slice(at)
+            : relsXml.replace(
+                /<Relationships[^>]*>/,
+                (m) => `${m}${newRelLines.join("")}`
+              );
+        outZip.file(relsPath, relsXml);
+      }
+    }
+
+    if (existing) {
+      slideXml = slideXml.replace(
+        /<p:bg\b[\s\S]*?<\/p:bg>|<p:bg\b[^>]*\/\s*>/,
+        bgXml
+      );
+    } else {
+      const cSldOpen = /<p:cSld\b[^>]*>/.exec(slideXml);
+      if (cSldOpen) {
+        const at = cSldOpen.index + cSldOpen[0].length;
+        slideXml = slideXml.slice(0, at) + bgXml + slideXml.slice(at);
+      }
+    }
+    outZip.file(slidePath, slideXml);
+  }
+}
+
+/**
+ * Write JSON-defined embedded fonts (PR 6). Only fires when chrome
+ * preservation didn't already copy fonts from a source — that's detected
+ * by checking whether `ppt/fonts/` is populated.
+ */
+async function applyEmbeddedFontsFromJson(
+  outZip: JSZip,
+  deck: Deck
+): Promise<void> {
+  if (!deck.fonts || !deck.fonts.length) return;
+  const existingFonts: string[] = [];
+  outZip.forEach((path) => {
+    if (path.startsWith("ppt/fonts/") && path.endsWith(".fntdata")) {
+      existingFonts.push(path);
+    }
+  });
+  if (existingFonts.length) return;
+
+  const descriptors = await synthesiseEmbeddedFonts(deck.fonts);
+  if (!descriptors.length) return;
+
+  // Write font bytes.
+  for (const d of descriptors) {
+    for (const p of d.payloads) {
+      outZip.file(p.fullPath, p.data, { binary: true });
+    }
+  }
+
+  // Register `.fntdata` Default content type.
+  const ctFile = outZip.file("[Content_Types].xml");
+  if (ctFile) {
+    let ct = await ctFile.async("string");
+    if (!/Extension="fntdata"/i.test(ct)) {
+      ct = ct.replace(
+        /<Types\b[^>]*>/,
+        (m) =>
+          `${m}<Default Extension="fntdata" ContentType="application/x-fontdata"/>`
+      );
+      outZip.file("[Content_Types].xml", ct);
+    }
+  }
+
+  // Add font rels to presentation.xml.rels and rewrite the marker rIds in
+  // each `<p:embeddedFont>` to those allocated rIds.
+  const presRelsFile = outZip.file("ppt/_rels/presentation.xml.rels");
+  if (!presRelsFile) return;
+  let presRelsXml = await presRelsFile.async("string");
+  const presRels = parseRels(presRelsXml);
+  let nextRid = highestRid(presRels) + 1;
+  const newRels: string[] = [];
+  const embeddedFontXml: string[] = [];
+  for (const d of descriptors) {
+    let xml = d.embeddedFontXml;
+    for (const r of d.rels) {
+      const rid = `rId${nextRid++}`;
+      xml = xml.replaceAll(r.ridMarker, rid);
+      newRels.push(buildRelXml(rid, r.relType, r.target));
+    }
+    embeddedFontXml.push(xml);
+  }
+  const insertAt = presRelsXml.lastIndexOf("</Relationships>");
+  presRelsXml =
+    insertAt >= 0
+      ? presRelsXml.slice(0, insertAt) +
+        newRels.join("") +
+        presRelsXml.slice(insertAt)
+      : presRelsXml.replace(
+          /<Relationships[^>]*>/,
+          (m) => `${m}${newRels.join("")}`
+        );
+  outZip.file("ppt/_rels/presentation.xml.rels", presRelsXml);
+
+  // Splice `<p:embeddedFontLst>` into presentation.xml (after sldIdLst).
+  const presFile = outZip.file("ppt/presentation.xml");
+  if (!presFile) return;
+  let presXml = await presFile.async("string");
+  const fontLst = `<p:embeddedFontLst>${embeddedFontXml.join("")}</p:embeddedFontLst>`;
+  if (/<p:embeddedFontLst\b/.test(presXml)) {
+    presXml = presXml.replace(
+      /<p:embeddedFontLst\b[\s\S]*?<\/p:embeddedFontLst>/,
+      fontLst
+    );
+  } else {
+    const after = /<\/p:sldIdLst>/.exec(presXml);
+    if (after) {
+      const at = after.index + after[0].length;
+      presXml = presXml.slice(0, at) + fontLst + presXml.slice(at);
+    }
+  }
+  outZip.file("ppt/presentation.xml", presXml);
+}
+
+/**
+ * Strip `<Override>` entries from `[Content_Types].xml` whose `PartName`
+ * doesn't correspond to a file actually present in the output zip.
+ *
+ * pptxgenjs has a long-standing quirk: it declares `slideMaster1.xml`
+ * through `slideMasterN.xml` (one per slide) even though it only ever
+ * writes `slideMaster1.xml`. PowerPoint enforces the manifest strictly
+ * and refuses to open the file when declared parts are missing
+ * ("PowerPoint found a problem with content"). Keynote is lenient and
+ * just emits the "may look different" warning. Removing the stale
+ * overrides makes the file legal for both apps.
+ */
+async function pruneDanglingContentTypes(outZip: JSZip): Promise<void> {
+  const ctFile = outZip.file("[Content_Types].xml");
+  if (!ctFile) return;
+  const xml = await ctFile.async("string");
+  // Collect every actual file path in the zip so we can answer "does
+  // /foo/bar.xml exist?" in O(1).
+  const existing = new Set<string>();
+  outZip.forEach((path, entry) => {
+    if (!entry.dir) existing.add("/" + path);
+  });
+  // `[^>]*` (not `[^/]*`) so ContentType values containing slashes —
+  // every PPTX MIME type does — don't break the match.
+  const pruned = xml.replace(
+    /<Override\b[^>]*PartName="([^"]+)"[^>]*\/>/g,
+    (match, partName: string) => (existing.has(partName) ? match : "")
+  );
+  if (pruned !== xml) outZip.file("[Content_Types].xml", pruned);
 }

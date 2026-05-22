@@ -10,7 +10,10 @@ import type {
   IconElement,
   EmbedElement,
   ChartElement,
+  GroupElement,
   UnknownElement,
+  ShadowSpec,
+  GlowSpec,
 } from "@/lib/types";
 
 export function ElementView({
@@ -39,9 +42,70 @@ export function ElementView({
       return <EmbedView el={el} />;
     case "chart":
       return <ChartView el={el} />;
+    case "group":
+      return <GroupView el={el} editing={editing} onTextCommit={onTextCommit} />;
     case "unknown":
       return <UnknownView el={el} />;
   }
+}
+
+/**
+ * Render a group as a transparent wrapper sized by the parent positioner;
+ * children carry slide-absolute coordinates so we translate the wrapper to
+ * (0,0) and absolutely-position children at (child.x - group.x, child.y - group.y).
+ * Child elements remain individually selectable in v1 — group-level
+ * drag/selection is the PR-5 follow-up.
+ */
+function GroupView({
+  el,
+  editing,
+  onTextCommit,
+}: {
+  el: GroupElement;
+  editing?: boolean;
+  onTextCommit?: (text: string, runs?: TextRun[]) => void;
+}) {
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      {el.children.map((child) => (
+        <div
+          key={child.id}
+          style={{
+            position: "absolute",
+            left: child.x - el.x,
+            top: child.y - el.y,
+            width: child.w,
+            height: child.h,
+            transform: child.rotation ? `rotate(${child.rotation}deg)` : undefined,
+          }}
+        >
+          <ElementView el={child} editing={editing} onTextCommit={onTextCommit} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** CSS for shadow/glow effects shared by Text / Shape / Line renderers. */
+function effectStyle(
+  shadow: ShadowSpec | undefined,
+  glow: GlowSpec | undefined,
+  kind: "box" | "text" | "filter"
+): React.CSSProperties {
+  const parts: string[] = [];
+  if (shadow) {
+    parts.push(`${shadow.offsetX}px ${shadow.offsetY}px ${shadow.blur}px ${shadow.color}`);
+  }
+  if (glow) {
+    // CSS has no native "glow" — approximate as a zero-offset shadow with the
+    // glow radius as blur, doubled to render visibly without too much falloff.
+    parts.push(`0 0 ${glow.radius}px ${glow.color}`);
+    parts.push(`0 0 ${glow.radius * 2}px ${glow.color}`);
+  }
+  if (!parts.length) return {};
+  if (kind === "box") return { boxShadow: parts.join(", ") };
+  if (kind === "text") return { textShadow: parts.join(", ") };
+  return { filter: parts.map((p) => `drop-shadow(${p})`).join(" ") };
 }
 
 function TextView({
@@ -78,6 +142,7 @@ function TextView({
   const inner: React.CSSProperties = {
     width: "100%",
     color: el.color,
+    ...effectStyle(el.shadow, el.glow, "text"),
     fontFamily: withGenericFallback(el.fontFamily),
     fontSize: el.fontSize,
     fontWeight: el.fontWeight,
@@ -378,6 +443,12 @@ function sameStyle(a: TextRun, b: TextRun): boolean {
 function ShapeView({ el }: { el: ShapeElement }) {
   const stroke = el.stroke ?? "transparent";
   const sw = el.strokeWidth ?? 0;
+  // SVG dash patterns + CSS border styles. Both renderers need this — the
+  // path/preset SVG path gets `stroke-dasharray`, the rect/circle div gets
+  // `border-style`.
+  const dashArray = svgDashArray(el.dashType);
+  const borderStyle = cssDashStyle(el.dashType);
+  const effect = effectStyle(el.shadow, el.glow, "filter");
   // Custom vector path (PPTX <a:custGeom>) takes precedence over the preset
   // kind — the path coordinates already encode the actual silhouette.
   if (el.path) {
@@ -387,6 +458,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
         preserveAspectRatio="none"
         width="100%"
         height="100%"
+        style={effect}
       >
         <path
           d={el.path.d}
@@ -394,6 +466,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
           fillRule={el.path.fillRule ?? "nonzero"}
           stroke={stroke}
           strokeWidth={sw || undefined}
+          strokeDasharray={dashArray}
           vectorEffect="non-scaling-stroke"
         />
       </svg>
@@ -407,7 +480,8 @@ function ShapeView({ el }: { el: ShapeElement }) {
           height: "100%",
           background: el.fill,
           borderRadius: el.shape === "rounded" ? (el.radius ?? 16) : 0,
-          border: sw ? `${sw}px solid ${stroke}` : undefined,
+          border: sw ? `${sw}px ${borderStyle} ${stroke}` : undefined,
+          ...effectStyle(el.shadow, el.glow, "box"),
         }}
       />
     );
@@ -420,19 +494,27 @@ function ShapeView({ el }: { el: ShapeElement }) {
           height: "100%",
           background: el.fill,
           borderRadius: "50%",
-          border: sw ? `${sw}px solid ${stroke}` : undefined,
+          border: sw ? `${sw}px ${borderStyle} ${stroke}` : undefined,
+          ...effectStyle(el.shadow, el.glow, "box"),
         }}
       />
     );
   }
   return (
-    <svg viewBox="0 0 100 100" preserveAspectRatio="none" width="100%" height="100%">
+    <svg
+      viewBox="0 0 100 100"
+      preserveAspectRatio="none"
+      width="100%"
+      height="100%"
+      style={effect}
+    >
       {el.shape === "triangle" && (
         <polygon
           points="50,3 97,97 3,97"
           fill={el.fill}
           stroke={stroke}
           strokeWidth={sw}
+          strokeDasharray={dashArray}
           vectorEffect="non-scaling-stroke"
         />
       )}
@@ -442,6 +524,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
           fill={el.fill}
           stroke={stroke}
           strokeWidth={sw}
+          strokeDasharray={dashArray}
           vectorEffect="non-scaling-stroke"
         />
       )}
@@ -451,11 +534,38 @@ function ShapeView({ el }: { el: ShapeElement }) {
           fill={el.fill}
           stroke={stroke}
           strokeWidth={sw}
+          strokeDasharray={dashArray}
           vectorEffect="non-scaling-stroke"
         />
       )}
     </svg>
   );
+}
+
+function svgDashArray(
+  dt: ShapeElement["dashType"] | LineElement["dashType"]
+): string | undefined {
+  switch (dt) {
+    case "dash":
+      return "8 4";
+    case "dot":
+      return "2 4";
+    case "dashDot":
+      return "8 4 2 4";
+    case "lgDash":
+      return "16 6";
+    case "sysDash":
+      return "5 3";
+    default:
+      return undefined;
+  }
+}
+
+function cssDashStyle(dt: ShapeElement["dashType"]): string {
+  if (dt === "dash" || dt === "lgDash" || dt === "sysDash") return "dashed";
+  if (dt === "dot") return "dotted";
+  if (dt === "dashDot") return "dashed";
+  return "solid";
 }
 
 function ImageView({ el }: { el: ImageElement }) {
@@ -532,7 +642,7 @@ function LineView({ el }: { el: LineElement }) {
       preserveAspectRatio="none"
       width="100%"
       height="100%"
-      style={{ overflow: "visible" }}
+      style={{ overflow: "visible", ...effectStyle(el.shadow, el.glow, "filter") }}
     >
       <line
         x1={x1}
@@ -541,7 +651,9 @@ function LineView({ el }: { el: LineElement }) {
         y2={y2}
         stroke={el.stroke}
         strokeWidth={el.strokeWidth}
-        strokeDasharray={el.dashed ? "12 8" : undefined}
+        strokeDasharray={
+          svgDashArray(el.dashType) ?? (el.dashed ? "12 8" : undefined)
+        }
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
       />
