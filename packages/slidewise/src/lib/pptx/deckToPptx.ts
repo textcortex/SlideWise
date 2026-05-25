@@ -562,6 +562,7 @@ async function preserveUnknowns(
     // (Keynote is lenient and just warns). Always sanitise.
     const outZip = await JSZip.loadAsync(generated);
     await pruneDanglingContentTypes(outZip);
+    await sanitisePresentationXml(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
   if (!sourceBuffer && hasSynth) {
@@ -572,6 +573,7 @@ async function preserveUnknowns(
     await applySynthSlideBackgrounds(outZip, deck);
     await applyEmbeddedFontsFromJson(outZip, deck);
     await pruneDanglingContentTypes(outZip);
+    await sanitisePresentationXml(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
 
@@ -654,6 +656,7 @@ async function preserveUnknowns(
   // copy any — avoids duplicating font entries when both source + deck.fonts
   // are set.
   await applyEmbeddedFontsFromJson(outZip, deck);
+  await sanitisePresentationXml(outZip);
 
   // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
@@ -2102,4 +2105,78 @@ async function pruneDanglingContentTypes(outZip: JSZip): Promise<void> {
     (match, partName: string) => (existing.has(partName) ? match : "")
   );
   if (pruned !== xml) outZip.file("[Content_Types].xml", pruned);
+}
+
+/**
+ * Reorder top-level children of `<p:presentation>` to match the OOXML
+ * schema's required sequence. pptxgenjs emits
+ *   sldMasterIdLst → sldIdLst → notesMasterIdLst → sldSz → notesSz
+ * but CT_Presentation mandates
+ *   sldMasterIdLst → notesMasterIdLst → handoutMasterIdLst → sldIdLst
+ *   → sldSz → notesSz → … → embeddedFontLst → …
+ * Out-of-sequence `notesMasterIdLst` (and `embeddedFontLst` if PR 6 ran)
+ * triggers PowerPoint's "found a problem with content" repair dialog
+ * even though the underlying content is valid. Keynote is lenient and
+ * just renders.
+ *
+ * We don't rebuild the XML; we just relocate the affected elements,
+ * preserving their inner text verbatim. Safe to call when the elements
+ * are already in order — the function is a no-op.
+ */
+async function sanitisePresentationXml(outZip: JSZip): Promise<void> {
+  const file = outZip.file("ppt/presentation.xml");
+  if (!file) return;
+  let xml = await file.async("string");
+  const original = xml;
+
+  // The schema-correct slot for notesMasterIdLst is immediately after
+  // sldMasterIdLst and before sldIdLst.
+  const extractBlock = (tag: string): string | null => {
+    const re = new RegExp(`<p:${tag}\\b[^>]*>[\\s\\S]*?</p:${tag}>`);
+    const m = re.exec(xml);
+    if (!m) return null;
+    xml = xml.slice(0, m.index) + xml.slice(m.index + m[0].length);
+    return m[0];
+  };
+
+  const insertAfter = (anchorTag: string, block: string): void => {
+    const closeAnchor = `</p:${anchorTag}>`;
+    const idx = xml.indexOf(closeAnchor);
+    if (idx < 0) return;
+    const at = idx + closeAnchor.length;
+    xml = xml.slice(0, at) + block + xml.slice(at);
+  };
+
+  const notesBlock = extractBlock("notesMasterIdLst");
+  if (notesBlock) insertAfter("sldMasterIdLst", notesBlock);
+
+  const handoutBlock = extractBlock("handoutMasterIdLst");
+  if (handoutBlock) {
+    // handoutMasterIdLst sits between notesMasterIdLst (if present) and
+    // sldIdLst. If notes was just inserted, anchor on it; otherwise on
+    // sldMasterIdLst.
+    const anchor = /\<\/p:notesMasterIdLst\>/.test(xml)
+      ? "notesMasterIdLst"
+      : "sldMasterIdLst";
+    insertAfter(anchor, handoutBlock);
+  }
+
+  // embeddedFontLst belongs AFTER smartTags / before custShowLst — in
+  // practice, immediately after notesSz works for every deck we emit.
+  const fontLstBlock = extractBlock("embeddedFontLst");
+  if (fontLstBlock) {
+    // notesSz is self-closing in pptxgenjs output, so we look for the
+    // self-closing tag end.
+    const m = /<p:notesSz\b[^>]*\/>/.exec(xml);
+    if (m) {
+      const at = m.index + m[0].length;
+      xml = xml.slice(0, at) + fontLstBlock + xml.slice(at);
+    } else {
+      // Fallback: put it back where we found it. Shouldn't happen — every
+      // pptxgenjs deck has notesSz.
+      insertAfter("sldIdLst", fontLstBlock);
+    }
+  }
+
+  if (xml !== original) outZip.file("ppt/presentation.xml", xml);
 }
