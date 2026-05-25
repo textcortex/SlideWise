@@ -564,6 +564,7 @@ async function preserveUnknowns(
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
+    pruneEmptyDirectories(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
   if (!sourceBuffer && hasSynth) {
@@ -576,6 +577,7 @@ async function preserveUnknowns(
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
+    pruneEmptyDirectories(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
 
@@ -2185,6 +2187,29 @@ async function sanitisePresentationXml(outZip: JSZip): Promise<void> {
 }
 
 /**
+ * Drop empty directory entries from the zip. pptxgenjs adds
+ * `ppt/charts/`, `ppt/charts/_rels/`, `ppt/embeddings/` (and similar)
+ * as zip directory entries even when no chart / embedding ever lands.
+ * PowerPoint validates the package and the empty `ppt/charts/_rels/`
+ * with no `ppt/charts/*.xml` is one of the patterns it flags.
+ *
+ * Synchronous — JSZip's `forEach` + `remove` are both sync.
+ */
+function pruneEmptyDirectories(outZip: JSZip): void {
+  const filePaths: string[] = [];
+  const dirPaths: string[] = [];
+  outZip.forEach((path, entry) => {
+    if (entry.dir) dirPaths.push(path);
+    else filePaths.push(path);
+  });
+  for (const dir of dirPaths) {
+    const prefix = dir.endsWith("/") ? dir : dir + "/";
+    const hasContent = filePaths.some((f) => f.startsWith(prefix));
+    if (!hasContent) outZip.remove(dir);
+  }
+}
+
+/**
  * Walk every `ppt/slides/slideN.xml` and collapse consecutive `<a:pPr>`
  * elements inside the same `<a:p>` to a single one. pptxgenjs sometimes
  * emits two adjacent `<a:pPr>` blocks (typically when a multi-run text
@@ -2216,6 +2241,15 @@ async function sanitiseSlideXml(outZip: JSZip): Promise<void> {
       prev = updated;
       updated = updated.replace(pprPair, "$1");
     } while (updated !== prev);
+    // pptxgenjs writes some element-only nodes with whitespace text
+    // between open/close (`<p:cNvPr …>    </p:cNvPr>`) which PowerPoint
+    // flags. Collapse to self-closing for elements that only have
+    // whitespace content. Restricted to nvSpPr/cNvPr-style empties so we
+    // don't accidentally normalise text frames.
+    updated = updated.replace(
+      /<(p:cNvPr|p:nvPr|p:cNvSpPr|p:cNvGrpSpPr|p:cNvPicPr|a:ln|a:avLst|a:lstStyle|a:bodyPr|a:gdLst|a:ahLst|a:cxnLst)\b([^>]*)>\s+<\/\1>/g,
+      "<$1$2/>"
+    );
     if (updated !== xml) outZip.file(p, updated);
   }
 }
