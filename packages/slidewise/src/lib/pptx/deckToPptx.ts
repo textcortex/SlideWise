@@ -564,6 +564,7 @@ async function preserveUnknowns(
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
+    await sanitiseRels(outZip);
     pruneEmptyDirectories(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
@@ -577,6 +578,7 @@ async function preserveUnknowns(
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
+    await sanitiseRels(outZip);
     pruneEmptyDirectories(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
@@ -662,6 +664,8 @@ async function preserveUnknowns(
   await applyEmbeddedFontsFromJson(outZip, deck);
   await sanitisePresentationXml(outZip);
   await sanitiseSlideXml(outZip);
+  await sanitiseRels(outZip);
+  pruneEmptyDirectories(outZip);
 
   // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
@@ -2184,6 +2188,43 @@ async function sanitisePresentationXml(outZip: JSZip): Promise<void> {
   }
 
   if (xml !== original) outZip.file("ppt/presentation.xml", xml);
+}
+
+/**
+ * Strip insignificant whitespace from every `.rels` file in the zip.
+ * pptxgenjs writes some rels files (notesMaster1, notesSlideN) with
+ * pretty-printed indentation including whitespace BETWEEN the XML
+ * declaration and the `<Relationships>` root. PowerPoint's strict
+ * package validator rejects this even though plain XML 1.0 allows
+ * whitespace in the prolog. Keynote is lenient.
+ *
+ * Conservative: only collapses whitespace OUTSIDE the
+ * Relationships element and between its children — both are
+ * element-only content models with no semantic whitespace.
+ */
+async function sanitiseRels(outZip: JSZip): Promise<void> {
+  const relsPaths: string[] = [];
+  outZip.forEach((path) => {
+    if (path.endsWith(".rels")) relsPaths.push(path);
+  });
+  for (const p of relsPaths) {
+    const file = outZip.file(p);
+    if (!file) continue;
+    const xml = await file.async("string");
+    let updated = xml;
+    // Drop whitespace between `?>` and `<Relationships`.
+    updated = updated.replace(/(\?>)\s+(<Relationships\b)/, "$1$2");
+    // Drop whitespace BETWEEN `<Relationship .../>` children.
+    updated = updated.replace(
+      /(<Relationship\b[^>]*\/>)\s+(<(?:Relationship\b|\/Relationships>))/g,
+      "$1$2"
+    );
+    // Drop whitespace immediately before `</Relationships>` close.
+    updated = updated.replace(/\s+<\/Relationships>/, "</Relationships>");
+    // Drop whitespace inside the `<Relationships>` open tag's content area.
+    updated = updated.replace(/(<Relationships\b[^>]*>)\s+(<Relationship\b)/, "$1$2");
+    if (updated !== xml) outZip.file(p, updated);
+  }
 }
 
 /**
