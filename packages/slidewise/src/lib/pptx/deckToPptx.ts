@@ -563,6 +563,7 @@ async function preserveUnknowns(
     const outZip = await JSZip.loadAsync(generated);
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
+    await sanitiseSlideXml(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
   if (!sourceBuffer && hasSynth) {
@@ -574,6 +575,7 @@ async function preserveUnknowns(
     await applyEmbeddedFontsFromJson(outZip, deck);
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
+    await sanitiseSlideXml(outZip);
     return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
   }
 
@@ -657,6 +659,7 @@ async function preserveUnknowns(
   // are set.
   await applyEmbeddedFontsFromJson(outZip, deck);
   await sanitisePresentationXml(outZip);
+  await sanitiseSlideXml(outZip);
 
   // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
   return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
@@ -2179,4 +2182,40 @@ async function sanitisePresentationXml(outZip: JSZip): Promise<void> {
   }
 
   if (xml !== original) outZip.file("ppt/presentation.xml", xml);
+}
+
+/**
+ * Walk every `ppt/slides/slideN.xml` and collapse consecutive `<a:pPr>`
+ * elements inside the same `<a:p>` to a single one. pptxgenjs sometimes
+ * emits two adjacent `<a:pPr>` blocks (typically when a multi-run text
+ * item with `breakLine` lands at a paragraph boundary) — CT_TextParagraph
+ * permits only one `pPr` per `<a:p>`, so PowerPoint flags the file as
+ * corrupt and offers to repair. Keynote is lenient and silently merges.
+ *
+ * The collapsed form keeps the FIRST occurrence (matches what PowerPoint
+ * resolves to in practice). When the two are identical it's a no-op
+ * semantically; when they differ, the first wins.
+ */
+async function sanitiseSlideXml(outZip: JSZip): Promise<void> {
+  const slidePaths: string[] = [];
+  outZip.forEach((path) => {
+    if (/^ppt\/slides\/slide\d+\.xml$/.test(path)) slidePaths.push(path);
+  });
+  for (const p of slidePaths) {
+    const file = outZip.file(p);
+    if (!file) continue;
+    const xml = await file.async("string");
+    // Match a `<a:pPr>` (with or without children) followed immediately
+    // by another `<a:pPr>` and drop the second. Repeat until no more
+    // pairs remain so 3+ consecutive blocks collapse to one.
+    const pprPair =
+      /(<a:pPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:pPr>))(<a:pPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:pPr>))/g;
+    let updated = xml;
+    let prev;
+    do {
+      prev = updated;
+      updated = updated.replace(pprPair, "$1");
+    } while (updated !== prev);
+    if (updated !== xml) outZip.file(p, updated);
+  }
 }
