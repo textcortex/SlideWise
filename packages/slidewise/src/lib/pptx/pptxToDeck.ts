@@ -16,6 +16,7 @@ import type {
   ChartElement,
   ChartSeries,
   UnknownElement,
+  FontAsset,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
 import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
@@ -321,11 +322,13 @@ export async function parsePptx(
   // a redundant fallback for callers that hold the deck object directly.
   const sourcePptxId = nanoid(12);
   sourceBufferCache.set(sourcePptxId, sourceBuffer);
+  const fonts = await readEmbeddedFonts(zip, presentationXml, presentationRels);
   const deck: Deck = {
     version: CURRENT_DECK_VERSION,
     title,
     slides,
     sourcePptxId,
+    ...(fonts.length ? { fonts } : {}),
   };
   Object.defineProperty(deck, SOURCE_PPTX, {
     value: sourceBuffer,
@@ -4366,6 +4369,78 @@ function firstByType(rels: Rels, suffix: string): string | undefined {
 
 function relsPathFor(xmlPath: string): string {
   return xmlPath.replace(/([^/]+)\.xml$/, "_rels/$1.xml.rels");
+}
+
+/**
+ * Walk the source's `<p:embeddedFontLst>` and pull each referenced
+ * font part out of `ppt/fonts/`, base64-encode the bytes, and return
+ * a `FontAsset[]` the serializer can write back. This makes the JSON
+ * deck self-contained: hosts can save the deck to disk, reload from
+ * JSON-only (no source bytes), and the EON / Inter / brand fonts
+ * still come through on export.
+ *
+ * Each `<p:embeddedFont>` can carry up to four style rels — regular /
+ * bold / italic / boldItalic. We emit one `FontAsset` per style with
+ * `weight` and `italic` set accordingly. The serializer combines
+ * same-family assets back into a single `<p:embeddedFont>` entry.
+ *
+ * Best-effort: when `ppt/fonts/` is absent or a rel points at a
+ * missing target, that style is skipped silently. Won't throw on
+ * malformed input — diagnostic only.
+ */
+async function readEmbeddedFonts(
+  zip: JSZip,
+  presentationXml: any,
+  presentationRels: Rels
+): Promise<FontAsset[]> {
+  const list = presentationXml?.["p:presentation"]?.["p:embeddedFontLst"];
+  if (!list) return [];
+  const fonts = asArray<any>(list["p:embeddedFont"]);
+  const out: FontAsset[] = [];
+  const styles: Array<{ key: string; weight: number; italic: boolean }> = [
+    { key: "p:regular", weight: 400, italic: false },
+    { key: "p:bold", weight: 700, italic: false },
+    { key: "p:italic", weight: 400, italic: true },
+    { key: "p:boldItalic", weight: 700, italic: true },
+  ];
+  for (const entry of fonts) {
+    const family = entry?.["p:font"]?.["@_typeface"];
+    if (!family) continue;
+    for (const style of styles) {
+      const rid = entry?.[style.key]?.["@_r:id"];
+      if (!rid) continue;
+      const target = presentationRels.byId.get(rid)?.target;
+      if (!target) continue;
+      const fullPath = normalisePath(target, "ppt");
+      const file = zip.file(fullPath);
+      if (!file) continue;
+      const bytes = await file.async("uint8array");
+      const base64 = uint8ArrayToBase64(bytes);
+      out.push({
+        family,
+        data: `data:application/x-fontdata;base64,${base64}`,
+        weight: style.weight,
+        italic: style.italic,
+      });
+    }
+  }
+  return out;
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  // Stream-friendly base64 — typed-array → binary-string → btoa works
+  // for files up to a few MB without blowing the call stack. Fonts are
+  // typically 50–500 KB so this is comfortable.
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(i, Math.min(i + chunk, bytes.length))
+    );
+  }
+  return typeof btoa !== "undefined"
+    ? btoa(binary)
+    : Buffer.from(binary, "binary").toString("base64");
 }
 
 async function readTitle(zip: JSZip): Promise<string> {

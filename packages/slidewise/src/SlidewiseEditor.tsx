@@ -19,7 +19,7 @@ import type { SlidewiseLabels } from "./compound/LabelsContext";
 import type { SlidewiseSurfaces } from "./compound/SurfacesContext";
 import type { SlidewiseCanvasConfig } from "./compound/CanvasContext";
 import type { Transition } from "framer-motion";
-import type { Deck } from "@/lib/types";
+import type { Deck, WebFontAsset } from "@/lib/types";
 import "./SlidewiseEditor.css";
 
 export interface SlidewiseEditorProps {
@@ -143,6 +143,13 @@ export interface SlidewiseEditorProps {
    * host chrome.
    */
   canvas?: SlidewiseCanvasConfig;
+  /**
+   * Per-host web font registry. The editor injects `@font-face` rules so
+   * the canvas renders text in your brand typeface. Per-deck entries on
+   * `Deck.webFonts` override on family-name collisions. Has no effect on
+   * PPTX export — that path uses `Deck.fonts` (the embedded payload).
+   */
+  fontRegistry?: WebFontAsset[];
   /** Extra class names appended to the editor root. */
   className?: string;
   /** Inline style applied to the editor root. */
@@ -204,6 +211,7 @@ export const SlidewiseEditor = forwardRef<
     labels,
     surfaces,
     canvas,
+    fontRegistry,
     className,
     style,
   },
@@ -239,6 +247,7 @@ export const SlidewiseEditor = forwardRef<
     labels,
     surfaces,
     canvas,
+    fontRegistry,
     className,
     style,
   };

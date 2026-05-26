@@ -10,7 +10,43 @@ export type ElementType =
   | "icon"
   | "embed"
   | "chart"
+  | "group"
   | "unknown";
+
+/**
+ * Drop shadow descriptor — emitted as CSS `box-shadow`/`text-shadow` in the
+ * renderer and `<a:outerShdw>` inside `<a:effectLst>` on save. Offsets and
+ * blur are in canvas pixels.
+ */
+export interface ShadowSpec {
+  color: string;
+  blur: number;
+  offsetX: number;
+  offsetY: number;
+}
+
+/**
+ * Outer-glow descriptor — emitted as CSS `filter: drop-shadow(…)` /
+ * `text-shadow` (since CSS has no native glow primitive) and `<a:glow>`
+ * inside `<a:effectLst>` on save.
+ */
+export interface GlowSpec {
+  color: string;
+  radius: number;
+}
+
+/**
+ * Dash pattern for stroked lines / shape outlines. Mirrors OOXML's
+ * `<a:prstDash val="…">` value list — these are the patterns PowerPoint
+ * recognises and renders without falling back to a custom dash.
+ */
+export type DashType =
+  | "solid"
+  | "dash"
+  | "dot"
+  | "dashDot"
+  | "lgDash"
+  | "sysDash";
 
 export type EnterAnim =
   | "none"
@@ -55,6 +91,10 @@ export interface TextRun {
 
 export interface TextElement extends BaseElement {
   type: "text";
+  /** Optional text shadow — CSS `text-shadow` / OOXML `<a:outerShdw>`. */
+  shadow?: ShadowSpec;
+  /** Optional outer glow — CSS `text-shadow` / OOXML `<a:glow>`. */
+  glow?: GlowSpec;
   text: string;
   fontFamily: string;
   fontSize: number;
@@ -131,9 +171,22 @@ export type ShapeKind =
 export interface ShapeElement extends BaseElement {
   type: "shape";
   shape: ShapeKind;
+  /**
+   * Solid hex (`#RRGGBB`), `transparent`, a CSS `linear-gradient(...)` /
+   * `radial-gradient(...)` string (set by the PPTX importer from
+   * `<a:gradFill>` — see `pptxToDeck.ts`), or a `url(data:image/...)` /
+   * `url(https://...)` string. The writer detects each form by parsing.
+   */
   fill: string;
   stroke?: string;
   strokeWidth?: number;
+  /**
+   * Typed dash pattern for the stroke — AI-authored and host-supplied
+   * decks set this. `strokeDash` is the raw OOXML value coming out of
+   * the importer; the renderer accepts either (`strokeDash` wins when
+   * both are set, since it preserves the exact PPTX intent).
+   */
+  dashType?: DashType;
   /**
    * Raw PPTX `<a:prstDash val="…">` style for the stroke (e.g. "dot", "dash",
    * "dashDot", "lgDash", "sysDot"). Only the patterned values are honoured;
@@ -141,6 +194,10 @@ export interface ShapeElement extends BaseElement {
    */
   strokeDash?: string;
   radius?: number;
+  /** Optional drop shadow — CSS `box-shadow` / OOXML `<a:outerShdw>`. */
+  shadow?: ShadowSpec;
+  /** Optional outer glow — CSS `filter: drop-shadow` / OOXML `<a:glow>`. */
+  glow?: GlowSpec;
   /**
    * Optional vector path, set when the shape was imported from a PPTX
    * `<a:custGeom>` (logos, brand marks, hand-drawn shapes). The renderer
@@ -181,7 +238,14 @@ export interface LineElement extends BaseElement {
   stroke: string;
   strokeWidth: number;
   arrow?: boolean;
+  /** Legacy convenience flag — equivalent to `dashType: "dash"`. */
   dashed?: boolean;
+  /** Detailed dash pattern. When set, takes precedence over `dashed`. */
+  dashType?: DashType;
+  /** Optional drop shadow. */
+  shadow?: ShadowSpec;
+  /** Optional outer glow. */
+  glow?: GlowSpec;
 }
 
 export interface TableElement extends BaseElement {
@@ -297,6 +361,21 @@ export interface ChartElement extends BaseElement {
   ooxmlXml?: string;
 }
 
+/**
+ * A grouped collection of slide elements. Position/size describe the group's
+ * own bounding box; children carry coordinates relative to the slide (NOT to
+ * the group). The renderer treats the group as a single z-stacked unit and
+ * the PPTX writer emits a `<p:grpSp>` containing the children's OOXML.
+ *
+ * NOTE: child drag-resize behaviour is unchanged in this release — selecting
+ * a child still moves the child individually. Group-level drag will follow
+ * in a later PR.
+ */
+export interface GroupElement extends BaseElement {
+  type: "group";
+  children: SlideElement[];
+}
+
 export type SlideElement =
   | TextElement
   | ShapeElement
@@ -306,12 +385,56 @@ export type SlideElement =
   | IconElement
   | EmbedElement
   | ChartElement
+  | GroupElement
   | UnknownElement;
 
 export interface Slide {
   id: string;
+  /**
+   * Solid hex (`#RRGGBB`), CSS `linear-gradient(...)` / `radial-gradient(...)`
+   * string, or `url(data:image/...)` / `url(https://...)` string. The writer
+   * picks the right `<p:bg>` OOXML form by parsing. When a source PPTX is
+   * attached, the source's `<p:bg>` replay wins over whatever's in this field.
+   */
   background: string;
   elements: SlideElement[];
+}
+
+/**
+ * A font the deck wants embedded into the saved PPTX so PowerPoint installs
+ * it on open. Bytes can be a data URL (`data:font/ttf;base64,...` or any
+ * `application/x-font-*` mime) or an http(s) URL the writer can fetch.
+ */
+export interface FontAsset {
+  /** Matches `TextElement.fontFamily` / run `fontFamily`. */
+  family: string;
+  /** Data URL or http(s) URL. The writer copies the bytes into `ppt/fonts/`. */
+  data: string;
+  /** Defaults to 400 (regular). */
+  weight?: number;
+  italic?: boolean;
+}
+
+/**
+ * A browser-renderable font file for the editor preview.
+ *
+ * `FontAsset.data` carries the PPTX-embedded payload (typically MTX-compressed
+ * EOT) which PowerPoint can render but browsers cannot. `WebFontAsset` is the
+ * accompanying TTF / OTF / WOFF / WOFF2 the host supplies so the in-editor
+ * canvas renders the actual typeface instead of a system fallback. Optional —
+ * when absent the renderer falls back through Google Fonts and then system.
+ */
+export interface WebFontAsset {
+  /** Matches `TextElement.fontFamily` / run `fontFamily`. */
+  family: string;
+  /**
+   * Same-origin URL, http(s) URL, or `data:font/*` data URL pointing at a
+   * browser-renderable font file (ttf / otf / woff / woff2).
+   */
+  src: string;
+  /** Defaults to 400 (regular). */
+  weight?: number;
+  italic?: boolean;
 }
 
 export interface Deck {
@@ -335,6 +458,20 @@ export interface Deck {
    * needs the host to re-attach source bytes via `serializeDeck({ source })`.
    */
   sourcePptxId?: string;
+  /**
+   * Optional list of fonts to embed into the saved PPTX. Honoured when no
+   * source PPTX is attached — when a source IS attached, chrome preservation
+   * carries the source's embedded fonts through verbatim and this field is
+   * ignored to avoid duplicate entries.
+   */
+  fonts?: FontAsset[];
+  /**
+   * Browser-renderable font files for the editor preview. The PPTX
+   * exporter only consults `fonts` (the embedded payload); `webFonts`
+   * is for the in-editor canvas. Hosts populate this when they have
+   * licensed copies of the brand font in a web-friendly format.
+   */
+  webFonts?: WebFontAsset[];
 }
 
 export type ElementDraft<T extends SlideElement = SlideElement> = T extends SlideElement
