@@ -273,6 +273,7 @@ export function Canvas() {
             transformOrigin: "top left",
             width: SLIDE_W,
             height: SLIDE_H,
+            overflow: "hidden",
           }}
         >
           {[...slide.elements]

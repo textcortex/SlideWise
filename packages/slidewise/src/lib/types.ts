@@ -142,6 +142,22 @@ export interface TextElement extends BaseElement {
    * collapses runs back to the flat representation.
    */
   runs?: TextRun[];
+  /**
+   * Optional per-paragraph layout metadata. PPTX bullets use a hanging-indent
+   * pattern (`marL` positive, `indent` negative) so the bullet hangs out to
+   * the left of the wrapped text. Splitting the text into paragraphs lets the
+   * renderer apply `padding-left` + `text-indent` per paragraph rather than
+   * collapsing every wrap line back to column 0.
+   */
+  paragraphs?: Array<{
+    text: string;
+    marL?: number;
+    indent?: number;
+    align?: "left" | "center" | "right";
+    runs?: TextRun[];
+    /** Space before paragraph in canvas pixels (from PPTX `<a:spcBef>`). */
+    spaceBefore?: number;
+  }>;
 }
 
 export type ShapeKind =
@@ -164,8 +180,19 @@ export interface ShapeElement extends BaseElement {
   fill: string;
   stroke?: string;
   strokeWidth?: number;
-  /** Optional dash pattern for the stroke. */
+  /**
+   * Typed dash pattern for the stroke — AI-authored and host-supplied
+   * decks set this. `strokeDash` is the raw OOXML value coming out of
+   * the importer; the renderer accepts either (`strokeDash` wins when
+   * both are set, since it preserves the exact PPTX intent).
+   */
   dashType?: DashType;
+  /**
+   * Raw PPTX `<a:prstDash val="…">` style for the stroke (e.g. "dot", "dash",
+   * "dashDot", "lgDash", "sysDot"). Only the patterned values are honoured;
+   * absent or "solid" renders as a continuous stroke.
+   */
+  strokeDash?: string;
   radius?: number;
   /** Optional drop shadow — CSS `box-shadow` / OOXML `<a:outerShdw>`. */
   shadow?: ShadowSpec;

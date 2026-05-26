@@ -200,6 +200,42 @@ function TextView({
     );
   }
 
+  if (el.paragraphs && el.paragraphs.length) {
+    // Per-paragraph rendering implements PPTX hanging-indent bullets: each
+    // paragraph becomes its own block, with `padding-left = marL` and
+    // `text-indent = indent`. A negative indent on top of a positive
+    // padding-left pulls the bullet glyph out to the left of the wrapped
+    // text below, matching PowerPoint's bulleted-list look.
+    return (
+      <div style={positionedOuter}>
+        {backingSvg}
+        <div style={innerStacked}>
+          {el.paragraphs.map((pp, pi) => {
+            const paraStyle: React.CSSProperties = {
+              paddingLeft: pp.marL ? pp.marL : undefined,
+              textIndent: pp.indent ? pp.indent : undefined,
+              textAlign: pp.align ?? undefined,
+              marginTop: pp.spaceBefore ? pp.spaceBefore : undefined,
+            };
+            const content =
+              pp.runs && pp.runs.length
+                ? pp.runs.map((r, ri) => (
+                    <span key={ri} style={runCssStyle(r)}>
+                      {r.text}
+                    </span>
+                  ))
+                : pp.text;
+            return (
+              <div key={pi} style={paraStyle}>
+                {content || " "}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   if (el.runs && el.runs.length) {
     return (
       <div style={positionedOuter}>
@@ -440,14 +476,51 @@ function sameStyle(a: TextRun, b: TextRun): boolean {
   );
 }
 
+// Map an OOXML <a:prstDash val="…"/> token to a CSS border-style and SVG
+// stroke-dasharray. PowerPoint's dot/dash patterns are sized relative to the
+// stroke width; the multipliers below match the visual rhythm of the preset
+// dash names (PPTX renders all "dot" variants as small round dots, "dash" as
+// medium dashes, "lgDash" as long dashes, etc.).
+function dashStyleFor(
+  preset: string | undefined,
+  sw: number
+): { borderStyle: "dotted" | "dashed" | "solid"; dasharray: string | undefined } {
+  if (!preset || preset === "solid") {
+    return { borderStyle: "solid", dasharray: undefined };
+  }
+  const w = Math.max(1, sw);
+  switch (preset) {
+    case "dot":
+    case "sysDot":
+      return { borderStyle: "dotted", dasharray: `${w} ${w * 2}` };
+    case "dash":
+    case "sysDash":
+      return { borderStyle: "dashed", dasharray: `${w * 4} ${w * 3}` };
+    case "lgDash":
+      return { borderStyle: "dashed", dasharray: `${w * 8} ${w * 3}` };
+    case "dashDot":
+    case "sysDashDot":
+      return { borderStyle: "dashed", dasharray: `${w * 4} ${w * 3} ${w} ${w * 3}` };
+    case "lgDashDot":
+      return { borderStyle: "dashed", dasharray: `${w * 8} ${w * 3} ${w} ${w * 3}` };
+    case "sysDashDotDot":
+    case "lgDashDotDot":
+      return {
+        borderStyle: "dashed",
+        dasharray: `${w * 8} ${w * 3} ${w} ${w * 3} ${w} ${w * 3}`,
+      };
+    default:
+      return { borderStyle: "dashed", dasharray: `${w * 4} ${w * 3}` };
+  }
+}
+
 function ShapeView({ el }: { el: ShapeElement }) {
   const stroke = el.stroke ?? "transparent";
   const sw = el.strokeWidth ?? 0;
-  // SVG dash patterns + CSS border styles. Both renderers need this — the
-  // path/preset SVG path gets `stroke-dasharray`, the rect/circle div gets
-  // `border-style`.
-  const dashArray = svgDashArray(el.dashType);
-  const borderStyle = cssDashStyle(el.dashType);
+  // Accept either `strokeDash` (raw OOXML, set by the importer) or
+  // `dashType` (typed enum, set by AI-authored / host-supplied decks).
+  // Raw wins when both are set — it preserves PPTX intent exactly.
+  const dash = dashStyleFor(el.strokeDash ?? el.dashType, sw);
   const effect = effectStyle(el.shadow, el.glow, "filter");
   // Custom vector path (PPTX <a:custGeom>) takes precedence over the preset
   // kind — the path coordinates already encode the actual silhouette.
@@ -466,7 +539,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
           fillRule={el.path.fillRule ?? "nonzero"}
           stroke={stroke}
           strokeWidth={sw || undefined}
-          strokeDasharray={dashArray}
+          strokeDasharray={dash.dasharray}
           vectorEffect="non-scaling-stroke"
         />
       </svg>
@@ -480,7 +553,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
           height: "100%",
           background: el.fill,
           borderRadius: el.shape === "rounded" ? (el.radius ?? 16) : 0,
-          border: sw ? `${sw}px ${borderStyle} ${stroke}` : undefined,
+          border: sw ? `${sw}px ${dash.borderStyle} ${stroke}` : undefined,
           ...effectStyle(el.shadow, el.glow, "box"),
         }}
       />
@@ -494,7 +567,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
           height: "100%",
           background: el.fill,
           borderRadius: "50%",
-          border: sw ? `${sw}px ${borderStyle} ${stroke}` : undefined,
+          border: sw ? `${sw}px ${dash.borderStyle} ${stroke}` : undefined,
           ...effectStyle(el.shadow, el.glow, "box"),
         }}
       />
@@ -514,7 +587,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
           fill={el.fill}
           stroke={stroke}
           strokeWidth={sw}
-          strokeDasharray={dashArray}
+          strokeDasharray={dash.dasharray}
           vectorEffect="non-scaling-stroke"
         />
       )}
@@ -524,7 +597,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
           fill={el.fill}
           stroke={stroke}
           strokeWidth={sw}
-          strokeDasharray={dashArray}
+          strokeDasharray={dash.dasharray}
           vectorEffect="non-scaling-stroke"
         />
       )}
@@ -534,38 +607,12 @@ function ShapeView({ el }: { el: ShapeElement }) {
           fill={el.fill}
           stroke={stroke}
           strokeWidth={sw}
-          strokeDasharray={dashArray}
+          strokeDasharray={dash.dasharray}
           vectorEffect="non-scaling-stroke"
         />
       )}
     </svg>
   );
-}
-
-function svgDashArray(
-  dt: ShapeElement["dashType"] | LineElement["dashType"]
-): string | undefined {
-  switch (dt) {
-    case "dash":
-      return "8 4";
-    case "dot":
-      return "2 4";
-    case "dashDot":
-      return "8 4 2 4";
-    case "lgDash":
-      return "16 6";
-    case "sysDash":
-      return "5 3";
-    default:
-      return undefined;
-  }
-}
-
-function cssDashStyle(dt: ShapeElement["dashType"]): string {
-  if (dt === "dash" || dt === "lgDash" || dt === "sysDash") return "dashed";
-  if (dt === "dot") return "dotted";
-  if (dt === "dashDot") return "dashed";
-  return "solid";
 }
 
 function ImageView({ el }: { el: ImageElement }) {
@@ -652,7 +699,8 @@ function LineView({ el }: { el: LineElement }) {
         stroke={el.stroke}
         strokeWidth={el.strokeWidth}
         strokeDasharray={
-          svgDashArray(el.dashType) ?? (el.dashed ? "12 8" : undefined)
+          dashStyleFor(el.dashType, el.strokeWidth).dasharray ??
+          (el.dashed ? "12 8" : undefined)
         }
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
