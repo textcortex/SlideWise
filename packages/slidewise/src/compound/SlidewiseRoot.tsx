@@ -15,9 +15,14 @@ import {
   useEditor,
   useEditorStore,
 } from "@/lib/StoreProvider";
-import { collectFontFamilies, ensureGoogleFontsLoaded } from "@/lib/fonts";
+import {
+  collectFontFamilies,
+  ensureGoogleFontsLoaded,
+  ensureWebFontsLoaded,
+  resolveWebFonts,
+} from "@/lib/fonts";
 import { resolveJsonDeck } from "@/lib/schema/json";
-import type { Deck } from "@/lib/types";
+import type { Deck, WebFontAsset } from "@/lib/types";
 import { GridView } from "@/components/editor/GridView";
 import { PlayMode } from "@/components/editor/PlayMode";
 import { MotionConfig, type Transition } from "framer-motion";
@@ -146,6 +151,18 @@ export interface SlidewiseRootProps {
    * `resolveSlideBackground` let hosts override per-slide fills.
    */
   canvas?: SlidewiseCanvasConfig;
+  /**
+   * Per-host web font registry. The editor injects an `@font-face` rule
+   * for every entry so the canvas can render text in the brand typeface
+   * before a deck supplies its own `Deck.webFonts`. Use this for fonts
+   * licensed across all decks the host serves (e.g. Inter, your brand
+   * sans). Per-deck entries in `Deck.webFonts` take precedence on
+   * family-name collisions.
+   *
+   * Has no effect on PPTX export — the writer consults `Deck.fonts`
+   * (the embedded binary payload) for that path.
+   */
+  fontRegistry?: WebFontAsset[];
   /** Extra class names appended to the root. */
   className?: string;
   /** Inline style applied to the root. */
@@ -285,6 +302,7 @@ function RootInner({
   labels,
   surfaces,
   canvas,
+  fontRegistry,
   className,
   style,
   children,
@@ -376,11 +394,34 @@ function RootInner({
   }, [deck, store]);
 
   const instanceId = useId().replace(/[^a-z0-9]/gi, "");
+  const fontRegistryRef = useRef(fontRegistry);
   useEffect(() => {
+    fontRegistryRef.current = fontRegistry;
+    const resolved = resolveWebFonts(store.getState().deck, fontRegistry ?? []);
+    ensureWebFontsLoaded(instanceId, resolved);
+    // Re-issue the Google Fonts link too so families covered by the
+    // registry no longer hit the Google endpoint (which 404s on
+    // private/brand families and surfaces a noisy CORS error).
+    const excluded = new Set(resolved.map((f) => f.family.toLowerCase()));
     ensureGoogleFontsLoaded(
       instanceId,
-      collectFontFamilies(store.getState().deck)
+      collectFontFamilies(store.getState().deck),
+      excluded
     );
+  }, [fontRegistry, instanceId, store]);
+
+  useEffect(() => {
+    const resolved = resolveWebFonts(
+      store.getState().deck,
+      fontRegistryRef.current ?? []
+    );
+    const excluded = new Set(resolved.map((f) => f.family.toLowerCase()));
+    ensureGoogleFontsLoaded(
+      instanceId,
+      collectFontFamilies(store.getState().deck),
+      excluded
+    );
+    ensureWebFontsLoaded(instanceId, resolved);
     return store.subscribe((state, prev) => {
       // Fire onHistoryChange whenever stack depths change. Independent of
       // deck identity so undo/redo always emit, even if the resulting deck
@@ -428,13 +469,24 @@ function RootInner({
         setDirty(nextDirty);
         onDirtyChangeRef.current?.(nextDirty);
       }
-      ensureGoogleFontsLoaded(instanceId, collectFontFamilies(state.deck));
+      const resolved = resolveWebFonts(
+        state.deck,
+        fontRegistryRef.current ?? []
+      );
+      const excluded = new Set(resolved.map((f) => f.family.toLowerCase()));
+      ensureGoogleFontsLoaded(
+        instanceId,
+        collectFontFamilies(state.deck),
+        excluded
+      );
+      ensureWebFontsLoaded(instanceId, resolved);
     });
   }, [store, instanceId]);
 
   useEffect(() => {
     return () => {
       ensureGoogleFontsLoaded(instanceId, []);
+      ensureWebFontsLoaded(instanceId, []);
     };
   }, [instanceId]);
 

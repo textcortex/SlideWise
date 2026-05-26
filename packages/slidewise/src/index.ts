@@ -122,5 +122,6 @@ export type {
   GlowSpec,
   DashType,
   FontAsset,
+  WebFontAsset,
 } from "./lib/types";
 export { SLIDE_W, SLIDE_H } from "./lib/types";

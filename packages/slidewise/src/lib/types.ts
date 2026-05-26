@@ -388,6 +388,28 @@ export interface FontAsset {
   italic?: boolean;
 }
 
+/**
+ * A browser-renderable font file for the editor preview.
+ *
+ * `FontAsset.data` carries the PPTX-embedded payload (typically MTX-compressed
+ * EOT) which PowerPoint can render but browsers cannot. `WebFontAsset` is the
+ * accompanying TTF / OTF / WOFF / WOFF2 the host supplies so the in-editor
+ * canvas renders the actual typeface instead of a system fallback. Optional —
+ * when absent the renderer falls back through Google Fonts and then system.
+ */
+export interface WebFontAsset {
+  /** Matches `TextElement.fontFamily` / run `fontFamily`. */
+  family: string;
+  /**
+   * Same-origin URL, http(s) URL, or `data:font/*` data URL pointing at a
+   * browser-renderable font file (ttf / otf / woff / woff2).
+   */
+  src: string;
+  /** Defaults to 400 (regular). */
+  weight?: number;
+  italic?: boolean;
+}
+
 export interface Deck {
   /**
    * Schema version this deck conforms to. Stamped by `migrate()` and by
@@ -416,6 +438,13 @@ export interface Deck {
    * ignored to avoid duplicate entries.
    */
   fonts?: FontAsset[];
+  /**
+   * Browser-renderable font files for the editor preview. The PPTX
+   * exporter only consults `fonts` (the embedded payload); `webFonts`
+   * is for the in-editor canvas. Hosts populate this when they have
+   * licensed copies of the brand font in a web-friendly format.
+   */
+  webFonts?: WebFontAsset[];
 }
 
 export type ElementDraft<T extends SlideElement = SlideElement> = T extends SlideElement
