@@ -248,9 +248,50 @@ export interface LineElement extends BaseElement {
   glow?: GlowSpec;
 }
 
+/**
+ * Per-cell formatting captured from `<a:tcPr>` (fill, alignment) and the
+ * first run's `<a:rPr>` (color, weight, size, family) when the PPTX
+ * importer parses a table.
+ *
+ * The schema is intentionally flat: PowerPoint tables routinely mix
+ * per-cell text colors, bold phase-header labels, and per-cell fills,
+ * and the previous `string[][]` shape collapsed all of that to the
+ * table's defaults. `text` is the visible content; the optional fields
+ * override the table-level defaults (`textColor`, `fontSize`, etc.)
+ * only when they were explicitly authored at the cell level.
+ *
+ * Cells provided as a bare string in `TableElement.rows` (legacy decks,
+ * AI-authored decks that don't carry styling) are accepted and treated
+ * as `{ text }` — no migration step required.
+ */
+export interface TableCell {
+  text: string;
+  /** Resolved hex colour for this cell's text, overrides `textColor`. */
+  color?: string;
+  /** Resolved hex fill for this cell, overrides any row/header/banded fill. */
+  fill?: string;
+  bold?: boolean;
+  italic?: boolean;
+  /** Font size in canvas pixels (post-fit-scaling), overrides `fontSize`. */
+  fontSize?: number;
+  fontFamily?: string;
+  align?: "left" | "center" | "right";
+  /** Horizontal cell merge (cells to the right are absorbed). */
+  colSpan?: number;
+  /** Vertical cell merge (cells below are absorbed). */
+  rowSpan?: number;
+}
+
+export type TableRow = (string | TableCell)[];
+
 export interface TableElement extends BaseElement {
   type: "table";
-  rows: string[][];
+  /**
+   * Each cell is either a plain string (renders with table defaults) or
+   * a `TableCell` carrying per-cell overrides. Plain strings are kept as
+   * the lossless representation for AI-authored / simple decks.
+   */
+  rows: TableRow[];
   headerFill: string;
   rowFill: string;
   textColor: string;

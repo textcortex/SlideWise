@@ -13,6 +13,7 @@ import type {
   ImageElement,
   LineElement,
   TableElement,
+  TableCell,
   ChartElement,
   ChartSeries,
   UnknownElement,
@@ -1840,7 +1841,7 @@ function parseTable(
   const band1Fill = styleFill(style?.band1H);
   const band2Fill = styleFill(style?.band2H);
 
-  const rows: string[][] = [];
+  const rows: TableCell[][] = [];
   let firstFontSizePx: number | undefined;
   let firstColor: string | undefined;
   let headerCellFill: string | undefined;
@@ -1849,17 +1850,16 @@ function parseTable(
   for (let ri = 0; ri < trs.length; ri++) {
     const tr = trs[ri];
     const tcs = asArray(tr["a:tc"]);
-    const cells: string[] = [];
+    const cells: TableCell[] = [];
     for (const tc of tcs) {
       if (tc?.["@_hMerge"] === "1" || tc?.["@_vMerge"] === "1") {
-        cells.push("");
+        cells.push({ text: "" });
         continue;
       }
       const txBody = tc["a:txBody"];
       const text = txBody
         ? extractRuns(txBody, ctx.theme, undefined, undefined, ctx.themeFonts)
         : { plain: "", runs: [] as RunInfo[] };
-      cells.push(text.plain);
 
       const r0 = text.runs[0];
       if (firstFontSizePx === undefined && r0?.fontSize) {
@@ -1867,16 +1867,33 @@ function parseTable(
       }
       if (!firstColor && r0?.color) firstColor = r0.color;
 
-      // Cell-level <a:tcPr><a:solidFill> wins over style fills (PPTX
-      // override semantics): record it here so the table-level defaults
-      // we pick below don't clobber it. We can't model per-cell fills
-      // yet, so the *first* explicit cell fill on the header / body
-      // wins for the whole row class.
+      // Per-cell fill from <a:tcPr><a:solidFill>. We continue to track
+      // the first header / body fill as table-level defaults for any
+      // cell that *doesn't* override (matches the legacy renderer).
       const cellFill = resolveColor(tc?.["a:tcPr"]?.["a:solidFill"], ctx.theme);
       if (cellFill) {
         if (ri === 0 && headerCellFill === undefined) headerCellFill = cellFill;
         else if (ri > 0 && bodyCellFill === undefined) bodyCellFill = cellFill;
       }
+
+      // Per-cell alignment from <a:tcPr anchor="ctr|t|b"> (vertical) or
+      // the first paragraph's <a:pPr algn="l|ctr|r"> (horizontal).
+      const algn = txBody?.["a:p"]?.["a:pPr"]?.["@_algn"]
+        ?? asArray(txBody?.["a:p"])[0]?.["a:pPr"]?.["@_algn"];
+      const horiz: TableCell["align"] | undefined =
+        algn === "ctr" ? "center" : algn === "r" ? "right" : algn === "l" ? "left" : undefined;
+
+      const cell: TableCell = { text: text.plain };
+      if (r0?.color) cell.color = r0.color;
+      if (cellFill) cell.fill = cellFill;
+      if (r0?.bold) cell.bold = true;
+      if (r0?.italic) cell.italic = true;
+      if (r0?.fontSize) {
+        cell.fontSize = Math.max(8, Math.round(r0.fontSize * ctx.fit.scale));
+      }
+      if (r0?.fontFamily) cell.fontFamily = r0.fontFamily;
+      if (horiz) cell.align = horiz;
+      cells.push(cell);
     }
     rows.push(cells);
   }

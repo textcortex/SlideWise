@@ -7,6 +7,7 @@ import type {
   ImageElement,
   LineElement,
   TableElement,
+  TableCell,
   IconElement,
   EmbedElement,
   ChartElement,
@@ -715,16 +716,21 @@ function LineView({ el }: { el: LineElement }) {
   );
 }
 
+/**
+ * Normalise `TableRow` (mixed `string | TableCell`) into a typed cell so the
+ * renderer doesn't have to branch on every access.
+ */
+function normaliseCell(c: string | TableCell): TableCell {
+  return typeof c === "string" ? { text: c } : c;
+}
+
 function TableView({ el }: { el: TableElement }) {
   const cols = el.rows[0]?.length ?? 1;
   const rowCount = el.rows.length;
-  // PPTX-faithful: contiguous cells, no inter-cell gap, no rounded corners.
-  // Cells share their dividers via inset box-shadows so we draw a single
-  // grid line between adjacent cells instead of doubling-up borders.
   const stroke = el.borderColor ?? "rgba(0, 0, 0, 0.12)";
   const hasHeader = el.hasHeader ?? true;
   const bandRows = el.bandRows ?? false;
-  const cellFill = (ri: number, ci: number): string => {
+  const tableFill = (ri: number, ci: number): string => {
     if (hasHeader && ri === 0) return el.headerFill;
     if (el.lastRowFill && ri === rowCount - 1 && rowCount > 1) return el.lastRowFill;
     if (el.firstColFill && ci === 0) return el.firstColFill;
@@ -737,7 +743,7 @@ function TableView({ el }: { el: TableElement }) {
     }
     return el.rowFill;
   };
-  const cellColor = (ri: number, ci: number): string => {
+  const tableColor = (ri: number, ci: number): string => {
     if (hasHeader && ri === 0 && el.headerTextColor) return el.headerTextColor;
     if (el.firstColTextColor && ci === 0 && !(hasHeader && ri === 0)) {
       return el.firstColTextColor;
@@ -758,34 +764,55 @@ function TableView({ el }: { el: TableElement }) {
       }}
     >
       {el.rows.flatMap((row, ri) =>
-        row.map((cell, ci) => (
-          <div
-            key={`${ri}-${ci}`}
-            style={{
-              background: cellFill(ri, ci),
-              color: cellColor(ri, ci),
-              fontSize: el.fontSize,
-              padding: "12px 16px",
-              display: "flex",
-              alignItems: "center",
-              fontWeight:
-                (hasHeader && ri === 0) || (el.firstColFill && ci === 0)
-                  ? 600
-                  : 400,
-              boxSizing: "border-box",
-              minWidth: 0,
-              minHeight: 0,
-              overflow: "hidden",
-              wordBreak: "break-word",
-              borderRight:
-                ci < cols - 1 ? `1px solid ${stroke}` : undefined,
-              borderBottom:
-                ri < rowCount - 1 ? `1px solid ${stroke}` : undefined,
-            }}
-          >
-            {cell}
-          </div>
-        ))
+        row.map((rawCell, ci) => {
+          const cell = normaliseCell(rawCell);
+          // Per-cell properties win over table-level defaults; fall back
+          // to the row/header/column rules when the cell didn't author
+          // its own override. This is what closes the per-cell-color
+          // visibility gap on PPTX tables where each cell carries its
+          // own colour (Gantt timelines, phase labels, etc.).
+          const fill = cell.fill ?? tableFill(ri, ci);
+          const color = cell.color ?? tableColor(ri, ci);
+          const fontSize = cell.fontSize ?? el.fontSize;
+          const isDefaultBold =
+            (hasHeader && ri === 0) || (el.firstColFill && ci === 0);
+          const fontWeight =
+            cell.bold === true ? 700 : cell.bold === false ? 400 : isDefaultBold ? 600 : 400;
+          return (
+            <div
+              key={`${ri}-${ci}`}
+              style={{
+                background: fill,
+                color,
+                fontSize,
+                fontWeight,
+                fontStyle: cell.italic ? "italic" : undefined,
+                fontFamily: cell.fontFamily,
+                textAlign: cell.align,
+                justifyContent:
+                  cell.align === "center"
+                    ? "center"
+                    : cell.align === "right"
+                      ? "flex-end"
+                      : undefined,
+                padding: "12px 16px",
+                display: "flex",
+                alignItems: "center",
+                boxSizing: "border-box",
+                minWidth: 0,
+                minHeight: 0,
+                overflow: "hidden",
+                wordBreak: "break-word",
+                borderRight:
+                  ci < cols - 1 ? `1px solid ${stroke}` : undefined,
+                borderBottom:
+                  ri < rowCount - 1 ? `1px solid ${stroke}` : undefined,
+              }}
+            >
+              {cell.text}
+            </div>
+          );
+        })
       )}
     </div>
   );

@@ -10,6 +10,7 @@ import type {
   ImageElement,
   LineElement,
   TableElement,
+  TableCell,
   IconElement,
   EmbedElement,
   ChartElement,
@@ -469,17 +470,53 @@ function addLine(
 
 function addTable(s: pptxgen.Slide, el: TableElement): void {
   if (!el.rows.length) return;
+  const hasHeader = el.hasHeader ?? true;
+  const bandRows = el.bandRows ?? false;
+  const cols = el.rows[0]?.length ?? 1;
+  const rowCount = el.rows.length;
+  const tableFill = (ri: number, ci: number): string => {
+    if (hasHeader && ri === 0) return el.headerFill;
+    if (el.lastRowFill && ri === rowCount - 1 && rowCount > 1) return el.lastRowFill;
+    if (el.firstColFill && ci === 0) return el.firstColFill;
+    if (el.lastColFill && ci === cols - 1) return el.lastColFill;
+    if (bandRows && el.rowAltFill) {
+      const bodyIdx = hasHeader ? ri - 1 : ri;
+      return bodyIdx % 2 === 1 ? el.rowAltFill : el.rowFill;
+    }
+    return el.rowFill;
+  };
+  const tableColor = (ri: number, ci: number): string => {
+    if (hasHeader && ri === 0 && el.headerTextColor) return el.headerTextColor;
+    if (el.firstColTextColor && ci === 0 && !(hasHeader && ri === 0)) {
+      return el.firstColTextColor;
+    }
+    return el.textColor;
+  };
   const rows = el.rows.map((row, ri) =>
-    row.map((cell) => ({
-      text: cell,
-      options: {
-        bold: ri === 0,
-        fill: { color: hexNoHash(ri === 0 ? el.headerFill : el.rowFill) },
-        color: hexNoHash(el.textColor),
-        fontSize: pxToPoints(el.fontSize),
-        valign: "middle" as const,
-      },
-    }))
+    row.map((raw, ci) => {
+      // Per-cell formatting wins over row/header/column defaults. Bare
+      // strings (`row: ["a","b"]` legacy shape) fall through to the
+      // table-level defaults below.
+      const cell: TableCell = typeof raw === "string" ? { text: raw } : raw;
+      const fill = cell.fill ?? tableFill(ri, ci);
+      const color = cell.color ?? tableColor(ri, ci);
+      const fontSize = cell.fontSize ?? el.fontSize;
+      const cellBold =
+        cell.bold === true ? true : cell.bold === false ? false : ri === 0;
+      return {
+        text: cell.text,
+        options: {
+          bold: cellBold,
+          italic: cell.italic === true ? true : undefined,
+          fill: { color: hexNoHash(fill) },
+          color: hexNoHash(color),
+          fontSize: pxToPoints(fontSize),
+          fontFace: cell.fontFamily,
+          align: cell.align,
+          valign: "middle" as const,
+        },
+      };
+    })
   );
   s.addTable(rows, {
     ...geometry(el),

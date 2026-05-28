@@ -109,6 +109,8 @@ export type {
   ImageElement,
   LineElement,
   TableElement,
+  TableCell,
+  TableRow,
   IconElement,
   EmbedElement,
   ChartElement,
