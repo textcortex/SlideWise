@@ -325,11 +325,16 @@ export function svgPathToOoxml(
     }
   }
   if (!cmds.length) return null;
+  // OOXML's `<a:path>` doesn't take an SVG-style `fill-rule`. The `fill`
+  // attribute here is a *color modifier* (`norm` | `lighten` | `darken` | …).
+  // Emit nothing → defaults to `norm`, i.e. use the shape's `<a:solidFill>`
+  // as-is. SVG even-odd vs non-zero winding doesn't have a direct OOXML
+  // equivalent — PowerPoint resolves winding from the order of moveTo /
+  // cubicBezTo operations, which we already preserve.
+  void fillRule;
   return (
     `<a:pathLst>` +
-    `<a:path w="${Math.max(1, Math.round(viewW))}" h="${Math.max(1, Math.round(viewH))}"` +
-    (fillRule === "evenodd" ? ` fill="darken"` : ``) +
-    `>` +
+    `<a:path w="${Math.max(1, Math.round(viewW))}" h="${Math.max(1, Math.round(viewH))}">` +
     cmds.join("") +
     `</a:path>` +
     `</a:pathLst>`

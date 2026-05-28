@@ -57,8 +57,12 @@ describe("synth writers (PRs 1, 2, 3, 4, 5, 6, 7)", () => {
     expect(slide).toContain("<a:moveTo>");
     expect(slide).toContain("<a:lnTo>");
     expect(slide).toContain("<a:close/>");
-    // even-odd fill rule
-    expect(slide).toMatch(/<a:path\b[^>]*fill="darken"/);
+    // `<a:path fill="…">` is a colour MODIFIER (`darken`, `lighten`, `norm`);
+    // it is NOT an SVG-style fill-rule. We omit the attribute so the path
+    // renders with the shape's `<a:solidFill>` unchanged. Asserting the
+    // wrong thing here was masking a real bug where every custGeom path
+    // came out grey (darkened red) instead of brand red.
+    expect(slide).not.toMatch(/<a:path\b[^>]*fill="darken"/);
   });
 
   it("PR 2: emits <a:gradFill> for shapes with linear-gradient fill", async () => {
