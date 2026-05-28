@@ -1,4 +1,5 @@
-import type { Deck, TextElement, WebFontAsset } from "@/lib/types";
+import type { Deck, FontAsset, TextElement, WebFontAsset } from "@/lib/types";
+import { decodeEot, EotDecodeError } from "./fonts/eot";
 
 /**
  * Best-effort web-font loader for typefaces referenced inside a Deck.
@@ -201,9 +202,18 @@ function escapeCss(s: string): string {
 }
 
 /**
- * Collect web fonts that should drive the editor preview, merging the
- * deck's own list with a host-supplied registry. The deck wins on
- * family-name collisions (the deck author knows best what they want).
+ * Collect web fonts that should drive the editor preview. Precedence:
+ *
+ *   1. `Deck.webFonts` — per-deck overrides, AI-authored decks ship these.
+ *   2. `fontRegistry` — host-wide brand fonts the platform owns.
+ *   3. **Decoded `Deck.fonts`** — embedded `.fntdata` payloads the importer
+ *      pulled from `ppt/fonts/`. When the EOT is uncompressed (or uses an
+ *      MTX sub-method we can decode), we synthesise a `data:font/ttf;…`
+ *      URL on the fly. Brand-embedded fonts that use MTX glyph compression
+ *      can't be decoded yet and are skipped — `fontRegistry` is the
+ *      documented fallback for those cases.
+ *
+ * The first source to claim a `(family, weight, italic)` tuple wins.
  */
 export function resolveWebFonts(
   deck: Deck,
@@ -225,5 +235,129 @@ export function resolveWebFonts(
     seen.add(k);
     out.push(f);
   }
+  for (const f of decodeDeckEmbeddedFonts(deck)) {
+    const k = key(f);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(f);
+  }
   return out;
+}
+
+/**
+ * Convert a `Deck.fonts` entry (raw `.fntdata` from `ppt/fonts/`) into a
+ * `WebFontAsset` the editor can render. Returns `null` when the EOT is
+ * MTX-compressed (we have a partial decoder; the brand-font glyph encoder
+ * isn't done yet — see `./fonts/mtx.ts`) so callers can move on to the
+ * registry / system-font fallback chain.
+ *
+ * The returned asset uses a `data:font/ttf;base64,...` URL so the resulting
+ * `@font-face` is fully self-contained — no CDN, no network request.
+ */
+export function fontAssetToWebFont(asset: FontAsset): WebFontAsset | null {
+  const bytes = decodeFontAssetData(asset.data);
+  if (!bytes) return null;
+  try {
+    const decoded = decodeEot(bytes);
+    const dataUrl = `data:font/ttf;base64,${uint8ArrayToBase64(decoded.ttf)}`;
+    return {
+      family: asset.family,
+      src: dataUrl,
+      weight: asset.weight,
+      italic: asset.italic,
+    };
+  } catch (err) {
+    // EotDecodeError with kind "mtx-not-implemented" is the expected path
+    // for brand-embedded fonts (EON / corporate fonts almost always use
+    // MTX glyph compression). Don't shout in the console; the host's
+    // `fontRegistry` is the documented fallback.
+    if (
+      err instanceof EotDecodeError &&
+      (err.kind === "mtx-not-implemented" || err.kind === "mtx-failed")
+    ) {
+      if (
+        typeof window !== "undefined" &&
+        (window as unknown as { __slidewiseFontDebug?: boolean })
+          .__slidewiseFontDebug
+      ) {
+        console.debug(
+          "[slidewise/fonts] embedded font",
+          asset.family,
+          "is MTX-compressed; falling back to fontRegistry / system",
+          err.message
+        );
+      }
+      return null;
+    }
+    if (
+      typeof window !== "undefined" &&
+      (window as unknown as { __slidewiseFontDebug?: boolean })
+        .__slidewiseFontDebug
+    ) {
+      console.debug(
+        "[slidewise/fonts] EOT decode failed for",
+        asset.family,
+        err
+      );
+    }
+    return null;
+  }
+}
+
+/**
+ * Bulk-convert `Deck.fonts` → `WebFontAsset[]` filtering out the entries
+ * we couldn't decode. Safe to call eagerly inside a `useMemo` because
+ * decoding a 200KB font runs in single-digit ms.
+ */
+export function decodeDeckEmbeddedFonts(deck: Deck): WebFontAsset[] {
+  if (!deck.fonts || !deck.fonts.length) return [];
+  const out: WebFontAsset[] = [];
+  for (const asset of deck.fonts) {
+    const web = fontAssetToWebFont(asset);
+    if (web) out.push(web);
+  }
+  return out;
+}
+
+/**
+ * Accept the `data` URL forms that `FontAsset` documents — `data:`
+ * URLs (the importer uses these for `ppt/fonts/*.fntdata`) and bare
+ * base64 strings. Returns null on `http(s):` URLs (those would need to
+ * be fetched, which is out of scope for the synchronous resolver).
+ */
+function decodeFontAssetData(data: string): Uint8Array | null {
+  if (!data) return null;
+  if (/^https?:/i.test(data)) return null;
+  const comma = data.indexOf(",");
+  const base64 = comma >= 0 ? data.slice(comma + 1) : data;
+  try {
+    return base64ToUint8Array(base64);
+  } catch {
+    return null;
+  }
+}
+
+function base64ToUint8Array(b64: string): Uint8Array {
+  if (typeof atob === "function") {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  // Node test environments — Buffer is available.
+  return new Uint8Array(Buffer.from(b64, "base64"));
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  if (typeof btoa === "function") {
+    let bin = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode(
+        ...bytes.subarray(i, Math.min(i + chunk, bytes.length))
+      );
+    }
+    return btoa(bin);
+  }
+  return Buffer.from(bytes).toString("base64");
 }
