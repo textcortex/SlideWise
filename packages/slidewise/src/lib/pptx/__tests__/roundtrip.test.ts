@@ -457,4 +457,53 @@ describe("pptx round-trip", () => {
     );
     expect(preservedFiles.length).toBe(1);
   });
+
+  it("surfaces an embedded SFNT font as a browser-renderable webFont", async () => {
+    const JSZip = (await import("jszip")).default;
+    const sourceZip = new JSZip();
+    sourceZip.file(
+      "[Content_Types].xml",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="fntdata" ContentType="application/x-fontdata"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+</Types>`
+    );
+    sourceZip.file(
+      "_rels/.rels",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>`
+    );
+    sourceZip.file(
+      "ppt/_rels/presentation.xml.rels",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" Target="fonts/font1.fntdata"/></Relationships>`
+    );
+    sourceZip.file(
+      "ppt/presentation.xml",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/><p:embeddedFontLst><p:embeddedFont><p:font typeface="BrandSans"/><p:regular r:id="rId10"/></p:embeddedFont></p:embeddedFontLst></p:presentation>`
+    );
+    sourceZip.file(
+      "ppt/slides/_rels/slide1.xml.rels",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`
+    );
+    sourceZip.file(
+      "ppt/slides/slide1.xml",
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree></p:spTree></p:cSld></p:sld>`
+    );
+    // Minimal payload that begins with the TrueType SFNT signature 0x00010000.
+    const fontBytes = new Uint8Array([0x00, 0x01, 0x00, 0x00, 0x41, 0x42]);
+    sourceZip.file("ppt/fonts/font1.fntdata", fontBytes);
+
+    const sourceBuffer = await sourceZip.generateAsync({ type: "arraybuffer" });
+    const parsed = await parsePptx(sourceBuffer);
+
+    // The embedded payload survives for re-export...
+    expect(parsed.fonts?.some((f) => f.family === "BrandSans")).toBe(true);
+    // ...and a browser-renderable webFont is surfaced for the editor canvas.
+    const web = parsed.webFonts?.find((f) => f.family === "BrandSans");
+    expect(web).toBeTruthy();
+    expect(web?.src.startsWith("data:font/ttf;base64,")).toBe(true);
+  });
 });
