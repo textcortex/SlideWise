@@ -110,6 +110,143 @@ describe("pptx round-trip", () => {
     }
   });
 
+  it("preserves a group (with custGeom + radial-gradient children) as a GroupElement", async () => {
+    const deck = makeDeck([
+      {
+        ...baseElement,
+        id: "grp",
+        type: "group",
+        x: 200,
+        y: 150,
+        w: 800,
+        h: 400,
+        children: [
+          {
+            ...baseElement,
+            id: "logo",
+            type: "shape",
+            x: 200,
+            y: 150,
+            w: 300,
+            h: 300,
+            shape: "rect",
+            fill: "#222222",
+            // Custom vector geometry (a triangle) — must survive grouping.
+            path: {
+              d: "M 0 100 L 50 0 L 100 100 Z",
+              viewW: 100,
+              viewH: 100,
+            },
+          },
+          {
+            ...baseElement,
+            id: "panel",
+            type: "shape",
+            x: 600,
+            y: 150,
+            w: 350,
+            h: 300,
+            shape: "circle",
+            fill: "radial-gradient(circle at 50% 50%, #FF0000 0%, #0000FF 100%)",
+          },
+        ],
+      },
+    ]);
+
+    const out = await roundtrip(deck);
+    const group = out.slides[0].elements.find((e) => e.type === "group");
+    expect(group).toBeTruthy();
+    if (!group || group.type !== "group") return;
+    // The group survived as a group rather than being flattened to loose shapes.
+    expect(group.children.length).toBe(2);
+    // Group bounding box maps back onto the slide.
+    expect(Math.abs(group.x - 200)).toBeLessThanOrEqual(2);
+    expect(Math.abs(group.y - 150)).toBeLessThanOrEqual(2);
+
+    const logo = group.children.find(
+      (c) => c.type === "shape" && c.path
+    );
+    expect(logo).toBeTruthy();
+    if (logo && logo.type === "shape") {
+      // custGeom path round-tripped (commands preserved, even if reformatted).
+      expect(logo.path?.d).toMatch(/[ML]/);
+    }
+
+    const panel = group.children.find(
+      (c) => c.type === "shape" && c.fill.startsWith("radial-gradient(")
+    );
+    expect(panel).toBeTruthy();
+    if (panel && panel.type === "shape") {
+      expect(panel.fill).toContain("radial-gradient(");
+      expect(panel.fill.toUpperCase()).toContain("#FF0000");
+      expect(panel.fill.toUpperCase()).toContain("#0000FF");
+    }
+  });
+
+  it("re-synthesises a group (keeping custGeom + radial) after a child is edited", async () => {
+    const deck = makeDeck([
+      {
+        ...baseElement,
+        id: "grp",
+        type: "group",
+        x: 200,
+        y: 150,
+        w: 800,
+        h: 400,
+        children: [
+          {
+            ...baseElement,
+            id: "logo",
+            type: "shape",
+            x: 200,
+            y: 150,
+            w: 300,
+            h: 300,
+            shape: "rect",
+            fill: "#222222",
+            path: { d: "M 0 100 L 50 0 L 100 100 Z", viewW: 100, viewH: 100 },
+          },
+          {
+            ...baseElement,
+            id: "panel",
+            type: "shape",
+            x: 600,
+            y: 150,
+            w: 350,
+            h: 300,
+            shape: "circle",
+            fill: "radial-gradient(circle at 50% 50%, #FF0000 0%, #0000FF 100%)",
+          },
+        ],
+      },
+    ]);
+
+    // First round-trip registers the imported group's source XML.
+    const imported = await roundtrip(deck);
+    const group = imported.slides[0].elements.find((e) => e.type === "group");
+    expect(group && group.type === "group").toBe(true);
+    if (!group || group.type !== "group") return;
+
+    // Edit a child → the group diverges from its snapshot, so the writer must
+    // take the synth path rather than replaying the (now stale) source XML.
+    const panel = group.children.find((c) => c.id && c.type === "shape" && c.fill.startsWith("radial-gradient("));
+    if (panel) panel.x += 40;
+
+    const edited = await roundtrip(imported);
+    const group2 = edited.slides[0].elements.find((e) => e.type === "group");
+    expect(group2 && group2.type === "group").toBe(true);
+    if (!group2 || group2.type !== "group") return;
+    expect(group2.children.length).toBe(2);
+    expect(
+      group2.children.some((c) => c.type === "shape" && c.path)
+    ).toBe(true);
+    expect(
+      group2.children.some(
+        (c) => c.type === "shape" && c.fill.startsWith("radial-gradient(")
+      )
+    ).toBe(true);
+  });
+
   it("preserves slide background colour", async () => {
     const deck: Deck = {
       version: CURRENT_DECK_VERSION,
