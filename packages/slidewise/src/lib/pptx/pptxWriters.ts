@@ -79,7 +79,8 @@ export function parseFill(fill: string | undefined): ParsedFill | null {
   const s = fill.trim();
   if (!s || s === "transparent") return { kind: "transparent" };
   if (s.startsWith("#")) {
-    return { kind: "solid", color: normaliseHex(s) };
+    const { color, alpha } = parseHexColor(s);
+    return { kind: "solid", color, alpha };
   }
   const rgb = /^rgba?\(([^)]+)\)$/i.exec(s);
   if (rgb) {
@@ -195,8 +196,28 @@ export function hexBare(color: string): string {
   return c.toUpperCase();
 }
 
-function normaliseHex(s: string): string {
-  return `#${hexBare(s)}`;
+/**
+ * Parse a hex color, splitting out the alpha channel carried by the 4-digit
+ * (`#RGBA`) and 8-digit (`#RRGGBBAA`) forms. `hexBare` deliberately truncates
+ * to 6 digits, so colors written as `#RRGGBBAA` would otherwise lose their
+ * per-stop transparency before it ever reaches `<a:alpha>`. Returns `#RRGGBB`
+ * plus alpha in 0..1, or `undefined` alpha when the source has no alpha channel.
+ */
+function parseHexColor(s: string): { color: string; alpha?: number } {
+  let body = s.trim().replace(/^#/, "");
+  // Expand 3/4-digit shorthand (e.g. `#abc`, `#abcd`) to the long form.
+  if (body.length === 3 || body.length === 4) {
+    body = body
+      .split("")
+      .map((ch) => `${ch}${ch}`)
+      .join("");
+  }
+  const color = `#${body.slice(0, 6).toUpperCase()}`;
+  if (body.length >= 8) {
+    const a = parseInt(body.slice(6, 8), 16);
+    if (Number.isFinite(a)) return { color, alpha: a / 255 };
+  }
+  return { color };
 }
 
 function clampByte(n: number): number {
