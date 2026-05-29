@@ -245,19 +245,38 @@ export function cssAngleToOoxml(cssDeg: number): number {
 
 /**
  * Translate the absolute-coordinate subset of an SVG `d` attribute into
- * `<a:pathLst>`. Supports M, L, C, Q, Z and the relative forms (m, l, c, q)
- * by tracking the pen. Falls back to `null` for anything beyond that
- * (arcs / smooth shorthands / formulas) so the caller can downgrade to a
- * simple rect rather than emit broken geometry.
+ * `<a:pathLst>`. Supports M, L, H, V, C, Q, A, Z and the relative forms by
+ * tracking the pen. Falls back to `null` for anything beyond that (S/T smooth
+ * shorthands) so the caller can downgrade to a simple rect rather than emit
+ * broken geometry.
+ *
+ * `targetW`/`targetH` (the shape's bounding box in EMU) rescale the path
+ * coordinate space so `<a:path w/h>` matches the shape extent. PowerPoint
+ * emits custGeom this way, and — crucially — LibreOffice only scales the path
+ * onto the shape correctly when the two spaces line up. Leaving the raw source
+ * viewBox here is what made some imported vectors (e.g. the eon bicycle,
+ * viewW≠box) render blank while others (logo, viewW≈box) happened to work.
  */
 export function svgPathToOoxml(
   d: string,
   viewW: number,
   viewH: number,
-  fillRule: "nonzero" | "evenodd" = "nonzero"
+  fillRule: "nonzero" | "evenodd" = "nonzero",
+  targetW?: number,
+  targetH?: number
 ): string | null {
   const tokens = tokenisePath(d);
   if (!tokens.length) return null;
+  // `fillRule` is retained for API compatibility but intentionally unused:
+  // OOXML custGeom has no even-odd winding control (see the path emission
+  // note below). Holes are carried by subpath direction in `d`.
+  void fillRule;
+  // Scale source path coords → target (shape EMU) space. Defaults to 1 when no
+  // target supplied (callers that just want the raw mapping).
+  _ptScaleX = targetW && viewW ? targetW / viewW : 1;
+  _ptScaleY = targetH && viewH ? targetH / viewH : 1;
+  const outW = Math.max(1, Math.round(targetW || viewW));
+  const outH = Math.max(1, Math.round(targetH || viewH));
   let i = 0;
   let penX = 0;
   let penY = 0;
@@ -382,19 +401,28 @@ export function svgPathToOoxml(
     }
   }
   if (!cmds.length) return null;
+  // NB: OOXML `<a:path>`'s `fill` attribute is a *shading* hint
+  // (none/norm/lighten/darken), NOT a winding rule — there is no even-odd flag
+  // in custGeom. Earlier code emitted `fill="darken"` for even-odd paths,
+  // which silently darkened the shape (and tripped LibreOffice) without
+  // achieving the hole. We now leave the default `norm` shading; holes come
+  // from the subpath directions encoded in `d`.
   return (
     `<a:pathLst>` +
-    `<a:path w="${Math.max(1, Math.round(viewW))}" h="${Math.max(1, Math.round(viewH))}"` +
-    (fillRule === "evenodd" ? ` fill="darken"` : ``) +
-    `>` +
+    `<a:path w="${outW}" h="${outH}">` +
     cmds.join("") +
     `</a:path>` +
     `</a:pathLst>`
   );
 }
 
+// Per-call scale applied by `ptXml`, set at the top of `svgPathToOoxml`. The
+// module is single-threaded/synchronous so this stays consistent within a call.
+let _ptScaleX = 1;
+let _ptScaleY = 1;
+
 function ptXml(x: number, y: number): string {
-  return `<a:pt x="${Math.round(x)}" y="${Math.round(y)}"/>`;
+  return `<a:pt x="${Math.round(x * _ptScaleX)}" y="${Math.round(y * _ptScaleY)}"/>`;
 }
 
 /**
@@ -554,7 +582,9 @@ function geometryXml(el: ShapeElement): string {
       el.path.d,
       el.path.viewW,
       el.path.viewH,
-      el.path.fillRule
+      el.path.fillRule,
+      pxToEmu(el.w),
+      pxToEmu(el.h)
     );
     if (pathLst) {
       return `<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="l" t="t" r="r" b="b"/>${pathLst}</a:custGeom>`;

@@ -57,8 +57,13 @@ describe("synth writers (PRs 1, 2, 3, 4, 5, 6, 7)", () => {
     expect(slide).toContain("<a:moveTo>");
     expect(slide).toContain("<a:lnTo>");
     expect(slide).toContain("<a:close/>");
-    // even-odd fill rule
-    expect(slide).toMatch(/<a:path\b[^>]*fill="darken"/);
+    // The path coordinate space matches the shape's EMU extent (400px →
+    // 2,540,000 EMU) so renderers scale the path onto the box correctly —
+    // not the raw 100×100 source viewBox.
+    expect(slide).toMatch(/<a:path w="2540000" h="2540000"/);
+    // `fill="darken"` was a bogus even-odd encoding (it's a shading hint) and
+    // must no longer be emitted.
+    expect(slide).not.toMatch(/<a:path\b[^>]*fill="darken"/);
   });
 
   it("emits <a:custGeom> (cubicBezTo) for arc paths instead of downgrading to a rect", async () => {
