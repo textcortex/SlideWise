@@ -385,11 +385,21 @@ function addShape(
       effectLstXml(el.shadow, el.glow)
     );
   }
+  // A solid fill may carry alpha (e.g. `#RRGGBBAA`); map it to pptxgenjs's
+  // `transparency` (0 opaque … 100 transparent) so flat translucent fills
+  // don't render opaque. Gradient/image fills take the synth path instead.
+  const solid = parseFill(el.fill);
+  const fillAlpha = solid && solid.kind === "solid" ? solid.alpha : undefined;
   // pptxgenjs accepts shape names as strings; the typed ShapeType enum is
   // also exposed. Pass via `as unknown as` to bypass strict enum typing.
   s.addShape(shapeName as unknown as Parameters<typeof s.addShape>[0], {
     ...geometry(el),
-    fill: { color: hexNoHash(extractSolidColor(el.fill)) },
+    fill: {
+      color: hexNoHash(extractSolidColor(el.fill)),
+      ...(fillAlpha != null && fillAlpha < 1
+        ? { transparency: Math.round((1 - fillAlpha) * 100) }
+        : {}),
+    },
     line: el.stroke
       ? {
           color: hexNoHash(el.stroke),

@@ -91,6 +91,97 @@ describe("synth writers (PRs 1, 2, 3, 4, 5, 6, 7)", () => {
     expect(slide).toContain("<a:lin");
   });
 
+  it("PR 2: emits <a:gradFill> with <a:path> for radial-gradient fill (incl. alpha)", async () => {
+    const deck = makeDeck([
+      {
+        id: "s",
+        background: "#FFFFFF",
+        elements: [
+          {
+            ...base,
+            id: "blob",
+            type: "shape",
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 400,
+            shape: "rect",
+            fill: "radial-gradient(circle at 30% 40%, #EA1B0A 0%, #7030A000 100%)",
+          },
+        ],
+      },
+    ]);
+    const zip = await generate(deck);
+    const slide = await zip.file("ppt/slides/slide1.xml")?.async("string");
+    expect(slide).toContain("<a:gradFill");
+    // Radial → <a:path> with a circle, not <a:lin>.
+    expect(slide).toContain('<a:path path="circle">');
+    expect(slide).not.toContain("<a:lin");
+    expect(slide).toMatch(/<a:gs pos="0"/);
+    expect(slide).toMatch(/<a:gs pos="100000"/);
+    // Trailing stop is fully transparent (#...00).
+    expect(slide).toMatch(/srgbClr val="7030A0"><a:alpha val="0"\/>/);
+  });
+
+  it("PR 2: preserves per-stop alpha from 8-digit hex (#RRGGBBAA) gradient stops", async () => {
+    const deck = makeDeck([
+      {
+        id: "s",
+        background: "#FFFFFF",
+        elements: [
+          {
+            ...base,
+            id: "g",
+            type: "shape",
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 400,
+            shape: "rect",
+            // #7030A059 → alpha 0x59/255 ≈ 0.349 → 34902 (in 1/1000 %).
+            // #AF255200 → fully transparent → alpha 0.
+            fill: "linear-gradient(110deg, #7030A059 0%, #AF255200 100%)",
+          },
+        ],
+      },
+    ]);
+    const zip = await generate(deck);
+    const slide = await zip.file("ppt/slides/slide1.xml")?.async("string");
+    expect(slide).toContain("<a:gradFill");
+    // RGB is kept to 6 digits, alpha emitted separately.
+    expect(slide).toMatch(/srgbClr val="7030A0"><a:alpha val="34902"\/>/);
+    expect(slide).toMatch(/srgbClr val="AF2552"><a:alpha val="0"\/>/);
+  });
+
+  it("PR 2: preserves alpha from 8-digit hex (#RRGGBBAA) solid fill", async () => {
+    const deck = makeDeck([
+      {
+        id: "s",
+        background: "#FFFFFF",
+        elements: [
+          {
+            ...base,
+            id: "sf",
+            type: "shape",
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 200,
+            shape: "rect",
+            fill: "#EA1B0A59",
+          },
+        ],
+      },
+    ]);
+    const zip = await generate(deck);
+    const slide = await zip.file("ppt/slides/slide1.xml")?.async("string");
+    // Routed through pptxgenjs's `transparency` (whole-percent), so alpha
+    // 0x59/255 ≈ 0.349 → transparency 65 → <a:alpha val="35000"/>.
+    expect(slide).toMatch(
+      /<a:solidFill><a:srgbClr val="EA1B0A"><a:alpha val="35000"\/><\/a:srgbClr><\/a:solidFill>/
+    );
+  });
+
   it("PR 2: emits <a:blipFill> + media for url(data:image/...) fills", async () => {
     // 1x1 transparent PNG.
     const dataUrl =
