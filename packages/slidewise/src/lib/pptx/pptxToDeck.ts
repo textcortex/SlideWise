@@ -15,6 +15,7 @@ import type {
   TableElement,
   ChartElement,
   ChartSeries,
+  GroupElement,
   UnknownElement,
   FontAsset,
 } from "@/lib/types";
@@ -391,11 +392,30 @@ export function getElementSource(elementId: string): ElementSource | undefined {
 }
 
 export function snapshotElement(element: SlideElement): string {
+  return JSON.stringify(snapshotFields(element));
+}
+
+function snapshotFields(element: SlideElement): unknown {
   // Hash only fields the user can change in the editor. Element `id` and
   // `z` are intentionally excluded — they may be reassigned by the store
   // without representing a meaningful edit.
   const e = element as any;
-  return JSON.stringify({
+  // Groups: include the children's snapshots so editing any descendant
+  // diverges the group's snapshot, which flips it off the verbatim-replay
+  // path onto the synth path (see deckToPptx). Without this, a child edit
+  // would silently re-emit the stale source `<p:grpSp>`.
+  if (e.type === "group") {
+    return {
+      type: "group",
+      x: e.x,
+      y: e.y,
+      w: e.w,
+      h: e.h,
+      rotation: e.rotation,
+      children: (e.children ?? []).map(snapshotFields),
+    };
+  }
+  return {
     type: e.type,
     x: e.x,
     y: e.y,
@@ -433,7 +453,7 @@ export function snapshotElement(element: SlideElement): string {
     rowFill: e.rowFill,
     textColor: e.textColor,
     borderColor: e.borderColor,
-  });
+  };
 }
 
 function registerElementSource(
@@ -902,7 +922,15 @@ async function parseSpTree(
     } else if (tag === "p:grpSp") {
       const inner = composeGroupTransform(node, outer);
       const children = await parseSpTree(node, ctx, inner);
-      out.push(...children);
+      if (!children.length) continue;
+      const group = buildGroupElement(node, children, ctx, outer);
+      // Register the whole `<p:grpSp>` so an unedited group round-trips
+      // verbatim — that preserves every child's custGeom, gradient, text,
+      // and image exactly, plus the group transform itself. Once any
+      // descendant is edited the snapshot diverges (see snapshotElement)
+      // and the synth path re-emits the group instead.
+      registerElementSource(group, rawSrc, ctx.slidePath);
+      out.push(group);
     }
   }
   return out;
@@ -944,6 +972,61 @@ function composeGroupTransform(grp: any, outer: GroupTransform): GroupTransform 
     b: outer.b * by,
     c: outer.a * cx0 + outer.c,
     d: outer.b * dy0 + outer.d,
+  };
+}
+
+/**
+ * Wrap a group's parsed children in a `GroupElement`. Children already carry
+ * slide-absolute coordinates (parsed through the composed group transform),
+ * matching the GroupElement contract the renderer and PPTX writer expect. The
+ * group's own bounding box comes from its `<p:grpSpPr><a:xfrm>` mapped onto
+ * the slide; when that's missing we fall back to the union of child boxes.
+ * Child `z` is re-stamped in document order so within-group stacking survives
+ * (the outer slide loop only re-stamps top-level elements).
+ */
+function buildGroupElement(
+  grp: any,
+  children: SlideElement[],
+  ctx: ParseContext,
+  outer: GroupTransform
+): GroupElement {
+  const geom =
+    readGeometry(grp?.["p:grpSpPr"]?.["a:xfrm"], ctx.fit, outer) ??
+    boundingBox(children);
+  return {
+    id: nanoid(8),
+    type: "group",
+    ...geom,
+    z: 0,
+    children: children.map((child, i) => ({ ...child, z: i + 1 })),
+  };
+}
+
+/** Union bounding box of a set of elements (slide-space px). */
+function boundingBox(els: SlideElement[]): {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation: number;
+} {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const e of els) {
+    minX = Math.min(minX, e.x);
+    minY = Math.min(minY, e.y);
+    maxX = Math.max(maxX, e.x + e.w);
+    maxY = Math.max(maxY, e.y + e.h);
+  }
+  if (!Number.isFinite(minX)) return { x: 0, y: 0, w: 1, h: 1, rotation: 0 };
+  return {
+    x: Math.round(minX),
+    y: Math.round(minY),
+    w: Math.max(1, Math.round(maxX - minX)),
+    h: Math.max(1, Math.round(maxY - minY)),
+    rotation: 0,
   };
 }
 
@@ -3995,7 +4078,18 @@ function annotateRawOrder(parsed: any, rawText: string): void {
  * order.
  */
 function annotateSpTreeElementRawSrc(parsed: any, rawText: string): void {
-  for (const tag of ["p:sp", "p:pic", "p:cxnSp", "p:graphicFrame"] as const) {
+  // `p:grpSp` is included so an unedited group round-trips verbatim. Both
+  // `findAllRawBlocks` (depth-aware) and `collectNamedDfs` (doesn't recurse
+  // into a matched key) enumerate only the *top-level* groups, so the blocks
+  // and parsed nodes stay paired; nested groups travel inside their parent's
+  // verbatim block.
+  for (const tag of [
+    "p:sp",
+    "p:pic",
+    "p:cxnSp",
+    "p:graphicFrame",
+    "p:grpSp",
+  ] as const) {
     if (!rawText.includes(`<${tag}`)) continue;
     const blocks = findAllRawBlocks(rawText, tag);
     if (!blocks.length) continue;
