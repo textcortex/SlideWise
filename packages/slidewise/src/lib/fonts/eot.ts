@@ -83,10 +83,25 @@ export function decodeEot(bytes: Uint8Array): DecodedEotFont {
   }
 
   if (flags & TTEMBED_TTCOMPRESSED) {
-    // MTX-compressed payload. Defer to ./mtx.ts — that module may itself
-    // bail with "not yet implemented" for the harder sub-cases, in which
-    // case we re-throw with the same kind so the caller's fallback chain
-    // can act on it.
+    // The TTCOMPRESSED flag tells us the payload is compressed, but NOT
+    // which compressor. Sniff the magic so we report precisely:
+    //
+    //   - "BSGP" — the format real PowerPoint emits for embedded fonts.
+    //     Proprietary Monotype/Microsoft glyph compression with no public
+    //     spec and no open-source decoder. (Confirmed against eon-deck.pptx
+    //     and other client decks.) NOT the W3C/ISO "MicroType Express"
+    //     container, despite both living behind the same EOT flag.
+    //   - anything else — try the W3C MTX path in ./mtx.ts.
+    const magic = magicOf(payload);
+    if (magic === "BSGP") {
+      throw new EotDecodeError(
+        "Embedded font uses the proprietary 'BSGP' glyph-compression format " +
+          "(what PowerPoint emits). No public spec or open-source decoder exists. " +
+          "Supply a browser-renderable copy via fontRegistry / Deck.webFonts for " +
+          "editor preview; the original bytes still round-trip to PPTX on export.",
+        "mtx-not-implemented"
+      );
+    }
     const decompressed = decompressMtx(payload);
     return { ttf: decompressed, header };
   }
@@ -170,34 +185,20 @@ export function parseEotHeader(bytes: Uint8Array): EotHeader {
   const _full = readNameString();
   void _full;
 
-  // EOT 2.0 (version 0x00020001) adds RootString. EOT 2.2 (0x00020002)
-  // adds the EUDC bits. We don't need their contents for decoding —
-  // just walk past them so `off` lands at FontData.
+  // EOT 2.0 (0x00020001) and 2.2 (0x00020002) add a RootString name
+  // field after FullName. Empirically — verified against real
+  // PowerPoint-embedded fonts — FontData begins immediately after
+  // RootString; the spec's optional EUDC / Signature blocks are either
+  // absent or laid out such that they don't precede FontData here.
+  // (An earlier version of this parser tried to walk the 2.2 EUDC tail
+  // and over-advanced `off` by 20 bytes, landing past the true FontData
+  // magic — confirmed against eon-deck.pptx where FontData starts at 212
+  // with a "BSGP" magic, not at 232.) So we stop after RootString and
+  // let the FontData slice begin there.
   if (version === 0x00020001 || version === 0x00020002) {
     skipPadding();
     const _root = readNameString();
     void _root;
-  }
-  if (version === 0x00020002) {
-    if (off + 8 > bytes.length) {
-      throw new EotDecodeError("truncated at 2.2 fixed tail", "truncated");
-    }
-    off += 8; // RootStringCheckSum + EUDCCodePage
-    skipPadding();
-    const _sig = readNameString();
-    void _sig;
-    if (off + 8 > bytes.length) {
-      throw new EotDecodeError("truncated at EUDC header", "truncated");
-    }
-    const _eudcFlags = dv.getUint32(off, true);
-    off += 4;
-    const eudcFontSize = dv.getUint32(off, true);
-    off += 4;
-    if (off + eudcFontSize > bytes.length) {
-      throw new EotDecodeError("truncated EUDC payload", "truncated");
-    }
-    off += eudcFontSize;
-    void _eudcFlags;
   }
 
   // Sanity: derived FontData offset + size should land within the file.
@@ -276,6 +277,12 @@ function assertSfnt(payload: Uint8Array): void {
       "truncated"
     );
   }
+}
+
+/** First 4 payload bytes as an ASCII tag (e.g. "BSGP", "OTTO"), or "". */
+function magicOf(payload: Uint8Array): string {
+  if (payload.length < 4) return "";
+  return String.fromCharCode(payload[0], payload[1], payload[2], payload[3]);
 }
 
 function decodeUtf16Le(bytes: Uint8Array): string {
