@@ -454,7 +454,7 @@ function shapeFillXml(el: ShapeElement): { xml: string; media: MediaPayload[] } 
   }
   if (parsed.kind === "radial") {
     return {
-      xml: radialGradFillXml(parsed.focusX, parsed.focusY, parsed.shape, parsed.stops),
+      xml: radialGradFillXml(parsed.focusX, parsed.focusY, parsed.stops),
       media: [],
     };
   }
@@ -490,7 +490,6 @@ function linearGradFillXml(cssAng: number, stops: GradStop[]): string {
 function radialGradFillXml(
   focusX: number,
   focusY: number,
-  shape: "circle" | "ellipse",
   stops: GradStop[]
 ): string {
   // fillToRect insets are in thousandths of a percent (matching `pos` units).
@@ -501,11 +500,19 @@ function radialGradFillXml(
   const t = clampInset(focusY);
   const r = clampInset(100 - focusX);
   const b = clampInset(100 - focusY);
-  const path = shape === "circle" ? "circle" : "shape";
+  // OOXML `ST_PathShadeType` is only {shape, circle, rect} — there is no
+  // "ellipse". PowerPoint represents *every* radial (circle or ellipse) as
+  // `path="circle"` and lets the (possibly non-square) `fillToRect` give it an
+  // elliptical footprint. We previously mapped a CSS `ellipse` radial to
+  // `path="shape"`, which makes the gradient follow the shape outline rather
+  // than radiate from the focus — and, crucially, LibreOffice/Gotenberg renders
+  // `path="shape"` radials as a flat fill, so brand "blob" decorations came out
+  // flattened. Always emitting `path="circle"` matches PowerPoint's own output
+  // and renders as a true radial across PowerPoint, Keynote, and LibreOffice.
   return (
     `<a:gradFill flip="none" rotWithShape="1">` +
     gsLstXml(stops) +
-    `<a:path path="${path}"><a:fillToRect l="${l}" t="${t}" r="${r}" b="${b}"/></a:path>` +
+    `<a:path path="circle"><a:fillToRect l="${l}" t="${t}" r="${r}" b="${b}"/></a:path>` +
     `</a:gradFill>`
   );
 }

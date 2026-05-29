@@ -106,7 +106,8 @@ describe("synth writers (PRs 1, 2, 3, 4, 5, 6, 7)", () => {
             w: 400,
             h: 400,
             shape: "rect",
-            fill: "radial-gradient(circle at 30% 40%, #EA1B0A 0%, #7030A000 100%)",
+            // ellipse radial — the common brand-"blob" case.
+            fill: "radial-gradient(ellipse at 30% 40%, #EA1B0A 0%, #7030A000 100%)",
           },
         ],
       },
@@ -114,8 +115,10 @@ describe("synth writers (PRs 1, 2, 3, 4, 5, 6, 7)", () => {
     const zip = await generate(deck);
     const slide = await zip.file("ppt/slides/slide1.xml")?.async("string");
     expect(slide).toContain("<a:gradFill");
-    // Radial → <a:path> with a circle, not <a:lin>.
+    // Every radial (circle OR ellipse) is emitted as path="circle" — OOXML has
+    // no "ellipse" path type, and LibreOffice/Gotenberg flattens path="shape".
     expect(slide).toContain('<a:path path="circle">');
+    expect(slide).not.toContain('path="shape"');
     expect(slide).not.toContain("<a:lin");
     expect(slide).toMatch(/<a:gs pos="0"/);
     expect(slide).toMatch(/<a:gs pos="100000"/);
