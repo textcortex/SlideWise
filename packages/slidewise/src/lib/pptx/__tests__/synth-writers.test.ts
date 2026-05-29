@@ -61,6 +61,42 @@ describe("synth writers (PRs 1, 2, 3, 4, 5, 6, 7)", () => {
     expect(slide).toMatch(/<a:path\b[^>]*fill="darken"/);
   });
 
+  it("emits <a:custGeom> (cubicBezTo) for arc paths instead of downgrading to a rect", async () => {
+    // A wheel: move to the right edge, then a full-circle arc back to start.
+    const deck = makeDeck([
+      {
+        id: "s",
+        background: "#FFFFFF",
+        elements: [
+          {
+            ...base,
+            id: "wheel",
+            type: "shape",
+            x: 100,
+            y: 100,
+            w: 200,
+            h: 200,
+            shape: "rect",
+            fill: "#222222",
+            path: {
+              d: "M 100 50 A 50 50 0 1 1 99.99 50 Z",
+              viewW: 100,
+              viewH: 100,
+            },
+          },
+        ],
+      },
+    ]);
+
+    const zip = await generate(deck);
+    const slide = await zip.file("ppt/slides/slide1.xml")?.async("string");
+    expect(slide).toBeTruthy();
+    // The arc must round-trip as real custGeom, NOT collapse to a prstGeom rect.
+    expect(slide).toContain("<a:custGeom>");
+    expect(slide).toContain("<a:cubicBezTo>");
+    expect(slide).not.toMatch(/<a:prstGeom prst="rect"/);
+  });
+
   it("PR 2: emits <a:gradFill> for shapes with linear-gradient fill", async () => {
     const deck = makeDeck([
       {

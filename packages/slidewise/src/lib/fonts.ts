@@ -4,11 +4,14 @@ import type { Deck, TextElement, WebFontAsset } from "@/lib/types";
  * Best-effort web-font loader for typefaces referenced inside a Deck.
  *
  * PPTX files commonly reference typefaces that are NOT installed on the
- * viewer's machine. The cleanest fix would be to extract the embedded font
- * binaries from `ppt/fonts/*.fntdata`, but those use Microsoft's EOT format
- * with MTX compression, which has no practical browser-side decoder.
+ * viewer's machine. PowerPoint embeds plain SFNT (TTF/OTF) binaries in
+ * `ppt/fonts/*.fntdata`, which the importer now surfaces as `Deck.webFonts`
+ * (see `readEmbeddedFonts` / `webFontMimeFromBytes` in `pptxToDeck.ts`) so the
+ * canvas can paint the real brand face. Anything that isn't a recognised font
+ * signature (e.g. a legacy obfuscated / EOT payload) is skipped.
  *
- * As a pragmatic alternative we ask Google Fonts for every unique typeface
+ * For families with no embedded binary we fall back to Google Fonts for every
+ * unique typeface
  * name we see — Google's CSS API silently returns 404 for unknown families,
  * so the worst case is the browser's normal font fallback. Most popular
  * typefaces (Coda, Quattrocento Sans, Roboto, Inter, Lato, Montserrat, …)
@@ -114,9 +117,9 @@ export function ensureGoogleFontsLoaded(
  *
  * `WebFontAsset` is for the in-editor preview only — the PPTX exporter
  * doesn't consult it; it consults `Deck.fonts` (the embedded payload).
- * The two live side-by-side so AI-authored decks can ship a renderable
- * font for the editor and the obfuscated MTX/EOT payload PowerPoint
- * needs, without one stomping the other.
+ * The two live side-by-side so a deck can ship a renderable font for the
+ * editor alongside the payload PowerPoint embeds, without one stomping the
+ * other.
  *
  * Idempotent per `instanceId`. Returns a disposer.
  */

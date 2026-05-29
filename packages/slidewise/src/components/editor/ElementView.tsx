@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type {
   SlideElement,
   TextElement,
@@ -117,6 +117,7 @@ function TextView({
   editing?: boolean;
   onCommit?: (text: string, runs?: TextRun[]) => void;
 }) {
+  const backingId = useId();
   // Outer wrapper handles vertical alignment via flex; the inner block carries
   // the typographic flow so inline <span> runs lay out correctly. Putting flex
   // on the same node as the spans turns each span into a block-level flex
@@ -165,6 +166,9 @@ function TextView({
   const innerStacked: React.CSSProperties = backingPath
     ? { ...inner, position: "relative", zIndex: 1 }
     : inner;
+  // Backing fill may be a CSS gradient — SVG `fill=` needs a paint server.
+  const backingGradId = `sw-grad-${backingId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const backingPaint = svgGradientPaint(backingPath?.fill, backingGradId);
   const backingSvg = backingPath ? (
     <svg
       viewBox={`0 0 ${backingPath.viewW} ${backingPath.viewH}`}
@@ -178,9 +182,10 @@ function TextView({
         zIndex: 0,
       }}
     >
+      {backingPaint.def && <defs>{backingPaint.def}</defs>}
       <path
         d={backingPath.d}
-        fill={backingPath.fill}
+        fill={backingPaint.paint}
         fillRule={backingPath.fillRule ?? "nonzero"}
       />
     </svg>
@@ -514,6 +519,168 @@ function dashStyleFor(
   }
 }
 
+interface GradStop {
+  pos: number;
+  color: string;
+  opacity?: number;
+}
+
+/**
+ * SVG `<path>` / `<polygon>` `fill` attributes cannot take a CSS gradient
+ * function (`linear-gradient(...)` / `radial-gradient(...)`) — they only
+ * accept a colour or a `url(#paintServer)` reference. So a vector shape (a
+ * PPTX `<a:custGeom>` silhouette, or a triangle / diamond / star) that carries
+ * a gradient fill renders with NO fill at all (blank) if we hand the raw CSS
+ * string straight to `fill=`. This builds the matching SVG paint server and
+ * returns `url(#id)` plus the `<defs>` child to render. Solid colours,
+ * `transparent`, `rgba(...)`, and `url(...)` pass straight through.
+ */
+function svgGradientPaint(
+  fill: string | undefined,
+  id: string
+): { paint: string | undefined; def: React.ReactNode } {
+  const grad = parseCssGradient(fill);
+  if (!grad) return { paint: fill, def: null };
+  const stops = grad.stops.map((s, i) => (
+    <stop
+      key={i}
+      offset={`${s.pos}%`}
+      stopColor={s.color}
+      stopOpacity={s.opacity}
+    />
+  ));
+  if (grad.kind === "linear") {
+    const v = linearGradientVector(grad.angle);
+    return {
+      paint: `url(#${id})`,
+      def: (
+        <linearGradient id={id} x1={v.x1} y1={v.y1} x2={v.x2} y2={v.y2}>
+          {stops}
+        </linearGradient>
+      ),
+    };
+  }
+  return {
+    paint: `url(#${id})`,
+    def: (
+      <radialGradient
+        id={id}
+        cx={`${grad.cx}%`}
+        cy={`${grad.cy}%`}
+        // ~corner-reaching radius so the gradient fills the box rather than
+        // stopping short at the bounding circle. Exact for export is handled
+        // by the OOXML writer; this is the editor preview approximation.
+        r="75%"
+        fx={`${grad.cx}%`}
+        fy={`${grad.cy}%`}
+      >
+        {stops}
+      </radialGradient>
+    ),
+  };
+}
+
+type ParsedGradient =
+  | { kind: "linear"; angle: number; stops: GradStop[] }
+  | { kind: "radial"; cx: number; cy: number; stops: GradStop[] };
+
+function parseCssGradient(fill: string | undefined): ParsedGradient | null {
+  if (!fill) return null;
+  const s = fill.trim();
+  if (s.startsWith("linear-gradient(")) {
+    const inner = s.slice("linear-gradient(".length, s.lastIndexOf(")"));
+    const parts = splitTopLevelCommas(inner);
+    let angle = 180;
+    let rest = parts;
+    if (parts.length && /deg\s*$/.test(parts[0].trim())) {
+      angle = parseFloat(parts[0]);
+      rest = parts.slice(1);
+    }
+    const stops = parseGradientStops(rest);
+    return stops.length ? { kind: "linear", angle, stops } : null;
+  }
+  if (s.startsWith("radial-gradient(")) {
+    const inner = s.slice("radial-gradient(".length, s.lastIndexOf(")"));
+    const parts = splitTopLevelCommas(inner);
+    let cx = 50;
+    let cy = 50;
+    let rest = parts;
+    if (parts.length && /\bat\b/.test(parts[0])) {
+      const m = /at\s+(-?\d+(?:\.\d+)?)%\s+(-?\d+(?:\.\d+)?)%/.exec(parts[0]);
+      if (m) {
+        cx = parseFloat(m[1]);
+        cy = parseFloat(m[2]);
+      }
+      rest = parts.slice(1);
+    }
+    const stops = parseGradientStops(rest);
+    return stops.length ? { kind: "radial", cx, cy, stops } : null;
+  }
+  return null;
+}
+
+/** Split on top-level commas only — colours like `rgba(0,0,0,.5)` keep theirs. */
+function splitTopLevelCommas(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (c === "," && depth === 0) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+function parseGradientStops(parts: string[]): GradStop[] {
+  const out: GradStop[] = [];
+  for (const raw of parts) {
+    const p = raw.trim();
+    if (!p) continue;
+    const pm = /\s+(-?\d+(?:\.\d+)?)%$/.exec(p);
+    const pos = pm ? parseFloat(pm[1]) : out.length === 0 ? 0 : 100;
+    const colorStr = (pm ? p.slice(0, pm.index) : p).trim();
+    out.push({ pos, ...splitHexAlpha(colorStr) });
+  }
+  return out;
+}
+
+/** `#RRGGBBAA` → `{ color: "#RRGGBB", opacity }`; everything else unchanged. */
+function splitHexAlpha(c: string): { color: string; opacity?: number } {
+  const m = /^#([0-9a-fA-F]{8})$/.exec(c);
+  if (!m) return { color: c };
+  return {
+    color: `#${m[1].slice(0, 6)}`,
+    opacity: parseInt(m[1].slice(6, 8), 16) / 255,
+  };
+}
+
+/**
+ * CSS gradient angle (0deg = up, clockwise) → SVG `objectBoundingBox`
+ * gradient line endpoints in [0,1]. 0deg ⇒ bottom→top, 90deg ⇒ left→right.
+ */
+function linearGradientVector(deg: number): {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+} {
+  const r = (deg * Math.PI) / 180;
+  const sin = Math.sin(r);
+  const cos = Math.cos(r);
+  return {
+    x1: 0.5 - 0.5 * sin,
+    y1: 0.5 + 0.5 * cos,
+    x2: 0.5 + 0.5 * sin,
+    y2: 0.5 - 0.5 * cos,
+  };
+}
+
 function ShapeView({ el }: { el: ShapeElement }) {
   const stroke = el.stroke ?? "transparent";
   const sw = el.strokeWidth ?? 0;
@@ -522,6 +689,10 @@ function ShapeView({ el }: { el: ShapeElement }) {
   // Raw wins when both are set — it preserves PPTX intent exactly.
   const dash = dashStyleFor(el.strokeDash ?? el.dashType, sw);
   const effect = effectStyle(el.shadow, el.glow, "filter");
+  // SVG `fill=` can't take a CSS gradient string, so vector shapes need a
+  // paint server. Build it once and reuse for path + polygon renderers.
+  const gradId = `sw-grad-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const { paint, def } = svgGradientPaint(el.fill, gradId);
   // Custom vector path (PPTX <a:custGeom>) takes precedence over the preset
   // kind — the path coordinates already encode the actual silhouette.
   if (el.path) {
@@ -533,9 +704,10 @@ function ShapeView({ el }: { el: ShapeElement }) {
         height="100%"
         style={effect}
       >
+        {def && <defs>{def}</defs>}
         <path
           d={el.path.d}
-          fill={el.fill}
+          fill={paint}
           fillRule={el.path.fillRule ?? "nonzero"}
           stroke={stroke}
           strokeWidth={sw || undefined}
@@ -581,10 +753,11 @@ function ShapeView({ el }: { el: ShapeElement }) {
       height="100%"
       style={effect}
     >
+      {def && <defs>{def}</defs>}
       {el.shape === "triangle" && (
         <polygon
           points="50,3 97,97 3,97"
-          fill={el.fill}
+          fill={paint}
           stroke={stroke}
           strokeWidth={sw}
           strokeDasharray={dash.dasharray}
@@ -594,7 +767,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
       {el.shape === "diamond" && (
         <polygon
           points="50,3 97,50 50,97 3,50"
-          fill={el.fill}
+          fill={paint}
           stroke={stroke}
           strokeWidth={sw}
           strokeDasharray={dash.dasharray}
@@ -604,7 +777,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
       {el.shape === "star" && (
         <polygon
           points="50,5 61,38 96,38 67,59 78,93 50,72 22,93 33,59 4,38 39,38"
-          fill={el.fill}
+          fill={paint}
           stroke={stroke}
           strokeWidth={sw}
           strokeDasharray={dash.dasharray}

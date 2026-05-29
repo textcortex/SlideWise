@@ -336,12 +336,48 @@ export function svgPathToOoxml(
         penX = x;
         penY = y;
       }
+    } else if (cmd === "A" || cmd === "a") {
+      // Elliptical arc. OOXML's `<a:arcTo>` is angle-based and awkward to
+      // derive from SVG's endpoint form, so we approximate each arc with
+      // cubic Béziers (≤90° segments → sub-pixel error) and emit those —
+      // reusing the already-correct `<a:cubicBezTo>` path. Without this the
+      // caller downgrades the entire custGeom to a rect, so any arc-bearing
+      // vector (wheels, rounded brand marks, the bicycle) exports blank.
+      const rel = cmd === "a";
+      while (typeof tokens[i] === "number") {
+        const rx = Number(tokens[i++]);
+        const ry = Number(tokens[i++]);
+        const phi = Number(tokens[i++]);
+        const largeArc = Number(tokens[i++]);
+        const sweep = Number(tokens[i++]);
+        const x = Number(tokens[i++]) + (rel ? penX : 0);
+        const y = Number(tokens[i++]) + (rel ? penY : 0);
+        const beziers = arcToCubics(
+          penX,
+          penY,
+          rx,
+          ry,
+          phi,
+          largeArc,
+          sweep,
+          x,
+          y
+        );
+        for (const b of beziers) {
+          cmds.push(
+            `<a:cubicBezTo>${ptXml(b[0], b[1])}${ptXml(b[2], b[3])}${ptXml(b[4], b[5])}</a:cubicBezTo>`
+          );
+        }
+        penX = x;
+        penY = y;
+      }
     } else if (cmd === "Z" || cmd === "z") {
       cmds.push(`<a:close/>`);
       penX = startX;
       penY = startY;
     } else {
-      // Unsupported command (A, S, T, …) — bail so caller can downgrade.
+      // Unsupported command (S, T smooth shorthands) — bail so caller can
+      // downgrade.
       return null;
     }
   }
@@ -359,6 +395,104 @@ export function svgPathToOoxml(
 
 function ptXml(x: number, y: number): string {
   return `<a:pt x="${Math.round(x)}" y="${Math.round(y)}"/>`;
+}
+
+/**
+ * Convert one SVG elliptical-arc segment (endpoint parameterisation) into a
+ * series of cubic Béziers (≤90° each). Standard implementation following the
+ * SVG spec's "Arc implementation notes" — endpoint → centre parameterisation,
+ * then a per-segment cubic approximation. Returns `[c1x,c1y,c2x,c2y,ex,ey]`
+ * tuples.
+ */
+function arcToCubics(
+  x1: number,
+  y1: number,
+  rx: number,
+  ry: number,
+  phiDeg: number,
+  largeArc: number,
+  sweep: number,
+  x2: number,
+  y2: number
+): number[][] {
+  // Degenerate radius → straight line (emit a zero-length-control cubic).
+  if (rx === 0 || ry === 0) return [[x1, y1, x2, y2, x2, y2]];
+  rx = Math.abs(rx);
+  ry = Math.abs(ry);
+  const phi = (phiDeg * Math.PI) / 180;
+  const cosPhi = Math.cos(phi);
+  const sinPhi = Math.sin(phi);
+  const dx = (x1 - x2) / 2;
+  const dy = (y1 - y2) / 2;
+  const x1p = cosPhi * dx + sinPhi * dy;
+  const y1p = -sinPhi * dx + cosPhi * dy;
+  let rxs = rx * rx;
+  let rys = ry * ry;
+  const x1ps = x1p * x1p;
+  const y1ps = y1p * y1p;
+  const lambda = x1ps / rxs + y1ps / rys;
+  if (lambda > 1) {
+    const s = Math.sqrt(lambda);
+    rx *= s;
+    ry *= s;
+    rxs = rx * rx;
+    rys = ry * ry;
+  }
+  const sign = largeArc !== sweep ? 1 : -1;
+  const num = Math.max(0, rxs * rys - rxs * y1ps - rys * x1ps);
+  const den = rxs * y1ps + rys * x1ps;
+  const co = den === 0 ? 0 : sign * Math.sqrt(num / den);
+  const cxp = co * ((rx * y1p) / ry);
+  const cyp = co * ((-ry * x1p) / rx);
+  const cx = cosPhi * cxp - sinPhi * cyp + (x1 + x2) / 2;
+  const cy = sinPhi * cxp + cosPhi * cyp + (y1 + y2) / 2;
+  const angle = (ux: number, uy: number, vx: number, vy: number): number => {
+    const dot = ux * vx + uy * vy;
+    const len = Math.sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
+    let a = Math.acos(Math.min(1, Math.max(-1, len === 0 ? 1 : dot / len)));
+    if (ux * vy - uy * vx < 0) a = -a;
+    return a;
+  };
+  const ux = (x1p - cxp) / rx;
+  const uy = (y1p - cyp) / ry;
+  const vx = (-x1p - cxp) / rx;
+  const vy = (-y1p - cyp) / ry;
+  const theta1 = angle(1, 0, ux, uy);
+  let dTheta = angle(ux, uy, vx, vy);
+  if (!sweep && dTheta > 0) dTheta -= 2 * Math.PI;
+  else if (sweep && dTheta < 0) dTheta += 2 * Math.PI;
+  const segs = Math.max(1, Math.ceil(Math.abs(dTheta) / (Math.PI / 2)));
+  const delta = dTheta / segs;
+  const t = (4 / 3) * Math.tan(delta / 4);
+  const out: number[][] = [];
+  let th = theta1;
+  let sx = x1;
+  let sy = y1;
+  for (let k = 0; k < segs; k++) {
+    const th2 = th + delta;
+    const cosTh = Math.cos(th);
+    const sinTh = Math.sin(th);
+    const cosTh2 = Math.cos(th2);
+    const sinTh2 = Math.sin(th2);
+    const ex = cx + (rx * cosTh2 * cosPhi - ry * sinTh2 * sinPhi);
+    const ey = cy + (rx * cosTh2 * sinPhi + ry * sinTh2 * cosPhi);
+    const d1x = -rx * sinTh * cosPhi - ry * cosTh * sinPhi;
+    const d1y = -rx * sinTh * sinPhi + ry * cosTh * cosPhi;
+    const d2x = -rx * sinTh2 * cosPhi - ry * cosTh2 * sinPhi;
+    const d2y = -rx * sinTh2 * sinPhi + ry * cosTh2 * cosPhi;
+    out.push([
+      sx + t * d1x,
+      sy + t * d1y,
+      ex - t * d2x,
+      ey - t * d2y,
+      ex,
+      ey,
+    ]);
+    sx = ex;
+    sy = ey;
+    th = th2;
+  }
+  return out;
 }
 
 function tokenisePath(d: string): Array<string | number> {

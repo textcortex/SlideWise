@@ -18,6 +18,7 @@ import type {
   GroupElement,
   UnknownElement,
   FontAsset,
+  WebFontAsset,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
 import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
@@ -323,13 +324,18 @@ export async function parsePptx(
   // a redundant fallback for callers that hold the deck object directly.
   const sourcePptxId = nanoid(12);
   sourceBufferCache.set(sourcePptxId, sourceBuffer);
-  const fonts = await readEmbeddedFonts(zip, presentationXml, presentationRels);
+  const { fonts, webFonts } = await readEmbeddedFonts(
+    zip,
+    presentationXml,
+    presentationRels
+  );
   const deck: Deck = {
     version: CURRENT_DECK_VERSION,
     title,
     slides,
     sourcePptxId,
     ...(fonts.length ? { fonts } : {}),
+    ...(webFonts.length ? { webFonts } : {}),
   };
   Object.defineProperty(deck, SOURCE_PPTX, {
     value: sourceBuffer,
@@ -3600,14 +3606,22 @@ function custGeomBodyToSvgD(pathBlock: string): string {
           const rad = (deg: number) => (deg * Math.PI) / 180;
           const cx = penX - wR * Math.cos(rad(stAng));
           const cy = penY - hR * Math.sin(rad(stAng));
-          const endAng = stAng + swAng;
-          const ex = cx + wR * Math.cos(rad(endAng));
-          const ey = cy + hR * Math.sin(rad(endAng));
-          const largeArc = Math.abs(swAng) > 180 ? 1 : 0;
+          // Split the sweep into ≤120° segments. A single SVG `A` whose end
+          // point coincides with its start (a 360° sweep — i.e. a wheel /
+          // full circle, which is exactly how PowerPoint authors round shapes)
+          // renders as NOTHING per the SVG spec, so the whole circle would
+          // vanish. Splitting also sidesteps the 180° large-arc ambiguity.
+          const segs = Math.max(1, Math.ceil(Math.abs(swAng) / 120));
+          const segSweep = swAng / segs;
           const sweep = swAng > 0 ? 1 : 0;
-          out += ` A ${wR} ${hR} 0 ${largeArc} ${sweep} ${ex.toFixed(2)} ${ey.toFixed(2)}`;
-          penX = ex;
-          penY = ey;
+          for (let k = 1; k <= segs; k++) {
+            const a = stAng + segSweep * k;
+            const ex = cx + wR * Math.cos(rad(a));
+            const ey = cy + hR * Math.sin(rad(a));
+            out += ` A ${wR} ${hR} 0 0 ${sweep} ${ex.toFixed(2)} ${ey.toFixed(2)}`;
+            penX = ex;
+            penY = ey;
+          }
         }
       }
       // Unknown commands are skipped — the rest of the path stays valid.
@@ -4486,11 +4500,12 @@ async function readEmbeddedFonts(
   zip: JSZip,
   presentationXml: any,
   presentationRels: Rels
-): Promise<FontAsset[]> {
+): Promise<{ fonts: FontAsset[]; webFonts: WebFontAsset[] }> {
   const list = presentationXml?.["p:presentation"]?.["p:embeddedFontLst"];
-  if (!list) return [];
+  if (!list) return { fonts: [], webFonts: [] };
   const fonts = asArray<any>(list["p:embeddedFont"]);
   const out: FontAsset[] = [];
+  const webOut: WebFontAsset[] = [];
   const styles: Array<{ key: string; weight: number; italic: boolean }> = [
     { key: "p:regular", weight: 400, italic: false },
     { key: "p:bold", weight: 700, italic: false },
@@ -4510,15 +4525,56 @@ async function readEmbeddedFonts(
       if (!file) continue;
       const bytes = await file.async("uint8array");
       const base64 = uint8ArrayToBase64(bytes);
+      // The PPTX-embedded payload, preserved verbatim for re-export.
       out.push({
         family,
         data: `data:application/x-fontdata;base64,${base64}`,
         weight: style.weight,
         italic: style.italic,
       });
+      // PowerPoint embeds plain SFNT (TTF/OTF) — directly renderable by the
+      // browser. When the bytes are a recognised font format we also surface
+      // a `WebFontAsset` so the editor canvas paints the real brand typeface
+      // instead of falling back to a system font (Calibri/sans-serif). If the
+      // payload isn't a known font signature we skip it (no regression).
+      const webMime = webFontMimeFromBytes(bytes);
+      if (webMime) {
+        webOut.push({
+          family,
+          src: `data:${webMime};base64,${base64}`,
+          weight: style.weight,
+          italic: style.italic,
+        });
+      }
     }
   }
-  return out;
+  return { fonts: out, webFonts: webOut };
+}
+
+/**
+ * Sniff a font file's signature and return the data-URL MIME a browser can
+ * load it with, or `null` when the bytes aren't a renderable font (e.g. an
+ * obfuscated / EOT payload). Magic numbers per the OpenType / WOFF specs.
+ */
+function webFontMimeFromBytes(bytes: Uint8Array): string | null {
+  if (bytes.length < 4) return null;
+  const b0 = bytes[0];
+  const b1 = bytes[1];
+  const b2 = bytes[2];
+  const b3 = bytes[3];
+  const tag = String.fromCharCode(b0, b1, b2, b3);
+  // SFNT TrueType outlines: 0x00010000, or "true"/"typ1" (Apple).
+  if (b0 === 0x00 && b1 === 0x01 && b2 === 0x00 && b3 === 0x00)
+    return "font/ttf";
+  if (tag === "true" || tag === "typ1") return "font/ttf";
+  // OpenType with CFF outlines.
+  if (tag === "OTTO") return "font/otf";
+  // Web font containers (rare as PPTX embeds, but renderable as-is).
+  if (tag === "wOFF") return "font/woff";
+  if (tag === "wOF2") return "font/woff2";
+  // "ttcf" (collections) and anything else aren't reliably loadable via
+  // @font-face — skip.
+  return null;
 }
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
