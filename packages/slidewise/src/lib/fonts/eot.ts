@@ -76,32 +76,24 @@ export function decodeEot(bytes: Uint8Array): DecodedEotFont {
   const header = parseEotHeader(bytes);
 
   const flags = header.flags;
-  let payload = bytes.subarray(header.dataOffset, header.dataOffset + header.fontDataSize);
+  // FontData is the LAST `fontDataSize` bytes of the EOT file — this is
+  // the spec-guaranteed location and is far more robust than walking the
+  // variable-length name / RootString / EUDC fields to find the offset.
+  // (Verified: for eon-deck fonts this lands exactly on the MTX `03`
+  // version byte; the name-table walk landed 20 bytes early, inside the
+  // RootString/EUDC metadata where the "BSGP" string lives.)
+  let payload = bytes.subarray(bytes.length - header.fontDataSize);
 
   if (flags & TTEMBED_XORENCRYPTDATA) {
     payload = xorDecrypt(payload);
   }
 
   if (flags & TTEMBED_TTCOMPRESSED) {
-    // The TTCOMPRESSED flag tells us the payload is compressed, but NOT
-    // which compressor. Sniff the magic so we report precisely:
-    //
-    //   - "BSGP" — the format real PowerPoint emits for embedded fonts.
-    //     Proprietary Monotype/Microsoft glyph compression with no public
-    //     spec and no open-source decoder. (Confirmed against eon-deck.pptx
-    //     and other client decks.) NOT the W3C/ISO "MicroType Express"
-    //     container, despite both living behind the same EOT flag.
-    //   - anything else — try the W3C MTX path in ./mtx.ts.
-    const magic = magicOf(payload);
-    if (magic === "BSGP") {
-      throw new EotDecodeError(
-        "Embedded font uses the proprietary 'BSGP' glyph-compression format " +
-          "(what PowerPoint emits). No public spec or open-source decoder exists. " +
-          "Supply a browser-renderable copy via fontRegistry / Deck.webFonts for " +
-          "editor preview; the original bytes still round-trip to PPTX on export.",
-        "mtx-not-implemented"
-      );
-    }
+    // TTCOMPRESSED ⇒ MicroType Express (MTX). decompressMtx parses +
+    // validates the MTX v3 container, then LZCOMP-decompresses. While the
+    // LZCOMP / CTF reconstruction milestones are in progress it throws
+    // mtx-not-implemented; any genuine parse failure also surfaces as an
+    // EotDecodeError so the caller's fallback chain runs.
     const decompressed = decompressMtx(payload);
     return { ttf: decompressed, header };
   }
@@ -277,12 +269,6 @@ function assertSfnt(payload: Uint8Array): void {
       "truncated"
     );
   }
-}
-
-/** First 4 payload bytes as an ASCII tag (e.g. "BSGP", "OTTO"), or "". */
-function magicOf(payload: Uint8Array): string {
-  if (payload.length < 4) return "";
-  return String.fromCharCode(payload[0], payload[1], payload[2], payload[3]);
 }
 
 function decodeUtf16Le(bytes: Uint8Array): string {
