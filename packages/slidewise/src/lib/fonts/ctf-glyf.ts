@@ -341,10 +341,28 @@ function assembleSfnt(
   }
 
   // Assemble the final table set (drop any existing loca; replace glyf).
+  // Also drop all hinting / device-metric tables: we emit unhinted glyphs
+  // (instructionLength = 0), so `cvt `, `fpgm`, `prep` (the instruction
+  // programs) and `hdmx`/`VDMX`/`LTSH`/`gasp` (device-metric caches) are
+  // unused — AND MTX stores `cvt`/`hdmx`/`VDMX` in a compressed/modified
+  // form in CTF, so copying them verbatim yields invalid tables (e.g. an
+  // odd-length `cvt ` that OTS / the browser rejects, failing the whole
+  // font). Dropping them produces a clean, browser-valid unhinted font.
+  const DROP_TABLES = new Set([
+    "glyf",
+    "loca",
+    "cvt ",
+    "fpgm",
+    "prep",
+    "hdmx",
+    "VDMX",
+    "LTSH",
+    "gasp",
+  ]);
   type Out = { tag: string; data: Uint8Array };
   const outTables: Out[] = [];
   for (const t of srcTables) {
-    if (t.tag === "glyf" || t.tag === "loca") continue;
+    if (DROP_TABLES.has(t.tag)) continue;
     let data = ctf.subarray(t.offset, t.offset + t.length);
     if (t.tag === "head") {
       // Force indexToLocFormat = 1 (long loca) and zero checkSumAdjustment.
