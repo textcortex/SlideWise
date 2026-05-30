@@ -20,6 +20,7 @@ import {
   ensureGoogleFontsLoaded,
   ensureWebFontsLoaded,
   resolveWebFonts,
+  googleFontExclusions,
 } from "@/lib/fonts";
 import { resolveJsonDeck } from "@/lib/schema/json";
 import type { Deck, WebFontAsset } from "@/lib/types";
@@ -402,7 +403,7 @@ function RootInner({
     // Re-issue the Google Fonts link too so families covered by the
     // registry no longer hit the Google endpoint (which 404s on
     // private/brand families and surfaces a noisy CORS error).
-    const excluded = new Set(resolved.map((f) => f.family.toLowerCase()));
+    const excluded = googleFontExclusions(store.getState().deck, resolved);
     ensureGoogleFontsLoaded(
       instanceId,
       collectFontFamilies(store.getState().deck),
@@ -415,7 +416,7 @@ function RootInner({
       store.getState().deck,
       fontRegistryRef.current ?? []
     );
-    const excluded = new Set(resolved.map((f) => f.family.toLowerCase()));
+    const excluded = googleFontExclusions(store.getState().deck, resolved);
     ensureGoogleFontsLoaded(
       instanceId,
       collectFontFamilies(store.getState().deck),
@@ -473,7 +474,7 @@ function RootInner({
         state.deck,
         fontRegistryRef.current ?? []
       );
-      const excluded = new Set(resolved.map((f) => f.family.toLowerCase()));
+      const excluded = googleFontExclusions(store.getState().deck, resolved);
       ensureGoogleFontsLoaded(
         instanceId,
         collectFontFamilies(state.deck),
