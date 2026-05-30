@@ -1,5 +1,66 @@
 # @textcortex/slidewise
 
+## 1.16.0
+
+### Minor Changes
+
+- ea3007a: Begin the MTX → TTF decoder for PPTX-embedded fonts.
+
+  PPTX stores embedded fonts as MTX-compressed EOT inside `ppt/fonts/*.fntdata`. PowerPoint decodes them natively; browsers can't, which is why editor previews fall back to system fonts even when `parsePptx` extracted the bytes into `Deck.fonts`. This change lays the groundwork:
+
+  **New `packages/slidewise/src/lib/fonts/eot.ts`**
+
+  - Full EOT wrapper parser — header, flags, variable-length name fields, version 1.0 / 2.0 / 2.1 / 2.2 tail variants
+  - Uncompressed-EOT extraction → ready-to-register TTF/OTF bytes
+  - MTX detection via the `TTEMBED_TTCOMPRESSED` flag
+  - `EotDecodeError` with discriminated `kind` so callers can distinguish "truncated", "magic-mismatch", "mtx-not-implemented", "mtx-failed"
+
+  **New `packages/slidewise/src/lib/fonts/mtx.ts`**
+
+  - MTX outer container parser scaffolding
+  - Recognises but does not yet decompress the PowerPoint MTX variant (Office-embedded fonts use a different major version than the W3C MTX submission spec; the post-2010 Office variant isn't publicly documented).
+  - Throws `EotDecodeError("mtx-not-implemented")` for unsupported sub-methods so the fallback chain (Deck.webFonts → fontRegistry → system fonts) runs cleanly. No noisy console errors — diagnostic only when `window.__slidewiseFontDebug = true`.
+
+  **Auto-wiring through `resolveWebFonts()`**
+
+  The font loader now decodes `Deck.fonts` on the fly. When a font is uncompressed EOT (~30% of real-world embedded fonts), we synthesise a `data:font/ttf;base64,…` URL and register it via `@font-face` — no `fontRegistry` needed, no platform involvement. Brand-embedded fonts that use MTX glyph compression (the EON case, most enterprise decks) still need `fontRegistry` for editor preview, but the export path still embeds the original MTX bytes verbatim.
+
+  **What still needs to happen for full coverage**
+
+  A real MTX decompressor for the Office variant. Either:
+
+  - Reverse-engineering the format against a test corpus, or
+  - A WebAssembly port of FontForge's GPL'd `parsettf.c` MTX path
+
+  Both are multi-week projects. Tracked as a follow-up.
+
+  **Tests**
+
+  3 new tests in `src/lib/fonts/__tests__/eot.test.ts` against the real `eon-deck.pptx` fixture:
+
+  - EOT header parser succeeds on every embedded font (5 entries)
+  - `isMtxCompressed()` correctly reports the EON fonts as MTX
+  - `decodeEot()` returns `EotDecodeError.kind === "mtx-not-implemented"` for MTX-flagged fonts (so the caller's fallback fires)
+
+  No public API changes. `FontAsset`, `WebFontAsset`, and the rest of the font surface are untouched. Additive.
+
+- ea3007a: Complete the in-browser MTX decoder: TrueType-glyf font reconstruction.
+
+  Milestone 2 decoded CFF/OTTO embedded fonts. This adds TrueType-outline fonts: MTX stores `glyf` in Compact Table Format (the WOFF2 triplet point encoding) and strips `loca`. `ctf-glyf.ts` reconstructs a standard `glyf` + `loca` and reassembles the sfnt with recomputed table checksums + `head.checkSumAdjustment` (so strict browser sanitizers accept it). TrueType hinting instructions are dropped (browsers ignore them; unhinted outlines render identically on screen). Simple and composite glyphs are handled.
+
+  Verified against `eon-deck.pptx`: all 5 embedded EON fonts now decode in-browser — the 4 CFF EON Brix Sans weights (OTTO) and the TrueType EON Office Head (FontForge confirms the font name and correct glyph outlines). No CDN, no `fontRegistry`, no network: embedded PPTX fonts render exactly and automatically on import.
+
+- ea3007a: Decode CFF embedded PowerPoint fonts in-browser via a clean-room MTX (MicroType Express) decompressor.
+
+  PPTX embeds fonts as MTX-compressed EOT in `ppt/fonts/*.fntdata`. Browsers can't decode MTX, so editor previews fell back to system fonts even though the importer extracts the bytes into `Deck.fonts`. This ports the W3C MTX submission (Appendix C: BITIO / AHUFF / LZCOMP) to TypeScript so the editor renders the **real embedded typeface** — no CDN, no `fontRegistry`, no network.
+
+  - `lib/fonts/lzcomp.ts` — full LZCOMP decompressor: MSB-first bit reader, adaptive Huffman (complete-tree init + priming + sibling-rule update/swap), 7168-byte preload dictionary, copy-model loop.
+  - `lib/fonts/mtx.ts` — MTX v3 container parse + `decompressMtx`: for CFF/OTTO fonts, block 1 decompresses to the complete font and is returned directly.
+  - `lib/fonts/eot.ts` — locates FontData as the trailing `fontDataSize` bytes (spec-correct); routes compressed payloads through the MTX decoder.
+  - `resolveWebFonts` / `fontAssetToWebFont` wrap the decoded bytes as a `data:font/otf` URL, so embedded CFF fonts render automatically on import.
+
+  **Verified** against `eon-deck.pptx`: the 4 CFF EON Brix Sans weights decode to valid OTTO fonts (FontForge confirms "EON Brix Sans Regular"). TrueType-glyf fonts (EON Office Head) fall back with `mtx-not-implemented` — CTF glyf reconstruction is the remaining milestone. Export is unchanged (original `.fntdata` bytes still round-trip to PPTX).
+
 ## 1.15.4
 
 ### Patch Changes
