@@ -215,6 +215,24 @@ function escapeCss(s: string): string {
  *
  * The first source to claim a `(family, weight, italic)` tuple wins.
  */
+/**
+ * Families that must NOT be requested from Google Fonts: anything we resolve
+ * to a web font locally, PLUS every embedded-font family on the deck. An
+ * embedded brand font (EON Office Head, etc.) will never exist on Google
+ * Fonts, so requesting it just produces a noisy CORS/404 — even when we
+ * can't yet decode it (TrueType-glyf MTX), the right behaviour is a silent
+ * system fallback, not a failed network request.
+ */
+export function googleFontExclusions(
+  deck: Deck,
+  resolved: WebFontAsset[]
+): Set<string> {
+  const out = new Set<string>();
+  for (const f of resolved) out.add(f.family.toLowerCase());
+  for (const f of deck.fonts ?? []) out.add(f.family.toLowerCase());
+  return out;
+}
+
 export function resolveWebFonts(
   deck: Deck,
   registry: WebFontAsset[] = []
