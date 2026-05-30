@@ -1,5 +1,14 @@
 # website
 
+## 0.0.23
+
+### Patch Changes
+
+- Updated dependencies [ea3007a]
+- Updated dependencies [ea3007a]
+- Updated dependencies [ea3007a]
+  - @textcortex/slidewise@1.16.0
+
 ## 0.0.22
 
 ### Patch Changes
