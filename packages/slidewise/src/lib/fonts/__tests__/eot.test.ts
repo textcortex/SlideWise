@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parsePptx } from "@/lib/pptx/pptxToDeck";
 import { decodeEot, isMtxCompressed } from "../eot";
 
-const EON_PPTX = resolve(
+const EON_PATH = resolve(
   __dirname,
   "../../../../../../.context/attachments/eon-deck.pptx"
 );
@@ -15,9 +15,14 @@ function dataUrlToBytes(dataUrl: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, "base64"));
 }
 
+// eon-deck.pptx lives in the gitignored .context/attachments (proprietary
+// embedded fonts, not committable). Skip when absent so CI stays green;
+// runs locally where the fixture is present.
+const hasEon = existsSync(EON_PATH);
+
 describe("EOT decoder", () => {
-  it("parses the EOT header of every embedded font in eon-deck.pptx", async () => {
-    const buf = readFileSync(EON_PPTX);
+  it.skipIf(!hasEon)("parses the EOT header of every embedded font in eon-deck.pptx", async () => {
+    const buf = readFileSync(EON_PATH);
     const deck = await parsePptx(new Uint8Array(buf));
     expect(deck.fonts && deck.fonts.length).toBeGreaterThan(0);
 
@@ -35,8 +40,8 @@ describe("EOT decoder", () => {
     }
   });
 
-  it("detects MTX compression on the EON brand fonts", async () => {
-    const buf = readFileSync(EON_PPTX);
+  it.skipIf(!hasEon)("detects MTX compression on the EON brand fonts", async () => {
+    const buf = readFileSync(EON_PATH);
     const deck = await parsePptx(new Uint8Array(buf));
     let mtxCount = 0;
     for (const asset of deck.fonts ?? []) {
@@ -50,12 +55,12 @@ describe("EOT decoder", () => {
     expect(mtxCount).toBeGreaterThan(0);
   });
 
-  it("decodes the CFF EON fonts via the MTX LZCOMP decoder", async () => {
+  it.skipIf(!hasEon)("decodes the CFF EON fonts via the MTX LZCOMP decoder", async () => {
     // Milestone 2: the clean-room MTX decoder now decodes CFF/OTTO embedded
     // fonts. The 4 EON Brix Sans weights decode to valid OTTO; the TrueType
     // EON Office Head still falls back (mtx-not-implemented). See
     // mtx-decode.test.ts for the per-font assertions.
-    const buf = readFileSync(EON_PPTX);
+    const buf = readFileSync(EON_PATH);
     const deck = await parsePptx(new Uint8Array(buf));
     const cff = (deck.fonts ?? []).find((a) => a.family === "EON Brix Sans")!;
     expect(cff).toBeTruthy();

@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parsePptx } from "@/lib/pptx/pptxToDeck";
 import { decodeEot } from "../eot";
 
-const EON = resolve(__dirname, "../../../../../../.context/attachments/eon-deck.pptx");
+const EON_PATH = resolve(__dirname, "../../../../../../.context/attachments/eon-deck.pptx");
 function b(d: string){const c=d.indexOf(",");return new Uint8Array(Buffer.from(c>=0?d.slice(c+1):d,"base64"));}
 
 /**
@@ -14,9 +14,14 @@ function b(d: string){const c=d.indexOf(",");return new Uint8Array(Buffer.from(c
  * complete, valid OTTO fonts. The TrueType-glyf EON Office Head falls back
  * with mtx-not-implemented (CTF glyf reconstruction is milestone 3).
  */
+// eon-deck.pptx lives in the gitignored .context/attachments (proprietary
+// embedded fonts, not committable). Skip when absent so CI stays green;
+// runs locally where the fixture is present.
+const hasEon = existsSync(EON_PATH);
+
 describe("MTX LZCOMP decode (CFF fonts)", () => {
-  it("decodes the 4 CFF EON Brix Sans weights to valid OTTO", async () => {
-    const deck = await parsePptx(new Uint8Array(readFileSync(EON)));
+  it.skipIf(!hasEon)("decodes the 4 CFF EON Brix Sans weights to valid OTTO", async () => {
+    const deck = await parsePptx(new Uint8Array(readFileSync(EON_PATH)));
     const cff = (deck.fonts ?? []).filter((a) => a.family === "EON Brix Sans");
     expect(cff.length).toBe(4);
     for (const a of cff) {
@@ -27,8 +32,8 @@ describe("MTX LZCOMP decode (CFF fonts)", () => {
     }
   });
 
-  it("reconstructs the TrueType-glyf EON Office Head to a valid sfnt", async () => {
-    const deck = await parsePptx(new Uint8Array(readFileSync(EON)));
+  it.skipIf(!hasEon)("reconstructs the TrueType-glyf EON Office Head to a valid sfnt", async () => {
+    const deck = await parsePptx(new Uint8Array(readFileSync(EON_PATH)));
     const tt = (deck.fonts ?? []).find((a) => a.family === "EON Office Head")!;
     expect(tt).toBeTruthy();
     const { ttf } = decodeEot(b(tt.data));

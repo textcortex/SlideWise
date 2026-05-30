@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parsePptx } from "@/lib/pptx/pptxToDeck";
 import { parseMtxContainer } from "../mtx";
 
-const EON = resolve(__dirname, "../../../../../../.context/attachments/eon-deck.pptx");
+const EON_PATH = resolve(__dirname, "../../../../../../.context/attachments/eon-deck.pptx");
 function b(d: string) { const c = d.indexOf(","); return new Uint8Array(Buffer.from(c >= 0 ? d.slice(c + 1) : d, "base64")); }
 
 /**
@@ -13,9 +13,14 @@ function b(d: string) { const c = d.indexOf(","); return new Uint8Array(Buffer.f
  * the payload exactly. LZCOMP block decompression + CTF glyf reconstruction
  * are later milestones (see mtx.ts / lzcomp.ts).
  */
+// eon-deck.pptx lives in the gitignored .context/attachments (proprietary
+// embedded fonts, not committable). Skip when absent so CI stays green;
+// runs locally where the fixture is present.
+const hasEon = existsSync(EON_PATH);
+
 describe("MTX v3 container parse", () => {
-  it("parses + validates every embedded EON font", async () => {
-    const deck = await parsePptx(new Uint8Array(readFileSync(EON)));
+  it.skipIf(!hasEon)("parses + validates every embedded EON font", async () => {
+    const deck = await parsePptx(new Uint8Array(readFileSync(EON_PATH)));
     expect(deck.fonts && deck.fonts.length).toBeGreaterThan(0);
     for (const asset of deck.fonts ?? []) {
       const eot = b(asset.data);
