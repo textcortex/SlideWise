@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parsePptx } from "@/lib/pptx/pptxToDeck";
-import { decodeEot, EotDecodeError } from "../eot";
+import { decodeEot } from "../eot";
 
 const EON = resolve(__dirname, "../../../../../../.context/attachments/eon-deck.pptx");
 function b(d: string){const c=d.indexOf(",");return new Uint8Array(Buffer.from(c>=0?d.slice(c+1):d,"base64"));}
@@ -27,16 +27,22 @@ describe("MTX LZCOMP decode (CFF fonts)", () => {
     }
   });
 
-  it("falls back cleanly on the TrueType-glyf font (milestone 3 pending)", async () => {
+  it("reconstructs the TrueType-glyf EON Office Head to a valid sfnt", async () => {
     const deck = await parsePptx(new Uint8Array(readFileSync(EON)));
     const tt = (deck.fonts ?? []).find((a) => a.family === "EON Office Head")!;
     expect(tt).toBeTruthy();
-    try {
-      decodeEot(b(tt.data));
-      expect.unreachable("glyf reconstruction not implemented yet");
-    } catch (e) {
-      expect(e).toBeInstanceOf(EotDecodeError);
-      expect((e as EotDecodeError).kind).toBe("mtx-not-implemented");
+    const { ttf } = decodeEot(b(tt.data));
+    // TrueType outlines reassemble with sfnt version 0x00010000.
+    const ver = (ttf[0] << 24) | (ttf[1] << 16) | (ttf[2] << 8) | ttf[3];
+    expect(ver >>> 0).toBe(0x00010000);
+    // glyf + loca present in the rebuilt directory.
+    const numTables = (ttf[4] << 8) | ttf[5];
+    const tags = new Set<string>();
+    for (let i = 0; i < numTables; i++) {
+      const o = 12 + i * 16;
+      tags.add(String.fromCharCode(ttf[o], ttf[o+1], ttf[o+2], ttf[o+3]));
     }
+    expect(tags.has("glyf")).toBe(true);
+    expect(tags.has("loca")).toBe(true);
   });
 });

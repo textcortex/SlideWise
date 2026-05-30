@@ -35,6 +35,7 @@
 
 import { EotDecodeError } from "./eot";
 import { lzcompDecompress } from "./lzcomp";
+import { reconstructTrueType } from "./ctf-glyf";
 
 export interface MtxContainer {
   version: number;
@@ -133,13 +134,9 @@ export function decompressMtx(payload: Uint8Array): Uint8Array {
     return block1;
   }
 
-  // TrueType (glyf) outlines: MTX strips loca and re-encodes glyf via the
-  // CTF triplet format + push (block 2) + instructions (block 3). Rebuilding
-  // those is the remaining milestone; until then, fall back cleanly.
-  throw new EotDecodeError(
-    "MTX TrueType-glyf (CTF) reconstruction not yet implemented; CFF fonts decode fully",
-    "mtx-not-implemented"
-  );
+  // TrueType (glyf) outlines: MTX strips loca and re-encodes glyf in CTF.
+  // Reconstruct a standard glyf + loca and reassemble the sfnt.
+  return reconstructTrueType(block1);
 }
 
 /** Read the set of 4-char table tags from an sfnt table directory. */
