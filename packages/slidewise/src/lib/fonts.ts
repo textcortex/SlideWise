@@ -259,7 +259,12 @@ export function fontAssetToWebFont(asset: FontAsset): WebFontAsset | null {
   if (!bytes) return null;
   try {
     const decoded = decodeEot(bytes);
-    const dataUrl = `data:font/ttf;base64,${uint8ArrayToBase64(decoded.ttf)}`;
+    // "OTTO" sfnt magic = OpenType/CFF → font/otf; otherwise TrueType.
+    const t = decoded.ttf;
+    const isOtto =
+      t.length >= 4 && t[0] === 0x4f && t[1] === 0x54 && t[2] === 0x54 && t[3] === 0x4f;
+    const mime = isOtto ? "font/otf" : "font/ttf";
+    const dataUrl = `data:${mime};base64,${uint8ArrayToBase64(decoded.ttf)}`;
     return {
       family: asset.family,
       src: dataUrl,

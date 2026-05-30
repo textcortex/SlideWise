@@ -1,203 +1,324 @@
 /**
- * LZCOMP decompressor for MTX (MicroType Express), per the W3C MTX submission
- * Appendix C (BITIO / AHUFF / LZCOMP) and ISO/IEC 14496-18.
+ * LZCOMP decompressor for MTX (MicroType Express) — clean-room TypeScript port
+ * of the W3C MTX submission Appendix C (BITIO.C / AHUFF.C / LZCOMP.C),
+ * https://www.w3.org/Submission/MTX/. Verified against real PowerPoint-embedded
+ * fonts (eon-deck.pptx).
  *
- * Three pieces:
- *   - BitReader  — MSB-first bit I/O over the compressed block
- *   - AdaptiveHuffman — FGK-style adaptive Huffman, all symbols pre-loaded at
- *     weight 1, sibling-property maintained, reweighted after every decode
- *   - lzcompDecompress — the copy-model main loop (literals + DUP2/4/6 +
- *     range-coded copy commands)
+ * Pipeline (per block):
+ *   1 bit  usingRunLength (when MTX version != 1)
+ *   AHUFF dist tree (range 8) + len tree (range 8) created — consume no bits
+ *   24 bits out_len
+ *   SetDistRange(out_len) → num_DistRanges, DUP2/4/6, NUM_SYMS
+ *   AHUFF sym tree (range NUM_SYMS) created
+ *   Decode(): a 7168-byte preload dictionary, then a copy-model loop emitting
+ *             out_len bytes.
  *
- * Symbol alphabet for the main tree (AHUFF #1), range = 307:
- *   0..255   literal bytes
- *   256..303 copy commands ( (sym-256)/8 + 1 distance symbols; (sym-256)%8 length seed )
- *   304      DUP2  (1 byte from 2 back)
- *   305      DUP4  (1 byte from 4 back)
- *   306      DUP6  (1 byte from 6 back)
- * AHUFF #2 (length extension) range = 8; AHUFF #3 (distance) range = 8.
- *
- * MILESTONE NOTE: the adaptive-Huffman *initial tree shape* must match the
- * encoder's exactly or decoding diverges on the first symbol. We build the
- * canonical equal-weight tree; the verification oracle is "does block 1
- * decompress to a valid TTF table directory" (checked in tests). If that
- * check fails, the init tie-breaking needs to be reconciled against the
- * Appendix C source — this module throws `mtx-not-implemented` so the caller
- * falls back cleanly meanwhile.
+ * Adaptive Huffman (AHUFF): array of {up,left,right,code,weight}, ROOT=1,
+ * nodes kept in non-increasing weight order; complete-binary-tree init with
+ * leaf for symbol i at index range+i, then a priming sequence; sibling-rule
+ * maintained by SwapNodes during UpdateWeight.
  */
 
 import { EotDecodeError } from "./eot";
 
+const PRELOAD_SIZE = 2 * 32 * 96 + 4 * 256; // 7168
 const LEN_WIDTH = 3;
-const NUM_DIST_RANGES = 6;
-const DUP2 = 256 + (1 << LEN_WIDTH) * NUM_DIST_RANGES; // 304
-const DUP4 = DUP2 + 1; // 305
-const DUP6 = DUP4 + 1; // 306
-const MAIN_RANGE = DUP6 + 1; // 307
-const LEN_RANGE = 8;
-const DIST_RANGE = 8;
+const DIST_WIDTH = 3;
+const LEN_MIN = 2;
+const DIST_MIN = 1;
+const MAX_2BYTE_DIST = 512;
 
 class BitReader {
   private bytes: Uint8Array;
   private pos = 0;
-  private bit = 0; // 0..7, MSB-first within the current byte
+  private bit = 0; // MSB-first within byte
   constructor(bytes: Uint8Array) {
     this.bytes = bytes;
   }
   readBit(): number {
-    if (this.pos >= this.bytes.length) {
-      // Past end — adaptive Huffman / copy loop should terminate before this.
-      // Return 0 rather than throwing so a benign trailing read doesn't abort.
-      return 0;
-    }
-    const byte = this.bytes[this.pos];
-    const v = (byte >> (7 - this.bit)) & 1;
-    this.bit++;
-    if (this.bit === 8) {
+    if (this.pos >= this.bytes.length) return 0;
+    const v = (this.bytes[this.pos] >> (7 - this.bit)) & 1;
+    if (++this.bit === 8) {
       this.bit = 0;
       this.pos++;
     }
     return v;
   }
-  get exhausted(): boolean {
-    return this.pos >= this.bytes.length;
+  readValue(n: number): number {
+    let v = 0;
+    for (let i = n - 1; i >= 0; i--) v = (v << 1) | this.readBit();
+    return v >>> 0;
   }
 }
 
-/**
- * FGK adaptive Huffman over `range` symbols, all initialised to weight 1.
- *
- * Node arrays (index 0 = root). For an internal node, `left`/`right` index
- * child nodes; for a leaf, `symbol >= 0`. `order` keeps nodes sorted by
- * non-decreasing weight so the sibling property can be maintained with swaps.
- */
-class AdaptiveHuffman {
-  private weight: number[] = [];
-  private parent: number[] = [];
-  private left: number[] = [];
-  private right: number[] = [];
-  private symbol: number[] = [];
-  private leafOf: number[] = []; // symbol -> node index
-  private root = 0;
+function bitsUsed(x: number): number {
+  let n = 0;
+  while (x > 0) {
+    n++;
+    x >>>= 1;
+  }
+  return n;
+}
+
+const ROOT = 1;
+
+/** Adaptive Huffman, faithful to AHUFF.C. */
+class AHuff {
+  private up: Int32Array;
+  private left: Int32Array;
+  private right: Int32Array;
+  private code: Int32Array;
+  private weight: Float64Array;
+  private symbolIndex: Int32Array;
+  readonly range: number;
 
   constructor(range: number) {
-    // Build the canonical equal-weight tree by repeatedly combining the two
-    // lowest-weight roots (classic Huffman over equal weights → balanced
-    // tree). Leaves first, in symbol order, so ties break by symbol index.
-    let next = 0;
-    const newLeaf = (sym: number): number => {
-      const i = next++;
-      this.weight[i] = 1;
-      this.parent[i] = -1;
-      this.left[i] = -1;
-      this.right[i] = -1;
-      this.symbol[i] = sym;
-      this.leafOf[sym] = i;
-      return i;
-    };
-    const newInternal = (l: number, r: number): number => {
-      const i = next++;
-      this.weight[i] = this.weight[l] + this.weight[r];
-      this.parent[i] = -1;
-      this.left[i] = l;
-      this.right[i] = r;
-      this.symbol[i] = -1;
-      this.parent[l] = i;
-      this.parent[r] = i;
-      return i;
-    };
-    // queue of (nodeIndex) ordered by insertion; combine front pairs
-    const queue: number[] = [];
-    for (let s = 0; s < range; s++) queue.push(newLeaf(s));
-    while (queue.length > 1) {
-      const l = queue.shift()!;
-      const r = queue.shift()!;
-      queue.push(newInternal(l, r));
-    }
-    this.root = queue[0];
-  }
+    this.range = range;
+    const n = 2 * range;
+    this.up = new Int32Array(n);
+    this.left = new Int32Array(n);
+    this.right = new Int32Array(n);
+    this.code = new Int32Array(n);
+    this.weight = new Float64Array(n);
+    this.symbolIndex = new Int32Array(range);
 
-  decode(br: BitReader): number {
-    let node = this.root;
-    while (this.symbol[node] < 0) {
-      node = br.readBit() === 0 ? this.left[node] : this.right[node];
-      if (node < 0) {
-        throw new EotDecodeError("AHUFF walked off tree", "mtx-failed");
+    let bitCount2 = 0;
+    if (range > 256 && range < 512) {
+      const r2 = range - 256;
+      bitCount2 = bitsUsed(r2 - 1) + 1;
+    }
+
+    // Complete-binary-tree init: node i has children 2i / 2i+1 and parent
+    // i>>1; leaves occupy [range .. 2*range-1] with symbol i at range+i.
+    for (let i = 2; i < n; i++) {
+      this.up[i] = i >> 1;
+      this.weight[i] = 1;
+    }
+    for (let i = 1; i < range; i++) {
+      this.left[i] = 2 * i;
+      this.right[i] = 2 * i + 1;
+    }
+    for (let i = 0; i < range; i++) {
+      this.code[i] = -1;
+      this.code[range + i] = i;
+      this.left[range + i] = -1;
+      this.right[range + i] = -1;
+      this.symbolIndex[i] = range + i;
+    }
+    this.initWeight(ROOT);
+
+    // Priming sequence (exactly as AHUFF.C): biases the starting tree.
+    if (bitCount2 !== 0) {
+      this.updateWeight(this.symbolIndex[256]);
+      this.updateWeight(this.symbolIndex[257]);
+      for (let i = 0; i < 12; i++) this.updateWeight(this.symbolIndex[range - 3]); // DUP2
+      for (let i = 0; i < 6; i++) this.updateWeight(this.symbolIndex[range - 2]); // DUP4
+      // DUP6 (range-1): no priming
+    } else {
+      for (let j = 0; j < 2; j++) {
+        for (let i = 0; i < range; i++) this.updateWeight(this.symbolIndex[i]);
       }
     }
-    const sym = this.symbol[node];
-    this.update(node);
-    return sym;
   }
 
-  /** Increment a leaf's weight and propagate to the root. (Simplified FGK:
-   *  weights propagate; full sibling-swap reordering is the reconciliation
-   *  point against the Appendix C source.) */
-  private update(node: number): void {
-    let n = node;
-    while (n !== -1) {
-      this.weight[n]++;
-      n = this.parent[n];
+  private initWeight(a: number): number {
+    if (this.code[a] < 0) {
+      this.weight[a] = this.initWeight(this.left[a]) + this.initWeight(this.right[a]);
     }
+    return this.weight[a];
+  }
+
+  private swapNodes(a: number, b: number): void {
+    const upa = this.up[a];
+    const upb = this.up[b];
+    // swap full node records
+    const w = this.weight[a]; this.weight[a] = this.weight[b]; this.weight[b] = w;
+    const l = this.left[a]; this.left[a] = this.left[b]; this.left[b] = l;
+    const r = this.right[a]; this.right[a] = this.right[b]; this.right[b] = r;
+    const c = this.code[a]; this.code[a] = this.code[b]; this.code[b] = c;
+    // positions keep their original parents
+    this.up[a] = upa;
+    this.up[b] = upb;
+    // fix children's parent pointers / symbol index
+    if (this.code[a] < 0) {
+      this.up[this.left[a]] = a;
+      this.up[this.right[a]] = a;
+    } else {
+      this.symbolIndex[this.code[a]] = a;
+    }
+    if (this.code[b] < 0) {
+      this.up[this.left[b]] = b;
+      this.up[this.right[b]] = b;
+    } else {
+      this.symbolIndex[this.code[b]] = b;
+    }
+  }
+
+  private updateWeight(a: number): void {
+    while (a !== ROOT) {
+      const weightA = this.weight[a];
+      let b = a - 1;
+      if (this.weight[b] === weightA) {
+        do {
+          b--;
+        } while (this.weight[b] === weightA);
+        b++;
+        if (b > ROOT) {
+          this.swapNodes(a, b);
+          a = b;
+        }
+      }
+      this.weight[a] = weightA + 1;
+      a = this.up[a];
+    }
+    this.weight[ROOT] = this.weight[ROOT] + 1;
+  }
+
+  readSymbol(br: BitReader): number {
+    let a = ROOT;
+    let symbol: number;
+    do {
+      a = br.readBit() ? this.right[a] : this.left[a];
+      symbol = this.code[a];
+    } while (symbol < 0);
+    this.updateWeight(a);
+    return symbol;
+  }
+}
+
+/** SetDistRange — derive num_DistRanges + NUM_SYMS from the output length. */
+function setDistRange(outLen: number): {
+  numDistRanges: number;
+  dup2: number;
+  dup4: number;
+  dup6: number;
+  numSyms: number;
+} {
+  let numDistRanges = 1;
+  let distMax = DIST_MIN + (1 << (DIST_WIDTH * numDistRanges)) - 1;
+  while (distMax < outLen) {
+    numDistRanges++;
+    distMax = DIST_MIN + Math.pow(2, DIST_WIDTH * numDistRanges) - 1;
+  }
+  const dup2 = 256 + (1 << LEN_WIDTH) * numDistRanges;
+  const dup4 = dup2 + 1;
+  const dup6 = dup4 + 1;
+  return { numDistRanges, dup2, dup4, dup6, numSyms: dup6 + 1 };
+}
+
+function decodeLength(
+  symbol: number,
+  br: BitReader,
+  lenTree: AHuff
+): { length: number; numDistRanges: number } {
+  const bitRange = LEN_WIDTH - 1; // 2
+  const mask = 1 << bitRange; // 4
+  let value = 0;
+  let firstTime = true;
+  let numDistRanges = 1;
+  let done: boolean;
+  do {
+    let bits: number;
+    if (firstTime) {
+      const seed = symbol - 256;
+      numDistRanges = ((seed / (1 << LEN_WIDTH)) | 0) + 1;
+      bits = seed % (1 << LEN_WIDTH);
+      firstTime = false;
+    } else {
+      bits = lenTree.readSymbol(br);
+    }
+    done = (bits & mask) === 0;
+    bits &= ~mask;
+    value = (value << bitRange) | bits;
+  } while (!done);
+  return { length: value + LEN_MIN, numDistRanges };
+}
+
+function decodeDistance(numDistRanges: number, br: BitReader, distTree: AHuff): number {
+  let value = 0;
+  for (let i = numDistRanges; i > 0; i--) {
+    value = (value << DIST_WIDTH) | distTree.readSymbol(br);
+  }
+  return value + DIST_MIN;
+}
+
+function fillPreload(buf: Uint8Array): void {
+  // Exactly InitializeModel(decompress): 32×96 (k,j) pairs, then 256×4 of j.
+  let i = 0;
+  for (let k = 0; k < 32; k++) {
+    for (let j = 0; j < 96; j++) {
+      buf[i++] = k;
+      buf[i++] = j;
+    }
+  }
+  let j = 0;
+  while (i < PRELOAD_SIZE && j < 256) {
+    buf[i++] = j;
+    buf[i++] = j;
+    buf[i++] = j;
+    buf[i++] = j;
+    j++;
   }
 }
 
 /**
- * Decompress one LZCOMP block. `copyLimit` is the header's copy-distance
- * parameter (max copy offset for the 2-byte minimum-length window).
+ * Decompress one LZCOMP block (one of the MTX container's three blocks).
+ * Returns the decompressed bytes. `mtxVersion` selects whether the
+ * usingRunLength bit is present (absent when version == 1).
  */
-export function lzcompDecompress(
-  block: Uint8Array,
-  copyLimit: number
-): Uint8Array {
-  void copyLimit;
+export function lzcompDecompress(block: Uint8Array, mtxVersion = 3): Uint8Array {
   const br = new BitReader(block);
-  const main = new AdaptiveHuffman(MAIN_RANGE);
-  const lenTree = new AdaptiveHuffman(LEN_RANGE);
-  const distTree = new AdaptiveHuffman(DIST_RANGE);
-  const out: number[] = [];
+  const usingRunLength = mtxVersion === 1 ? 0 : br.readBit();
+  if (usingRunLength) {
+    // RUNLENGTHCOMP wrapper — rare; SaveBytes layer not yet ported.
+    throw new EotDecodeError(
+      "MTX block uses RUNLENGTHCOMP wrapper (not yet ported)",
+      "mtx-not-implemented"
+    );
+  }
 
-  // We don't have an explicit symbol count / end marker from the container,
-  // so decode until the bit stream is exhausted. (The CTF layer knows the
-  // expected decompressed size; cross-checking it is part of the next
-  // milestone.) Guard with a generous cap to avoid runaway loops.
-  const CAP = 8 * 1024 * 1024;
-  while (!br.exhausted && out.length < CAP) {
-    const sym = main.decode(br);
-    if (sym < 256) {
-      out.push(sym);
-    } else if (sym === DUP2) {
-      out.push(out[out.length - 2]);
-    } else if (sym === DUP4) {
-      out.push(out[out.length - 4]);
-    } else if (sym === DUP6) {
-      out.push(out[out.length - 6]);
+  // dist + len trees (range 8) are created before out_len is read; they
+  // consume no bits at construction.
+  const distTree = new AHuff(1 << DIST_WIDTH);
+  const lenTree = new AHuff(1 << LEN_WIDTH);
+
+  const outLen = br.readValue(24);
+  if (outLen === 0) return new Uint8Array(0);
+  const { numSyms, dup2, dup4, dup6 } = setDistRange(outLen);
+  const symTree = new AHuff(numSyms);
+
+  const buf = new Uint8Array(PRELOAD_SIZE + outLen);
+  fillPreload(buf);
+  const base = PRELOAD_SIZE;
+  let pos = 0;
+
+  while (pos < outLen) {
+    const symbol = symTree.readSymbol(br);
+    if (symbol < 256) {
+      buf[base + pos++] = symbol;
+    } else if (symbol === dup2) {
+      buf[base + pos] = buf[base + pos - 2];
+      pos++;
+    } else if (symbol === dup4) {
+      buf[base + pos] = buf[base + pos - 4];
+      pos++;
+    } else if (symbol === dup6) {
+      buf[base + pos] = buf[base + pos - 6];
+      pos++;
     } else {
-      const numDistSymbols = ((sym - 256) / 8 | 0) + 1;
-      const lengthBits3 = (sym - 256) % 8;
-      let length = lengthBits3 & 0x3;
-      if (!(lengthBits3 & 0x4)) {
-        let lenSym: number;
-        do {
-          lenSym = lenTree.decode(br);
-          length = (length << 2) | (lenSym & 0x3);
-        } while (!(lenSym & 0x4));
+      const { length: len0, numDistRanges } = decodeLength(symbol, br, lenTree);
+      const distance = decodeDistance(numDistRanges, br, distTree);
+      const length = distance >= MAX_2BYTE_DIST ? len0 + 1 : len0;
+      // distance is measured to the END of the copied run.
+      const start = pos - distance - length + 1;
+      if (base + start < 0) {
+        throw new EotDecodeError("LZCOMP copy before preload start", "mtx-failed");
       }
-      length += 2;
-      let dist = 0;
-      for (let i = 0; i < numDistSymbols; i++) {
-        dist = (dist << 3) | (distTree.decode(br) & 0x7);
-      }
-      const offset = dist + 1;
-      if (offset >= 512) length += 1;
-      const start = out.length - offset;
-      if (start < 0) {
-        throw new EotDecodeError("LZCOMP copy offset before start", "mtx-failed");
-      }
-      for (let i = 0; i < length; i++) {
-        out.push(out[start + i]);
+      for (let j = 0; j < length; j++) {
+        buf[base + pos] = buf[base + start + j];
+        pos++;
       }
     }
   }
-  return Uint8Array.from(out);
+  return buf.subarray(base, base + outLen);
 }

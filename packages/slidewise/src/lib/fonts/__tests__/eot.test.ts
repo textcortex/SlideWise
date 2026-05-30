@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parsePptx } from "@/lib/pptx/pptxToDeck";
-import { decodeEot, isMtxCompressed, EotDecodeError } from "../eot";
+import { decodeEot, isMtxCompressed } from "../eot";
 
 const EON_PPTX = resolve(
   __dirname,
@@ -50,25 +50,16 @@ describe("EOT decoder", () => {
     expect(mtxCount).toBeGreaterThan(0);
   });
 
-  it("throws EotDecodeError with kind=mtx-not-implemented on EON fonts", async () => {
+  it("decodes the CFF EON fonts via the MTX LZCOMP decoder", async () => {
+    // Milestone 2: the clean-room MTX decoder now decodes CFF/OTTO embedded
+    // fonts. The 4 EON Brix Sans weights decode to valid OTTO; the TrueType
+    // EON Office Head still falls back (mtx-not-implemented). See
+    // mtx-decode.test.ts for the per-font assertions.
     const buf = readFileSync(EON_PPTX);
     const deck = await parsePptx(new Uint8Array(buf));
-    const mtxAsset = (deck.fonts ?? []).find((a) =>
-      isMtxCompressed(dataUrlToBytes(a.data))
-    );
-    expect(mtxAsset).toBeTruthy();
-    if (!mtxAsset) return;
-    const bytes = dataUrlToBytes(mtxAsset.data);
-    try {
-      decodeEot(bytes);
-      // If we reach here, the decoder mistakenly thinks it succeeded;
-      // that would be a bug — fail the test loudly.
-      expect.unreachable("MTX decode should not yet succeed for EON fonts");
-    } catch (err) {
-      // The expected path: caller sees a kind="mtx-not-implemented"
-      // signal and falls back to fontRegistry / system fonts.
-      expect(err).toBeInstanceOf(EotDecodeError);
-      expect((err as EotDecodeError).kind).toBe("mtx-not-implemented");
-    }
+    const cff = (deck.fonts ?? []).find((a) => a.family === "EON Brix Sans")!;
+    expect(cff).toBeTruthy();
+    const { ttf } = decodeEot(dataUrlToBytes(cff.data));
+    expect(String.fromCharCode(ttf[0], ttf[1], ttf[2], ttf[3])).toBe("OTTO");
   });
 });

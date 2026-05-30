@@ -116,19 +116,57 @@ export function parseMtxContainer(payload: Uint8Array): MtxContainer {
  */
 export function decompressMtx(payload: Uint8Array): Uint8Array {
   const c = parseMtxContainer(payload);
-  // Container parse is verified-correct. LZCOMP + CTF reconstruction are the
-  // remaining milestones: the adaptive-Huffman tree isn't yet bit-exact with
-  // the encoder, so block decompression currently diverges. Attempt it (so the
-  // layer stays exercised) but treat ANY failure as "not implemented yet" —
-  // it's incomplete work, not a corrupt font — so the caller falls back to
-  // fontRegistry / system cleanly.
-  try {
-    lzcompDecompress(c.block1, c.copyLimit);
-  } catch {
-    // fall through to the not-implemented signal below
+
+  // Block 1 LZCOMP-decompresses to the CTF font tables. For CFF/OpenType
+  // fonts (sfnt magic "OTTO") there is no glyf/loca, so block 1 is already a
+  // complete, valid sfnt — return it directly. (Verified: every EON embedded
+  // font decodes to a complete "EON Brix Sans" / "EON Office Head" OTF.)
+  const block1 = lzcompDecompress(c.block1, c.version);
+  if (block1.length < 12) {
+    throw new EotDecodeError("MTX block1 too small to be sfnt", "mtx-failed");
   }
+  const tables = readSfntTableTags(block1);
+
+  if (!tables.has("glyf")) {
+    // CFF / OpenType-PostScript: block 1 is the whole font.
+    assertSfntTiles(block1);
+    return block1;
+  }
+
+  // TrueType (glyf) outlines: MTX strips loca and re-encodes glyf via the
+  // CTF triplet format + push (block 2) + instructions (block 3). Rebuilding
+  // those is the remaining milestone; until then, fall back cleanly.
   throw new EotDecodeError(
-    "MTX v3 container parsed + validated; LZCOMP/CTF glyf reconstruction is the next milestone",
+    "MTX TrueType-glyf (CTF) reconstruction not yet implemented; CFF fonts decode fully",
     "mtx-not-implemented"
   );
+}
+
+/** Read the set of 4-char table tags from an sfnt table directory. */
+function readSfntTableTags(sfnt: Uint8Array): Set<string> {
+  const dv = new DataView(sfnt.buffer, sfnt.byteOffset, sfnt.byteLength);
+  const numTables = dv.getUint16(4);
+  const tags = new Set<string>();
+  for (let i = 0; i < numTables; i++) {
+    const o = 12 + i * 16;
+    if (o + 4 > sfnt.length) break;
+    tags.add(
+      String.fromCharCode(sfnt[o], sfnt[o + 1], sfnt[o + 2], sfnt[o + 3])
+    );
+  }
+  return tags;
+}
+
+/** Sanity-check that the sfnt's table records lie within the buffer. */
+function assertSfntTiles(sfnt: Uint8Array): void {
+  const dv = new DataView(sfnt.buffer, sfnt.byteOffset, sfnt.byteLength);
+  const numTables = dv.getUint16(4);
+  for (let i = 0; i < numTables; i++) {
+    const o = 12 + i * 16;
+    const off = dv.getUint32(o + 8);
+    const len = dv.getUint32(o + 12);
+    if (off + len > sfnt.length) {
+      throw new EotDecodeError("MTX block1 table record out of bounds", "mtx-failed");
+    }
+  }
 }
