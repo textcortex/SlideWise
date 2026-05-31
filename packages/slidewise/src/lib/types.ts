@@ -205,6 +205,21 @@ export interface ShapeElement extends BaseElement {
    * `shape` field remains as a sensible fallback for older renderers.
    */
   path?: ShapePath;
+  /**
+   * Verbatim `<p:sp>` OOXML captured at import for a self-contained custGeom
+   * (vector) shape, carried *in the deck JSON* so a serialize running in a
+   * different process from the import (parse client-side → store JSON →
+   * serialize server-side) can replay the exact source geometry rather than
+   * re-synthesising from `path.d`. Synthesis can't express OOXML even-odd /
+   * winding faithfully, so complex vectors blank when the process-global
+   * source registry isn't available. Only populated for shapes whose source
+   * XML has no external references (`r:embed` / `r:id` / `a:schemeClr`), so it
+   * stays valid without the source archive or theme. `snapshot` is the element
+   * snapshot at import; the serializer replays the XML only while the element
+   * is unedited (snapshot still matches), otherwise it falls back to synthesis.
+   * Host-opaque — do not author by hand.
+   */
+  pristineOoxml?: { xml: string; snapshot: string };
 }
 
 export interface ShapePath {
