@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parsePptx, serializeDeck } from "../index";
+import { resolveSchemeColorsInXml } from "../pptxToDeck";
 import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
 import type { Deck } from "@/lib/types";
 
@@ -283,6 +284,28 @@ describe("pptx round-trip", () => {
     // treats it as pristine until edited).
     expect(typeof shape.pristineOoxml?.snapshot).toBe("string");
     expect(shape.pristineOoxml?.snapshot.length).toBeGreaterThan(0);
+  });
+
+  it("resolves <a:schemeClr> to literal <a:srgbClr> so theme-coloured vectors self-contain", () => {
+    const theme = {
+      accent2: "#EA1B0A",
+      tx1: "#0E1330",
+    } as unknown as Parameters<typeof resolveSchemeColorsInXml>[1];
+    // Self-closing, with-children, and closing-tag forms; an unresolvable
+    // token (phClr) must be left intact so the caller can bail.
+    const xml =
+      `<a:solidFill><a:schemeClr val="accent2"/></a:solidFill>` +
+      `<a:ln><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="50000"/></a:schemeClr></a:solidFill></a:ln>` +
+      `<a:fill><a:schemeClr val="phClr"/></a:fill>`;
+    const out = resolveSchemeColorsInXml(xml, theme);
+    expect(out).toContain('<a:srgbClr val="EA1B0A"/>');
+    // Child transforms survive the swap.
+    expect(out).toContain('<a:srgbClr val="0E1330"><a:lumMod val="50000"/></a:srgbClr>');
+    // phClr (not in theme) is untouched.
+    expect(out).toContain('<a:schemeClr val="phClr"/>');
+    // accent2 / tx1 scheme refs are gone.
+    expect(out).not.toContain('schemeClr val="accent2"');
+    expect(out).not.toContain('schemeClr val="tx1"');
   });
 
   it("preserves slide background colour", async () => {
