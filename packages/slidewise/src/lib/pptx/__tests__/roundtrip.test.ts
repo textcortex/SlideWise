@@ -247,6 +247,44 @@ describe("pptx round-trip", () => {
     ).toBe(true);
   });
 
+  it("stamps verbatim pristineOoxml on imported self-contained custGeom shapes", async () => {
+    // Round a custGeom shape (solid fill, no scheme/rId refs) through a real
+    // serialize→parse. The importer should carry its verbatim <p:sp> in the
+    // deck JSON so a later cross-process serialize can replay it.
+    const deck = makeDeck([
+      {
+        ...baseElement,
+        id: "logo",
+        type: "shape",
+        x: 100,
+        y: 100,
+        w: 400,
+        h: 300,
+        shape: "rect",
+        fill: "#EA1B0A",
+        path: {
+          d: "M 0 0 L 100 0 L 100 100 L 0 100 Z",
+          viewW: 100,
+          viewH: 100,
+          fillRule: "evenodd",
+        },
+      },
+    ]);
+
+    const out = await roundtrip(deck);
+    const shape = out.slides[0].elements.find(
+      (e) => e.type === "shape" && e.path
+    );
+    expect(shape && shape.type === "shape").toBe(true);
+    if (!shape || shape.type !== "shape") return;
+    expect(shape.pristineOoxml).toBeTruthy();
+    expect(shape.pristineOoxml?.xml).toContain("<a:custGeom>");
+    // The stored snapshot matches the element as imported (so the serializer
+    // treats it as pristine until edited).
+    expect(typeof shape.pristineOoxml?.snapshot).toBe("string");
+    expect(shape.pristineOoxml?.snapshot.length).toBeGreaterThan(0);
+  });
+
   it("preserves slide background colour", async () => {
     const deck: Deck = {
       version: CURRENT_DECK_VERSION,
