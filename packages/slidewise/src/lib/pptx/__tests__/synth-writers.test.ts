@@ -1,8 +1,9 @@
 import { describe, it, expect } from "vitest";
 import JSZip from "jszip";
 import { serializeDeck } from "../index";
+import { snapshotElement } from "../pptxToDeck";
 import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
-import type { Deck } from "@/lib/types";
+import type { Deck, ShapeElement } from "@/lib/types";
 
 /**
  * Tests for the synth-OOXML writers added in the full-fidelity export work:
@@ -100,6 +101,75 @@ describe("synth writers (PRs 1, 2, 3, 4, 5, 6, 7)", () => {
     expect(slide).toContain("<a:custGeom>");
     expect(slide).toContain("<a:cubicBezTo>");
     expect(slide).not.toMatch(/<a:prstGeom prst="rect"/);
+  });
+
+  it("replays verbatim custGeom OOXML from the deck JSON when present (cross-process)", async () => {
+    const shape: ShapeElement = {
+      ...base,
+      id: "bikeXYZ",
+      type: "shape",
+      shape: "rect",
+      x: 100,
+      y: 100,
+      w: 400,
+      h: 300,
+      fill: "#EA1B0A",
+      path: {
+        d: "M 0 0 L 100 0 L 100 100 Z",
+        viewW: 100,
+        viewH: 100,
+        fillRule: "evenodd",
+      },
+    };
+    // Self-contained verbatim <p:sp> with a colliding low cNvPr id + a marker.
+    const verbatim =
+      `<p:sp><p:nvSpPr><p:cNvPr id="7" name="bike"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+      `<p:spPr><a:xfrm><a:off x="635000" y="635000"/><a:ext cx="2540000" cy="1905000"/></a:xfrm>` +
+      `<a:custGeom data-marker="VERBATIM_BIKE"><a:pathLst><a:path w="100" h="100">` +
+      `<a:moveTo><a:pt x="0" y="0"/></a:moveTo><a:lnTo><a:pt x="100" y="0"/></a:lnTo><a:close/>` +
+      `</a:path></a:pathLst></a:custGeom>` +
+      `<a:solidFill><a:srgbClr val="EA1B0A"/></a:solidFill></p:spPr>` +
+      `<p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>`;
+    shape.pristineOoxml = { xml: verbatim, snapshot: snapshotElement(shape) };
+
+    const zip = await generate(
+      makeDeck([{ id: "s", background: "#FFFFFF", elements: [shape] }])
+    );
+    const slide = await zip.file("ppt/slides/slide1.xml")?.async("string");
+    // The exact source geometry was replayed (marker + source fill present)…
+    expect(slide).toContain('data-marker="VERBATIM_BIKE"');
+    expect(slide).toContain('<a:srgbClr val="EA1B0A"/>');
+    // …and the colliding cNvPr id="7" was rewritten to a fresh high id.
+    expect(slide).not.toMatch(/<p:cNvPr\b[^>]*\bid="7"/);
+  });
+
+  it("falls back to synthesis when a pristine-OOXML shape was edited", async () => {
+    const shape: ShapeElement = {
+      ...base,
+      id: "bikeEdited",
+      type: "shape",
+      shape: "rect",
+      x: 100,
+      y: 100,
+      w: 400,
+      h: 300,
+      fill: "#EA1B0A",
+      path: { d: "M 0 0 L 100 0 L 100 100 Z", viewW: 100, viewH: 100 },
+    };
+    const verbatim =
+      `<p:sp><p:nvSpPr><p:cNvPr id="7" name="bike"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+      `<p:spPr><a:custGeom data-marker="VERBATIM_BIKE"/></p:spPr></p:sp>`;
+    shape.pristineOoxml = { xml: verbatim, snapshot: snapshotElement(shape) };
+    // Edit the shape AFTER the snapshot was taken → snapshot diverges.
+    shape.x = 999;
+
+    const zip = await generate(
+      makeDeck([{ id: "s", background: "#FFFFFF", elements: [shape] }])
+    );
+    const slide = await zip.file("ppt/slides/slide1.xml")?.async("string");
+    // Verbatim replay is rejected; the synth path emits the custGeom from path.d.
+    expect(slide).not.toContain("VERBATIM_BIKE");
+    expect(slide).toContain("<a:custGeom>");
   });
 
   it("PR 2: emits <a:gradFill> for shapes with linear-gradient fill", async () => {

@@ -480,6 +480,25 @@ function registerElementSource(
     snapshot: snapshotElement(element),
     slidePath,
   });
+  stampPristineOoxml(element, rawXml);
+}
+
+/**
+ * For a self-contained custGeom (vector) shape, copy its verbatim `<p:sp>`
+ * source XML onto the element so it survives JSON serialization (the
+ * `elementSourceRegistry` above is module-global and lost across processes).
+ * A serialize in a fresh process can then replay the exact source geometry
+ * instead of re-synthesising from `path.d` — synthesis can't represent OOXML
+ * even-odd winding, which is what blanks complex vectors like the eon bicycle.
+ *
+ * Restricted to shapes whose XML carries no external references
+ * (`r:embed` / `r:id` / `r:link` images, `a:schemeClr` theme colours) so the
+ * fragment stays valid without the source archive or its theme.
+ */
+function stampPristineOoxml(element: SlideElement, rawXml: string): void {
+  if (element.type !== "shape" || !element.path) return;
+  if (/\br:(embed|id|link)=|<a:schemeClr\b/.test(rawXml)) return;
+  element.pristineOoxml = { xml: rawXml, snapshot: snapshotElement(element) };
 }
 
 function hasExplicitXfrm(xml: string): boolean {

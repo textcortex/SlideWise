@@ -32,6 +32,7 @@ import {
   synthesiseEmbeddedFonts,
   effectLstXml,
   parseFill,
+  freshNvId,
   RID_MARKER_RE,
   slidewiseShapeName,
   type MediaPayload,
@@ -167,6 +168,16 @@ function shouldSynthesise(el: SlideElement): boolean {
 
 function synthesiseInto(synth: SynthSlideEntry, el: SlideElement): void {
   if (el.type === "shape") {
+    // Cross-process replay: an unedited custGeom shape carries its verbatim
+    // source `<p:sp>` in the deck JSON (see `stampPristineOoxml`). Replaying
+    // it preserves the exact source winding/geometry that synthesis can't —
+    // this is what un-blanks complex vectors when the import-time source
+    // registry isn't available (parse + serialize in different processes).
+    const verbatim = pristineShapeXml(el);
+    if (verbatim) {
+      synth.shapeXml.push(verbatim);
+      return;
+    }
     const out = synthesiseShape(el);
     synth.shapeXml.push(out.xml);
     for (const m of out.media) synth.media.push(m);
@@ -185,6 +196,26 @@ function synthesiseInto(synth: SynthSlideEntry, el: SlideElement): void {
     synth.charts.push(out);
     return;
   }
+}
+
+/**
+ * Verbatim `<p:sp>` for a custGeom shape that carries deck-JSON-persisted
+ * source OOXML and hasn't been edited. Returns null when there's no pristine
+ * XML or the element diverged from its import snapshot (then the caller
+ * synthesises from `path.d`). The source `cNvPr/@id` is rewritten to a fresh
+ * high id so it can't collide with whatever pptxgenjs allocated in the spTree.
+ *
+ * NB: same-process serialize never reaches here for these shapes — they're
+ * caught earlier by `isPristineImportedElement` (registry hit) and replayed
+ * through the source archive. This path is the cross-process fallback.
+ */
+function pristineShapeXml(el: SlideElement): string | null {
+  if (el.type !== "shape" || !el.pristineOoxml) return null;
+  if (snapshotElement(el) !== el.pristineOoxml.snapshot) return null;
+  return el.pristineOoxml.xml.replace(
+    /(<p:cNvPr\b[^>]*\bid=")\d+(")/,
+    `$1${freshNvId()}$2`
+  );
 }
 
 /**
