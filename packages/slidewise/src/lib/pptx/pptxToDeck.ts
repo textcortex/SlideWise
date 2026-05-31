@@ -465,7 +465,8 @@ function snapshotFields(element: SlideElement): unknown {
 function registerElementSource(
   element: SlideElement,
   rawXml: string | undefined,
-  slidePath: string
+  slidePath: string,
+  theme?: ThemeColors
 ): void {
   if (!rawXml) return;
   // Skip elements whose source XML relies on placeholder geometry
@@ -480,7 +481,7 @@ function registerElementSource(
     snapshot: snapshotElement(element),
     slidePath,
   });
-  stampPristineOoxml(element, rawXml);
+  stampPristineOoxml(element, rawXml, theme);
 }
 
 /**
@@ -491,14 +492,48 @@ function registerElementSource(
  * instead of re-synthesising from `path.d` — synthesis can't represent OOXML
  * even-odd winding, which is what blanks complex vectors like the eon bicycle.
  *
- * Restricted to shapes whose XML carries no external references
- * (`r:embed` / `r:id` / `r:link` images, `a:schemeClr` theme colours) so the
- * fragment stays valid without the source archive or its theme.
+ * Theme colours (`<a:schemeClr>`) are resolved to literal `<a:srgbClr>` against
+ * the slide's theme so brand-coloured vectors (the common case — e.g. E.ON red
+ * is a theme accent) become self-contained and still qualify; the swap is
+ * lossless because both elements accept the same child transforms. Shapes that
+ * reference media (`r:embed` / `r:id` / `r:link`) or carry an unresolvable
+ * colour are left to the synth path (they'd be invalid without the archive).
  */
-function stampPristineOoxml(element: SlideElement, rawXml: string): void {
+function stampPristineOoxml(
+  element: SlideElement,
+  rawXml: string,
+  theme?: ThemeColors
+): void {
   if (element.type !== "shape" || !element.path) return;
-  if (/\br:(embed|id|link)=|<a:schemeClr\b/.test(rawXml)) return;
-  element.pristineOoxml = { xml: rawXml, snapshot: snapshotElement(element) };
+  if (/\br:(embed|id|link)=/.test(rawXml)) return;
+  const xml = theme ? resolveSchemeColorsInXml(rawXml, theme) : rawXml;
+  // Any unresolved scheme colour left over → not self-contained → synth.
+  if (/<a:schemeClr\b/.test(xml)) return;
+  element.pristineOoxml = { xml, snapshot: snapshotElement(element) };
+}
+
+/**
+ * Rewrite `<a:schemeClr val="accent2">` → `<a:srgbClr val="EA1B0A">` (and the
+ * self-closing / closing-tag forms) using the baked theme. `schemeClr` and
+ * `srgbClr` accept identical child transforms (`lumMod`, `alpha`, …), so the
+ * swap preserves tints/shades exactly — only the colour source changes from a
+ * theme reference to a literal. Tokens not present in the theme (e.g. `phClr`)
+ * are left untouched so the caller can detect "still has schemeClr" and bail.
+ */
+export function resolveSchemeColorsInXml(xml: string, theme: ThemeColors): string {
+  return xml.replace(
+    /<a:schemeClr\b([^>]*?)\bval="([^"]+)"([^>]*?)(\/?)>/g,
+    (whole, pre: string, token: string, post: string, selfClose: string) => {
+      const hex = (theme as unknown as Record<string, string>)[token];
+      // Only swap when the theme gives a literal #RRGGBB — anything else
+      // (missing token, "transparent", …) is left so the caller bails out.
+      if (!hex || !/^#[0-9a-fA-F]{6}$/.test(hex)) return whole;
+      const val = hex.slice(1).toUpperCase();
+      // `pre` already carries the whitespace that separated the tag from
+      // `val=`, so don't add another space (would double it).
+      return `<a:srgbClr${pre}val="${val}"${post}${selfClose}>`;
+    }
+  ).replace(/<\/a:schemeClr>/g, "</a:srgbClr>");
 }
 
 function hasExplicitXfrm(xml: string): boolean {
@@ -746,7 +781,7 @@ async function walkUnderlay(
   const registerFromNode = (node: any, el: SlideElement | null) => {
     if (!el) return;
     const rawSrc = (node as any)?._elementRawSrc as string | undefined;
-    registerElementSource(el, rawSrc, ctx.slidePath);
+    registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
     out.push(el);
   };
   for (const sp of asArray(spTree["p:sp"])) {
@@ -923,25 +958,25 @@ async function parseSpTree(
     if (tag === "p:sp") {
       const el = await parseSpOrText(node, ctx, outer);
       if (el) {
-        registerElementSource(el, rawSrc, ctx.slidePath);
+        registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
         out.push(el);
       }
     } else if (tag === "p:pic") {
       const el = await parsePic(node, ctx, outer);
       if (el) {
-        registerElementSource(el, rawSrc, ctx.slidePath);
+        registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
         out.push(el);
       }
     } else if (tag === "p:cxnSp") {
       const el = parseCxn(node, ctx, outer);
       if (el) {
-        registerElementSource(el, rawSrc, ctx.slidePath);
+        registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
         out.push(el);
       }
     } else if (tag === "p:graphicFrame") {
       const el = await parseGraphicFrame(node, ctx, outer);
       if (el) {
-        registerElementSource(el, rawSrc, ctx.slidePath);
+        registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
         out.push(el);
       }
     } else if (tag === "p:grpSp") {
@@ -954,7 +989,7 @@ async function parseSpTree(
       // and image exactly, plus the group transform itself. Once any
       // descendant is edited the snapshot diverges (see snapshotElement)
       // and the synth path re-emits the group instead.
-      registerElementSource(group, rawSrc, ctx.slidePath);
+      registerElementSource(group, rawSrc, ctx.slidePath, ctx.theme);
       out.push(group);
     }
   }
