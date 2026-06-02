@@ -681,9 +681,23 @@ function linearGradientVector(deg: number): {
   };
 }
 
+/**
+ * A shape's `fill` may be a picture/SVG fill the importer captured from a
+ * PPTX `<a:blipFill>` (modern Office icons), stored as `url("data:…")` /
+ * `url(https://…)`. Pull the bare URL out so it can be painted as an
+ * `<image>` (vector shapes) or `background-image` (rect/circle). Gradients
+ * and solid colours return undefined — they paint via the normal path.
+ */
+function imageFillUrlOf(fill: string | undefined): string | undefined {
+  if (!fill) return undefined;
+  const m = /^\s*url\((['"]?)(.*?)\1\)\s*$/.exec(fill);
+  return m ? m[2] : undefined;
+}
+
 function ShapeView({ el }: { el: ShapeElement }) {
   const stroke = el.stroke ?? "transparent";
   const sw = el.strokeWidth ?? 0;
+  const imageFill = imageFillUrlOf(el.fill);
   // Accept either `strokeDash` (raw OOXML, set by the importer) or
   // `dashType` (typed enum, set by AI-authored / host-supplied decks).
   // Raw wins when both are set — it preserves PPTX intent exactly.
@@ -691,11 +705,52 @@ function ShapeView({ el }: { el: ShapeElement }) {
   const effect = effectStyle(el.shadow, el.glow, "filter");
   // SVG `fill=` can't take a CSS gradient string, so vector shapes need a
   // paint server. Build it once and reuse for path + polygon renderers.
-  const gradId = `sw-grad-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const gradId = `sw-grad-${uid}`;
   const { paint, def } = svgGradientPaint(el.fill, gradId);
   // Custom vector path (PPTX <a:custGeom>) takes precedence over the preset
   // kind — the path coordinates already encode the actual silhouette.
   if (el.path) {
+    // Picture/SVG fill: paint the image clipped to the silhouette rather
+    // than handing the renderer an `url(...)` it can't use as an SVG paint.
+    if (imageFill) {
+      const clipId = `sw-clip-${uid}`;
+      return (
+        <svg
+          viewBox={`0 0 ${el.path.viewW} ${el.path.viewH}`}
+          preserveAspectRatio="none"
+          width="100%"
+          height="100%"
+          style={effect}
+        >
+          <defs>
+            <clipPath id={clipId}>
+              <path d={el.path.d} fillRule={el.path.fillRule ?? "nonzero"} />
+            </clipPath>
+          </defs>
+          <image
+            href={imageFill}
+            x={0}
+            y={0}
+            width={el.path.viewW}
+            height={el.path.viewH}
+            preserveAspectRatio="none"
+            clipPath={`url(#${clipId})`}
+          />
+          {sw ? (
+            <path
+              d={el.path.d}
+              fill="none"
+              fillRule={el.path.fillRule ?? "nonzero"}
+              stroke={stroke}
+              strokeWidth={sw}
+              strokeDasharray={dash.dasharray}
+              vectorEffect="non-scaling-stroke"
+            />
+          ) : null}
+        </svg>
+      );
+    }
     return (
       <svg
         viewBox={`0 0 ${el.path.viewW} ${el.path.viewH}`}
@@ -717,13 +772,25 @@ function ShapeView({ el }: { el: ShapeElement }) {
       </svg>
     );
   }
+  // PPTX `<a:stretch><a:fillRect/>` fills the box edge-to-edge; mirror that
+  // with a non-repeating, box-sized background image. Use the
+  // `background-image` longhand (not the `background` shorthand, which would
+  // reset background-size back to its initial value).
+  const fillStyle: React.CSSProperties = imageFill
+    ? {
+        backgroundImage: el.fill,
+        backgroundSize: "100% 100%",
+        backgroundRepeat: "no-repeat",
+        backgroundPosition: "center",
+      }
+    : { background: el.fill };
   if (el.shape === "rect" || el.shape === "rounded") {
     return (
       <div
         style={{
           width: "100%",
           height: "100%",
-          background: el.fill,
+          ...fillStyle,
           borderRadius: el.shape === "rounded" ? (el.radius ?? 16) : 0,
           border: sw ? `${sw}px ${dash.borderStyle} ${stroke}` : undefined,
           ...effectStyle(el.shadow, el.glow, "box"),
@@ -737,7 +804,7 @@ function ShapeView({ el }: { el: ShapeElement }) {
         style={{
           width: "100%",
           height: "100%",
-          background: el.fill,
+          ...fillStyle,
           borderRadius: "50%",
           border: sw ? `${sw}px ${dash.borderStyle} ${stroke}` : undefined,
           ...effectStyle(el.shadow, el.glow, "box"),
