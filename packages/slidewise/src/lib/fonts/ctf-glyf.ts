@@ -269,9 +269,15 @@ function reconstructComposite(r: Reader, ctf: Uint8Array, glyfRec: TableRec): Ui
   const bbox: [number, number, number, number] = [r.i16(), r.i16(), r.i16(), r.i16()];
   const start = r.pos;
   let weHaveInstr = false;
-  // walk components to find their byte span
+  // Walk components to find their byte span. Record each component's flags
+  // position (relative to the component block start) so we can clear the
+  // WE_HAVE_INSTRUCTIONS bit wherever it appears — the spec lets any
+  // component carry it (it's conventionally on the LAST one), and a stray
+  // bit makes parsers read a non-existent instructionLength past the glyph.
+  const flagOffsets: number[] = [];
   let more = true;
   while (more) {
+    flagOffsets.push(r.pos - start);
     const flags = r.u16();
     r.u16(); // glyphIndex
     if (flags & ARG_1_AND_2_ARE_WORDS) { r.u16(); r.u16(); } else { r.u8(); r.u8(); }
@@ -299,12 +305,16 @@ function reconstructComposite(r: Reader, ctf: Uint8Array, glyfRec: TableRec): Ui
   dv.setInt16(6, bbox[2]);
   dv.setInt16(8, bbox[3]);
   out.set(componentBytes, 10);
-  // Clear WE_HAVE_INSTRUCTIONS on the first component's flags (we dropped them).
-  if (componentBytes.length >= 2) {
-    const f = (out[10] << 8) | out[11];
+  // Clear WE_HAVE_INSTRUCTIONS on EVERY component's flags — we dropped the
+  // hint stream and emit no instructionLength, so any surviving bit (most
+  // often on the last component) would push a parser past the glyph's end.
+  for (const fo of flagOffsets) {
+    const o = 10 + fo;
+    if (o + 1 >= out.length) break;
+    const f = (out[o] << 8) | out[o + 1];
     const cleared = f & ~WE_HAVE_INSTRUCTIONS;
-    out[10] = (cleared >> 8) & 0xff;
-    out[11] = cleared & 0xff;
+    out[o] = (cleared >> 8) & 0xff;
+    out[o + 1] = cleared & 0xff;
   }
   return out;
 }
@@ -370,6 +380,8 @@ function assembleSfnt(
       const hv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       hv.setUint32(8, 0); // checkSumAdjustment
       hv.setInt16(50, 1); // indexToLocFormat
+    } else if (t.tag === "cmap") {
+      data = sanitizeCmapLanguages(data);
     }
     outTables.push({ tag: t.tag, data });
   }
@@ -417,6 +429,37 @@ function assembleSfnt(
   }
   void headRec;
   return out;
+}
+
+/**
+ * Zero the `language` field of every non-Macintosh cmap subtable. The strict
+ * browser sanitizer (OTS) rejects the whole font when a format 4/6/12 subtable
+ * on a Unicode/Windows platform carries a non-zero language (we've seen
+ * PowerPoint-embedded faces ship `language = 1007` in their format-12 group),
+ * while fontTools silently tolerates it. `language` is only meaningful for the
+ * Macintosh platform (platformID 1), so clearing it elsewhere is lossless.
+ */
+function sanitizeCmapLanguages(src: Uint8Array): Uint8Array {
+  const data = src.slice();
+  if (data.length < 4) return data;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const numTables = dv.getUint16(2);
+  for (let i = 0; i < numTables; i++) {
+    const rec = 4 + i * 8;
+    if (rec + 8 > data.length) break;
+    const platformID = dv.getUint16(rec);
+    if (platformID === 1) continue; // Macintosh: language is meaningful
+    const subOff = dv.getUint32(rec + 4);
+    if (subOff + 2 > data.length) continue;
+    const format = dv.getUint16(subOff);
+    if (format === 0 || format === 2 || format === 4 || format === 6) {
+      if (subOff + 6 <= data.length) dv.setUint16(subOff + 4, 0); // 16-bit language
+    } else if (format === 8 || format === 10 || format === 12 || format === 13) {
+      if (subOff + 12 <= data.length) dv.setUint32(subOff + 8, 0); // 32-bit language
+    }
+    // format 14 (variation selectors) has no language field.
+  }
+  return data;
 }
 
 function tableChecksum(data: Uint8Array): number {
