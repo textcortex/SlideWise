@@ -790,9 +790,13 @@ async function walkUnderlay(
     if (ph) {
       const isPicPrompt = ph["@_type"] === "pic";
       const isOverridden = slidePhKeys.has(placeholderKey(ph));
-      // Picture placeholders are "Insert Picture" prompts; when the slide
-      // supplies an actual image, the prompt panel must hide.
-      if (isPicPrompt && isOverridden) continue;
+      // Picture placeholders are "Insert Picture" prompts — an edit-time
+      // affordance, not slide content. PowerPoint never renders their grey
+      // prompt panel: when the slide fills the placeholder the in-slide
+      // <p:pic> renders instead, and when it's left empty nothing renders.
+      // Either way, suppress the layout/master prompt backing — otherwise an
+      // unfilled picture placeholder leaks onto the slide as a grey box.
+      if (isPicPrompt) continue;
       // When the slide hosts this placeholder, its fill rides on the
       // slide's text element (TextElement.background) so it stays at the
       // text's z-index. pptxgenjs can't write those fields back though —
@@ -1217,10 +1221,27 @@ async function parseSpOrText(
     return el;
   }
 
-  // Fill / stroke. Use placeholder-inherited spPr if slide spPr is empty.
+  // Fill / stroke. An empty placeholder shape — e.g. a picture placeholder
+  // the slide hosts but hasn't filled with an image — carries no spPr of its
+  // own and inherits geometry + fill from the layout/master placeholder.
+  // That's where the template's grey rounded "Insert Picture" prompt lives;
+  // without inheriting it the placeholder renders as a sharp, transparent
+  // rect instead of the rounded grey box the template shows.
   const spPr = sp?.["p:spPr"];
+  const phSpPr = layoutPh?.spPr ?? masterPh?.spPr;
+  // Inherit the placeholder's (often rounded) custGeom silhouette when the
+  // slide shape declares no geometry of its own.
+  if (!customPath && phSpPr?.["a:custGeom"]) {
+    customPath = parseCustGeomPath(phSpPr["a:custGeom"]);
+  }
+  // A picture/SVG fill (modern Office icons) wins over solid/gradient —
+  // it carries the actual art. Resolved to a url("data:…") the renderer
+  // paints into the shape (clipped to its custGeom path when present).
+  const blipFill = await extractShapeBlipFill(spPr, ctx);
   const fillColor =
-    extractShapeFill(spPr, ctx.theme)
+    blipFill
+    ?? extractShapeFill(spPr, ctx.theme)
+    ?? (phSpPr ? extractShapeFill(phSpPr, ctx.theme) : undefined)
     ?? resolveStyleFillRef(sp, ctx)
     ?? "transparent";
   const lineProps = spPr?.["a:ln"];
@@ -2838,6 +2859,24 @@ function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: n
     g: Math.round(hue(h) * 255),
     b: Math.round(hue(h - 1 / 3) * 255),
   };
+}
+
+/**
+ * Resolve a shape's `<a:blipFill>` (picture/SVG fill) to a CSS
+ * `url("data:…")` string. This is the modern Office "icon" pattern —
+ * a `<p:sp>` whose fill is an image rather than a solid/gradient (often a
+ * dual PNG+SVG blip). `blipDataUrl` prefers the sharper SVG embed when the
+ * dual-blip `<asvg:svgBlip>` extension is present. Returns undefined when
+ * the shape has no blip fill or the referenced media can't be resolved.
+ */
+async function extractShapeBlipFill(
+  spPr: any,
+  ctx: ParseContext
+): Promise<string | undefined> {
+  const blip = spPr?.["a:blipFill"]?.["a:blip"];
+  if (!blip) return undefined;
+  const url = await blipDataUrl(blip, ctx, ctx.slideRels, ctx.slidePath);
+  return url ? `url("${url}")` : undefined;
 }
 
 /**

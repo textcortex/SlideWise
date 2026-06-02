@@ -210,11 +210,11 @@ function escapeCss(s: string): string {
  *   1. `Deck.webFonts` — per-deck overrides, AI-authored decks ship these.
  *   2. `fontRegistry` — host-wide brand fonts the platform owns.
  *   3. **Decoded `Deck.fonts`** — embedded `.fntdata` payloads the importer
- *      pulled from `ppt/fonts/`. When the EOT is uncompressed (or uses an
- *      MTX sub-method we can decode), we synthesise a `data:font/ttf;…`
- *      URL on the fly. Brand-embedded fonts that use MTX glyph compression
- *      can't be decoded yet and are skipped — `fontRegistry` is the
- *      documented fallback for those cases.
+ *      pulled from `ppt/fonts/`. These are EOT, usually MicroType-Express
+ *      (MTX) compressed; `decodeEot` decompresses them and reconstructs the
+ *      `glyf` table into a browser-valid TTF, surfaced as a `data:font/ttf;…`
+ *      URL. A font that still can't be decoded (truncated / unsupported
+ *      variant) is skipped and `fontRegistry` is the documented fallback.
  *
  * The first source to claim a `(family, weight, italic)` tuple wins.
  */
@@ -267,10 +267,11 @@ export function resolveWebFonts(
 
 /**
  * Convert a `Deck.fonts` entry (raw `.fntdata` from `ppt/fonts/`) into a
- * `WebFontAsset` the editor can render. Returns `null` when the EOT is
- * MTX-compressed (we have a partial decoder; the brand-font glyph encoder
- * isn't done yet — see `./fonts/mtx.ts`) so callers can move on to the
- * registry / system-font fallback chain.
+ * `WebFontAsset` the editor can render. `decodeEot` handles uncompressed and
+ * MicroType-Express (MTX) compressed EOT, reconstructing the `glyf` table.
+ * Returns `null` only when the payload still can't be decoded (truncated /
+ * unsupported variant) so callers can fall back to the registry / system
+ * font chain.
  *
  * The returned asset uses a `data:font/ttf;base64,...` URL so the resulting
  * `@font-face` is fully self-contained — no CDN, no network request.
@@ -331,16 +332,70 @@ export function fontAssetToWebFont(asset: FontAsset): WebFontAsset | null {
 }
 
 /**
+ * Weight-name suffixes a font family can carry, longest/most-specific first
+ * so "Semi Bold" / "Extra Bold" win over a bare "Bold" match. Used to alias a
+ * weight-named embedded family (e.g. "Montserrat Bold") to its base family at
+ * the matching numeric weight, so text that asks for the base family in bold
+ * ("Montserrat" + b) renders with the REAL bold face the deck shipped instead
+ * of a synthetic (faux) bold of the regular face.
+ */
+const WEIGHT_SUFFIXES: Array<[RegExp, number]> = [
+  [/[\s-]?thin$/i, 100],
+  [/[\s-]?(?:extra|ultra)[\s-]?light$/i, 200],
+  [/[\s-]?light$/i, 300],
+  [/[\s-]?regular$/i, 400],
+  [/[\s-]?normal$/i, 400],
+  [/[\s-]?medium$/i, 500],
+  [/[\s-]?(?:semi|demi)[\s-]?bold$/i, 600],
+  [/[\s-]?(?:extra|ultra)[\s-]?bold$/i, 800],
+  [/[\s-]?(?:black|heavy)$/i, 900],
+  [/[\s-]?bold$/i, 700],
+];
+
+/**
+ * Split a trailing weight word off a family name. "Montserrat Semi-Bold" →
+ * { base: "Montserrat", weight: 600 }. Returns null when the family carries no
+ * recognised weight suffix (e.g. "DM Serif Display").
+ */
+export function splitFamilyWeight(
+  family: string
+): { base: string; weight: number } | null {
+  for (const [re, weight] of WEIGHT_SUFFIXES) {
+    if (re.test(family)) {
+      const base = family.replace(re, "").trim();
+      if (base.length) return { base, weight };
+    }
+  }
+  return null;
+}
+
+/**
  * Bulk-convert `Deck.fonts` → `WebFontAsset[]` filtering out the entries
  * we couldn't decode. Safe to call eagerly inside a `useMemo` because
  * decoding a 200KB font runs in single-digit ms.
+ *
+ * For each weight-named family we ALSO emit an alias under the base family at
+ * the matching numeric weight (Montserrat Bold → Montserrat / 700), so a run
+ * that asks for "Montserrat" in bold binds to the real bold face rather than
+ * synthesising one. The original family is kept too, so runs that name the
+ * weight-variant directly still resolve.
  */
 export function decodeDeckEmbeddedFonts(deck: Deck): WebFontAsset[] {
   if (!deck.fonts || !deck.fonts.length) return [];
   const out: WebFontAsset[] = [];
   for (const asset of deck.fonts) {
     const web = fontAssetToWebFont(asset);
-    if (web) out.push(web);
+    if (!web) continue;
+    out.push(web);
+    const split = splitFamilyWeight(web.family);
+    if (split) {
+      out.push({
+        family: split.base,
+        src: web.src,
+        weight: split.weight,
+        italic: web.italic,
+      });
+    }
   }
   return out;
 }
