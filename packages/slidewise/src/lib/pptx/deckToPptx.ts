@@ -67,6 +67,16 @@ import {
  */
 export interface SerializeOptions {
   source?: Blob | ArrayBuffer | Uint8Array;
+  /**
+   * Emit a PowerPoint template (`.potx`) instead of a presentation (`.pptx`).
+   * The two share an identical OOXML package; the only on-disk difference is
+   * the main part's content type in `[Content_Types].xml`
+   * (`…presentationml.template.main+xml` vs `…presentation.main+xml`) and the
+   * Blob's MIME type. When left `undefined`, template-ness is inferred from the
+   * source archive so a `.potx` parsed by `parsePptx` round-trips back to a
+   * `.potx`; pass `true`/`false` to force the output kind.
+   */
+  asTemplate?: boolean;
 }
 
 /**
@@ -114,7 +124,7 @@ export async function serializeDeck(
   const generated = (await pptx.write({
     outputType: "arraybuffer",
   })) as ArrayBuffer;
-  return preserveUnknowns(generated, deck, options.source);
+  return preserveUnknowns(generated, deck, options.source, options.asTemplate);
 }
 
 function addSlide(pptx: pptxgen, slide: Slide, slideIndex: number): void {
@@ -651,7 +661,8 @@ function addEmbed(s: pptxgen.Slide, el: EmbedElement): void {
 async function preserveUnknowns(
   generated: ArrayBuffer,
   deck: Deck,
-  explicitSource?: Blob | ArrayBuffer | Uint8Array
+  explicitSource?: Blob | ArrayBuffer | Uint8Array,
+  asTemplate?: boolean
 ): Promise<Blob> {
   // Prefer the caller-supplied source (survives state cloning / localStorage
   // rehydrate); fall back to the non-enumerable attachment from parsePptx
@@ -682,7 +693,7 @@ async function preserveUnknowns(
     await sanitiseSlideXml(outZip);
     await sanitiseRels(outZip);
     pruneEmptyDirectories(outZip);
-    return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+    return finalizeOutput(outZip, asTemplate === true);
   }
   if (!sourceBuffer && hasSynth) {
     // No source: still run the synth-only post-process. The chrome / EMF /
@@ -696,7 +707,7 @@ async function preserveUnknowns(
     await sanitiseSlideXml(outZip);
     await sanitiseRels(outZip);
     pruneEmptyDirectories(outZip);
-    return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+    return finalizeOutput(outZip, asTemplate === true);
   }
 
   const unknownsBySlide = collectUnknowns(deck);
@@ -784,7 +795,10 @@ async function preserveUnknowns(
   pruneEmptyDirectories(outZip);
 
   // JSZip's blob output preserves the OOXML mime type set by pptxgenjs.
-  return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+  // When the caller didn't force the output kind, inherit it from the source
+  // so a parsed `.potx` round-trips back to a `.potx`.
+  const emitAsTemplate = asTemplate ?? (await isTemplateArchive(srcZip));
+  return finalizeOutput(outZip, emitAsTemplate);
 }
 
 async function resolveSource(
@@ -1833,6 +1847,49 @@ function parseSldSz(xml: string): { cx: number; cy: number } | null {
 
 const PPTX_MIME =
   "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+const POTX_MIME =
+  "application/vnd.openxmlformats-officedocument.presentationml.template";
+
+// Main-part content types declared in `[Content_Types].xml`. A presentation
+// and a template share an otherwise-identical package; only this override
+// distinguishes them.
+const PRESENTATION_MAIN_CT =
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
+const TEMPLATE_MAIN_CT =
+  "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml";
+
+/** Does this OOXML package declare its main part as a template (`.potx`)? */
+async function isTemplateArchive(zip: JSZip): Promise<boolean> {
+  const file = zip.file("[Content_Types].xml");
+  if (!file) return false;
+  const xml = await file.async("string");
+  return xml.includes(TEMPLATE_MAIN_CT);
+}
+
+/**
+ * Generate the final Blob, flipping the main-part content type to the template
+ * variant first when emitting a `.potx`. pptxgenjs always writes the
+ * presentation content type, so the template path rewrites it in place.
+ */
+async function finalizeOutput(
+  outZip: JSZip,
+  asTemplate: boolean
+): Promise<Blob> {
+  if (!asTemplate) {
+    return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+  }
+  const file = outZip.file("[Content_Types].xml");
+  if (file) {
+    const xml = await file.async("string");
+    if (xml.includes(PRESENTATION_MAIN_CT)) {
+      outZip.file(
+        "[Content_Types].xml",
+        xml.replace(PRESENTATION_MAIN_CT, TEMPLATE_MAIN_CT)
+      );
+    }
+  }
+  return outZip.generateAsync({ type: "blob", mimeType: POTX_MIME });
+}
 
 // -- helpers ----------------------------------------------------------------
 

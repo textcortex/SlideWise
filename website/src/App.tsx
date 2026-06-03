@@ -21,6 +21,7 @@ import {
   SlidewiseEditor,
   type SlidewiseEditorHandle,
   parsePptx,
+  isPptxTemplate,
   serializeDeck,
   type Deck,
   Root,
@@ -145,10 +146,16 @@ export function App() {
   // serializeDeck to round-trip per-element source XML (gradient panels,
   // custGeom marks, charts, SmartArt) without dropping them.
   const sourcePptxRef = useRef<ArrayBuffer | undefined>(undefined);
+  // Whether the last loaded file was a PowerPoint template (.potx). Tracked so
+  // export round-trips the same kind (template → template) and names the
+  // download accordingly. Same OOXML package as .pptx; only the main-part
+  // content type differs.
+  const sourceIsTemplateRef = useRef(false);
 
   const loadFromFile = async (file: File) => {
-    if (!file.name.toLowerCase().endsWith(".pptx")) {
-      setOverlay(`Not a .pptx file: ${file.name}`);
+    const name = file.name.toLowerCase();
+    if (!name.endsWith(".pptx") && !name.endsWith(".potx")) {
+      setOverlay(`Not a .pptx or .potx file: ${file.name}`);
       setTimeout(() => setOverlay(null), 1800);
       return;
     }
@@ -156,6 +163,9 @@ export function App() {
       setOverlay(`Loading ${file.name}…`);
       const buffer = await file.arrayBuffer();
       sourcePptxRef.current = buffer;
+      // Trust the package's content type over the filename: a mis-named
+      // .pptx that is actually a template still round-trips as a template.
+      sourceIsTemplateRef.current = await isPptxTemplate(buffer);
       const next = await parsePptx(buffer);
       setDeck(next);
       setSourceLabel(file.name);
@@ -163,7 +173,7 @@ export function App() {
       setTimeout(() => setOverlay(null), 1600);
     } catch (err) {
       console.error("[slidewise] PPTX parse failed:", err);
-      setOverlay("Failed to parse .pptx — see console");
+      setOverlay("Failed to parse file — see console");
       setTimeout(() => setOverlay(null), 2400);
     }
   };
@@ -173,7 +183,7 @@ export function App() {
     const onDragEnter = (e: DragEvent) => {
       if (!e.dataTransfer?.types.includes("Files")) return;
       dragDepth++;
-      setOverlay("Drop a .pptx to load it");
+      setOverlay("Drop a .pptx or .potx to load it");
     };
     const onDragLeave = () => {
       dragDepth = Math.max(0, dragDepth - 1);
@@ -216,13 +226,16 @@ export function App() {
 
   const handleExportPptx = async (current: Deck) => {
     try {
+      const asTemplate = sourceIsTemplateRef.current;
       const blob = await serializeDeck(current, {
         source: sourcePptxRef.current,
+        asTemplate,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${(current.title || "deck").replace(/[^a-z0-9-_]+/gi, "-")}.pptx`;
+      const ext = asTemplate ? "potx" : "pptx";
+      a.download = `${(current.title || "deck").replace(/[^a-z0-9-_]+/gi, "-")}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -305,12 +318,12 @@ export function App() {
           }
         >
           <Upload size={14} />
-          Open .pptx
+          Open .pptx / .potx
         </button>
         <input
           ref={fileInputRef}
           type="file"
-          accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+          accept=".pptx,.potx,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.presentationml.template"
           onChange={async (e) => {
             const file = e.target.files?.[0];
             if (file) await loadFromFile(file);
