@@ -88,7 +88,7 @@ export {
   type SlideRailItemContextValue,
 } from "./compound";
 
-export { parsePptx, serializeDeck } from "./lib/pptx";
+export { parsePptx, isPptxTemplate, serializeDeck } from "./lib/pptx";
 export type { ParseDiagnostics, ParseResult } from "./lib/pptx/types";
 
 export { migrate, CURRENT_DECK_VERSION } from "./lib/schema/migrate";

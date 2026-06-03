@@ -254,6 +254,30 @@ const DEFAULT_THEME: ThemeColors = {
  *    UnknownElement carrying its raw OOXML so a save round-trip can re-emit
  *    it without data loss.
  */
+/**
+ * Detect whether an OOXML package is a PowerPoint template (`.potx`) rather
+ * than a presentation (`.pptx`). The two share an identical package layout;
+ * the only on-disk difference is the main part's content type in
+ * `[Content_Types].xml`. Prefer this over trusting a filename extension — a
+ * mis-named `.pptx` that is really a template is detected correctly, and a
+ * `.potx` round-trips back to a template on export.
+ */
+export async function isPptxTemplate(
+  blob: Blob | ArrayBuffer | Uint8Array
+): Promise<boolean> {
+  try {
+    const zip = await JSZip.loadAsync(await toArrayBuffer(blob));
+    const xml = await zip.file("[Content_Types].xml")?.async("string");
+    return xml
+      ? xml.includes(
+          "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml"
+        )
+      : false;
+  } catch {
+    return false;
+  }
+}
+
 export async function parsePptx(
   blob: Blob | ArrayBuffer | Uint8Array
 ): Promise<Deck> {
