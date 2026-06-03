@@ -87,6 +87,19 @@ export interface TextRun {
   strike?: boolean;
   color?: string;
   letterSpacing?: number;
+  /**
+   * Optional text highlight colour (CSS background behind the glyphs), from
+   * OOXML `<a:rPr><a:highlight>`. PowerPoint renders this like a highlighter
+   * pen — common in think-cell decks for yellow callouts.
+   */
+  highlight?: string;
+  /**
+   * Optional letter-case transform from OOXML `<a:rPr cap="…">`: `"all"`
+   * (all-caps) or `"small"` (small caps). PowerPoint applies this at render
+   * time without changing the stored characters, so it's often inherited from
+   * a placeholder's list style rather than set on the run.
+   */
+  cap?: "all" | "small";
 }
 
 export interface TextElement extends BaseElement {
@@ -117,6 +130,23 @@ export interface TextElement extends BaseElement {
    */
   background?: string;
   /**
+   * Optional box outline / corner radius for a text-bearing preset shape
+   * (e.g. a roundRect "speech bubble" containing bullets). The PPTX importer
+   * sets these from the shape's `<a:ln>` and `roundRect` adjust value so the
+   * box renders its border and rounded corners behind the text — otherwise a
+   * white-filled bordered shape with text would vanish into the slide.
+   */
+  borderColor?: string;
+  borderWidth?: number;
+  borderRadius?: number;
+  /**
+   * When true the text renders on a single line without wrapping. Set by the
+   * PPTX importer for `<a:bodyPr><a:spAutoFit/>` / `wrap="none"` boxes whose
+   * bounds were fitted to a single line — prevents a substitute font from
+   * wrapping content the original kept on one line.
+   */
+  noWrap?: boolean;
+  /**
    * Optional vector glyph drawn behind the text. Set by the PPTX importer
    * when the layout placeholder carried an `<a:custGeom>` (typically a
    * brand logo plate) — the path fills the text box, the text spans render
@@ -128,6 +158,14 @@ export interface TextElement extends BaseElement {
     viewH: number;
     fill: string;
     fillRule?: "nonzero" | "evenodd";
+    /**
+     * Optional outline for the silhouette (from the shape's `<a:ln>`). Needed
+     * for outline-only shapes — e.g. a white-filled chevron with a coloured
+     * border that holds text; without the stroke it would vanish on a white
+     * slide.
+     */
+    stroke?: string;
+    strokeWidth?: number;
   };
   /**
    * Optional inner padding (in canvas pixels) for the text box. The PPTX
@@ -263,6 +301,38 @@ export interface LineElement extends BaseElement {
   glow?: GlowSpec;
 }
 
+/** One side of a table cell border. */
+export interface CellBorderSide {
+  /** CSS colour of the line. */
+  color: string;
+  /** Line width in canvas pixels. */
+  width: number;
+}
+
+/**
+ * Per-side borders for a single table cell. A side set to a {@link CellBorderSide}
+ * draws that line; `null` is an explicit "no line" (`<a:noFill>`); an absent
+ * side means the cell didn't specify it (fall back to neighbour / default).
+ */
+export interface CellBorders {
+  t?: CellBorderSide | null;
+  r?: CellBorderSide | null;
+  b?: CellBorderSide | null;
+  l?: CellBorderSide | null;
+}
+
+/**
+ * Span metadata for a table cell, indexed alongside `rows`. An origin cell
+ * carries `colSpan`/`rowSpan` (> 1) when it merges neighbours; a cell that has
+ * been merged away carries `covered: true` and is not rendered (its grid slot
+ * is occupied by the spanning origin).
+ */
+export interface CellSpan {
+  colSpan?: number;
+  rowSpan?: number;
+  covered?: boolean;
+}
+
 export interface TableElement extends BaseElement {
   type: "table";
   rows: string[][];
@@ -302,6 +372,63 @@ export interface TableElement extends BaseElement {
   headerTextColor?: string;
   /** First-column text colour override. */
   firstColTextColor?: string;
+  /**
+   * Optional per-cell fill overrides, indexed `[row][col]` parallel to `rows`.
+   * A non-null entry wins over headerFill / rowFill / banding for that cell.
+   * PPTX tables — especially think-cell Gantt charts — colour individual cells
+   * (the bars, milestones, and header strips are cell fills); the row-class
+   * fills above are only the fallback for cells left null. `"transparent"`
+   * represents an explicit `<a:noFill>`.
+   */
+  cellFills?: (string | null)[][];
+  /**
+   * Optional per-cell text-colour overrides, indexed `[row][col]` parallel to
+   * `rows`. Falls back to headerTextColor / firstColTextColor / textColor.
+   */
+  cellTextColors?: (string | null)[][];
+  /**
+   * Optional per-cell rich runs, indexed `[row][col]` parallel to `rows`. Set
+   * when a cell carries formatting the flat `rows` string can't express —
+   * highlight (think-cell yellow callouts), per-run fonts, bullet line breaks,
+   * or mapped symbol glyphs (✓). When present the renderer/serializer use
+   * these; cells without rich runs fall back to the plain string.
+   */
+  cellRuns?: (TextRun[] | null)[][];
+  /**
+   * Optional per-cell vertical alignment from `<a:tcPr anchor>`, indexed
+   * `[row][col]`. `null` means unspecified (renderer falls back to its
+   * header/body default). PPTX table cells default to top anchor; cells with
+   * `anchor="ctr"`/`"b"` must centre / bottom-align their content.
+   */
+  cellVAligns?: (("top" | "middle" | "bottom") | null)[][];
+  /**
+   * Optional per-cell borders, indexed `[row][col]` parallel to `rows`. Each
+   * cell names up to four sides; a side is a line (`{color,width}`), `null`
+   * for an explicit `<a:noFill>` (no line), or absent when the cell doesn't
+   * specify that side. PPTX tables (think-cell especially) draw only a few
+   * coloured edges and leave the rest blank — modelling sides individually is
+   * what stops the renderer from painting a full grey grid.
+   */
+  cellBorders?: (CellBorders | null)[][];
+  /**
+   * Optional per-cell span metadata, indexed `[row][col]` parallel to `rows`.
+   * Present only when the table merges cells (`<a:tc gridSpan>`/`hMerge`/
+   * `rowSpan`/`vMerge`). Lets a merged cell (e.g. a full-width band) cover the
+   * columns it spans instead of stopping after one column.
+   */
+  cellSpans?: (CellSpan | null)[][];
+  /**
+   * Optional relative column widths from `<a:tblGrid><a:gridCol w>` (EMU). Used
+   * proportionally as CSS grid track sizes so a narrow number column and a wide
+   * label column keep their shape. Falls back to equal columns when absent.
+   */
+  colWidths?: number[];
+  /**
+   * Optional relative row heights from `<a:tr h>` (EMU). Used proportionally as
+   * CSS grid track sizes — PPTX tables (think-cell Gantts especially) rely on
+   * uneven row heights. Falls back to equal rows when absent.
+   */
+  rowHeights?: number[];
 }
 
 export interface IconElement extends BaseElement {

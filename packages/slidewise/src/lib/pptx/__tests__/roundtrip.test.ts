@@ -436,6 +436,42 @@ describe("pptx round-trip", () => {
     expect(colors).toContain("#0F1B3D");
   });
 
+  it("round-trips a text run highlight colour", async () => {
+    const deck = makeDeck([
+      {
+        ...baseElement,
+        id: "t1",
+        type: "text",
+        x: 100,
+        y: 100,
+        w: 1500,
+        h: 220,
+        text: "Aktivität 1",
+        fontFamily: "Inter",
+        fontSize: 60,
+        fontWeight: 400,
+        italic: false,
+        underline: false,
+        strike: false,
+        color: "#0F2B53",
+        align: "left",
+        vAlign: "top",
+        lineHeight: 1,
+        letterSpacing: 0,
+        runs: [{ text: "Aktivität 1", color: "#0F2B53", highlight: "#FFFF00" }],
+      },
+    ]);
+
+    const out = await roundtrip(deck);
+    const text = out.slides[0].elements.find((e) => e.type === "text");
+    expect(text?.type).toBe("text");
+    if (text?.type !== "text") return;
+    expect(text.runs).toBeTruthy();
+    const highlighted = (text.runs ?? []).find((r) => r.highlight);
+    expect(highlighted).toBeTruthy();
+    expect((highlighted?.highlight ?? "").toUpperCase()).toBe("#FFFF00");
+  });
+
   it("preserves UnknownElement OOXML and its rels across a round-trip", async () => {
     // Build a deck with a single hand-crafted UnknownElement carrying a raw
     // OOXML fragment that references rId7. parsePptx then attaches a fake

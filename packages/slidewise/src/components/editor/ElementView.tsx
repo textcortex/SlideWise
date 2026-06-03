@@ -7,6 +7,7 @@ import type {
   ImageElement,
   LineElement,
   TableElement,
+  CellBorderSide,
   IconElement,
   EmbedElement,
   ChartElement,
@@ -134,10 +135,15 @@ function TextView({
           ? "center"
           : "flex-end",
     background: el.background,
+    // Border / radius for a text-bearing preset shape (e.g. roundRect callout).
+    border: el.borderColor
+      ? `${el.borderWidth ?? 1}px solid ${el.borderColor}`
+      : undefined,
+    borderRadius: el.borderRadius ? el.borderRadius : undefined,
     padding: el.padding
       ? `${el.padding.t}px ${el.padding.r}px ${el.padding.b}px ${el.padding.l}px`
       : undefined,
-    boxSizing: el.padding ? "border-box" : undefined,
+    boxSizing: el.padding || el.borderColor ? "border-box" : undefined,
     cursor: editing ? "text" : "inherit",
   };
   const inner: React.CSSProperties = {
@@ -154,8 +160,8 @@ function TextView({
     textAlign: el.align,
     lineHeight: el.lineHeight,
     letterSpacing: el.letterSpacing,
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
+    whiteSpace: el.noWrap ? "pre" : "pre-wrap",
+    wordBreak: el.noWrap ? "normal" : "break-word",
     outline: "none",
   };
 
@@ -187,6 +193,9 @@ function TextView({
         d={backingPath.d}
         fill={backingPaint.paint}
         fillRule={backingPath.fillRule ?? "nonzero"}
+        stroke={backingPath.stroke}
+        strokeWidth={backingPath.stroke ? backingPath.strokeWidth ?? 1 : undefined}
+        vectorEffect={backingPath.stroke ? "non-scaling-stroke" : undefined}
       />
     </svg>
   ) : null;
@@ -216,20 +225,38 @@ function TextView({
         {backingSvg}
         <div style={innerStacked}>
           {el.paragraphs.map((pp, pi) => {
+            // Indent / spacing live on the per-line blocks below; the wrapper
+            // only carries alignment (inherited by its line children).
             const paraStyle: React.CSSProperties = {
-              paddingLeft: pp.marL ? pp.marL : undefined,
-              textIndent: pp.indent ? pp.indent : undefined,
               textAlign: pp.align ?? undefined,
-              marginTop: pp.spaceBefore ? pp.spaceBefore : undefined,
             };
-            const content =
+            // A hanging-indent paragraph needs each line as its own block —
+            // CSS text-indent only affects a block's first line, so a
+            // multi-line bulleted paragraph would misalign every bullet after
+            // the first. Split on "\n" and render one indented block per line.
+            const lineRuns: TextRun[][] =
               pp.runs && pp.runs.length
-                ? pp.runs.map((r, ri) => (
-                    <span key={ri} style={runCssStyle(r)}>
-                      {r.text}
-                    </span>
-                  ))
-                : pp.text;
+                ? splitRunsByNewline(pp.runs)
+                : (pp.text ?? "").split("\n").map((t) => [{ text: t }]);
+            const content = lineRuns.map((line, li) => (
+              <div
+                key={li}
+                style={{
+                  paddingLeft: pp.marL ? pp.marL : undefined,
+                  textIndent: pp.indent ? pp.indent : undefined,
+                  marginTop:
+                    li === 0 && pp.spaceBefore ? pp.spaceBefore : undefined,
+                }}
+              >
+                {line.some((r) => r.text.length > 0)
+                  ? line.map((r, ri) => (
+                      <span key={ri} style={runCssStyle(r)}>
+                        {r.text}
+                      </span>
+                    ))
+                  : /* keep an empty paragraph's line height (blank line) */ " "}
+              </div>
+            ));
             return (
               <div key={pi} style={paraStyle}>
                 {content || " "}
@@ -288,13 +315,37 @@ function withGenericFallback(family: string | undefined): string | undefined {
   return `${family}, sans-serif`;
 }
 
+/**
+ * Split a run list into per-line groups at "\n", preserving each run's style.
+ * Used so a hanging-indent paragraph can render each line as its own block.
+ */
+function splitRunsByNewline(runs: TextRun[]): TextRun[][] {
+  const lines: TextRun[][] = [[]];
+  for (const r of runs) {
+    const parts = r.text.split("\n");
+    parts.forEach((part, i) => {
+      if (i > 0) lines.push([]);
+      if (part.length) lines[lines.length - 1].push({ ...r, text: part });
+    });
+  }
+  return lines;
+}
+
 function runCssStyle(r: TextRun): React.CSSProperties {
   const s: React.CSSProperties = {};
   if (r.fontFamily) s.fontFamily = withGenericFallback(r.fontFamily);
   if (r.fontSize) s.fontSize = r.fontSize;
   if (r.fontWeight) s.fontWeight = r.fontWeight;
   if (r.color) s.color = r.color;
+  if (r.highlight) {
+    s.backgroundColor = r.highlight;
+    // Keep the highlight painted continuously across wrapped lines.
+    s.boxDecorationBreak = "clone";
+    s.WebkitBoxDecorationBreak = "clone";
+  }
   if (r.italic) s.fontStyle = "italic";
+  if (r.cap === "all") s.textTransform = "uppercase";
+  else if (r.cap === "small") s.fontVariant = "small-caps";
   if (r.letterSpacing != null) s.letterSpacing = r.letterSpacing;
   const decoration = [r.underline && "underline", r.strike && "line-through"]
     .filter(Boolean)
@@ -389,6 +440,9 @@ function runsToHtml(runs: TextRun[]): string {
       if (r.fontSize) props.push(`font-size: ${r.fontSize}px`);
       if (r.fontWeight) props.push(`font-weight: ${r.fontWeight}`);
       if (r.italic) props.push(`font-style: italic`);
+      if (r.cap === "all") props.push(`text-transform: uppercase`);
+      else if (r.cap === "small") props.push(`font-variant: small-caps`);
+      if (r.highlight) props.push(`background-color: ${r.highlight}`);
       if (r.letterSpacing != null) props.push(`letter-spacing: ${r.letterSpacing}px`);
       const decoration = [r.underline && "underline", r.strike && "line-through"]
         .filter(Boolean)
@@ -417,6 +471,9 @@ function styleToRun(el: HTMLElement, text: string): TextRun {
     if (Number.isFinite(w)) r.fontWeight = w;
   }
   if (s.fontStyle === "italic") r.italic = true;
+  if (s.textTransform === "uppercase") r.cap = "all";
+  else if (s.fontVariant === "small-caps") r.cap = "small";
+  if (s.backgroundColor) r.highlight = s.backgroundColor;
   if (s.letterSpacing) {
     const ls = parseFloat(s.letterSpacing);
     if (Number.isFinite(ls)) r.letterSpacing = ls;
@@ -477,6 +534,8 @@ function sameStyle(a: TextRun, b: TextRun): boolean {
     a.italic === b.italic &&
     a.underline === b.underline &&
     a.strike === b.strike &&
+    a.highlight === b.highlight &&
+    a.cap === b.cap &&
     a.letterSpacing === b.letterSpacing
   );
 }
@@ -965,6 +1024,15 @@ function TableView({ el }: { el: TableElement }) {
   const hasHeader = el.hasHeader ?? true;
   const bandRows = el.bandRows ?? false;
   const cellFill = (ri: number, ci: number): string => {
+    // An explicit per-cell fill (PPTX <a:tcPr> override) wins over every
+    // row-class default — this is what paints think-cell Gantt cells.
+    const perCell = el.cellFills?.[ri]?.[ci];
+    if (perCell) return perCell;
+    // In a per-cell-fill table, a cell with no fill of its own is transparent
+    // (the slide shows through). It must NOT fall back to headerFill/rowFill —
+    // those were derived from some other cell and would flood unfilled cells
+    // with that colour (e.g. a stray cream band turning the whole grid cream).
+    if (el.cellFills) return "transparent";
     if (hasHeader && ri === 0) return el.headerFill;
     if (el.lastRowFill && ri === rowCount - 1 && rowCount > 1) return el.lastRowFill;
     if (el.firstColFill && ci === 0) return el.firstColFill;
@@ -978,27 +1046,98 @@ function TableView({ el }: { el: TableElement }) {
     return el.rowFill;
   };
   const cellColor = (ri: number, ci: number): string => {
+    const perCell = el.cellTextColors?.[ri]?.[ci];
+    if (perCell) return perCell;
     if (hasHeader && ri === 0 && el.headerTextColor) return el.headerTextColor;
     if (el.firstColTextColor && ci === 0 && !(hasHeader && ri === 0)) {
       return el.firstColTextColor;
     }
     return el.textColor;
   };
+
+  // When the source defined per-cell borders, honour them exactly: most PPTX
+  // (think-cell) cells leave sides blank, so a uniform grid is wrong. Each
+  // internal edge is drawn once — by the cell above (its bottom) or to the
+  // left (its right) — and a coloured side wins over a neighbour's blank one,
+  // so shared edges never double up.
+  const hasCellBorders = !!el.cellBorders;
+  const sideCss = (s: CellBorderSide | null | undefined): string | undefined =>
+    s ? `${s.width}px solid ${s.color}` : undefined;
+  // Pick the drawn line between two adjacent sides (a colour beats null/absent).
+  const mergeSide = (
+    a: CellBorderSide | null | undefined,
+    b: CellBorderSide | null | undefined
+  ): CellBorderSide | null | undefined => a ?? b;
+  // Merged cells: a covered continuation cell renders nothing, and a spanning
+  // origin cell is placed explicitly so it covers the columns/rows it merges
+  // (e.g. a full-width band). Explicit placement (col/row = array index) avoids
+  // auto-flow ambiguity once some cells span and others are omitted.
+  const hasSpans = !!el.cellSpans;
+  const cellPlacement = (ri: number, ci: number): React.CSSProperties => {
+    if (!hasSpans) return {};
+    const span = el.cellSpans?.[ri]?.[ci];
+    return {
+      gridColumn: `${ci + 1} / span ${span?.colSpan ?? 1}`,
+      gridRow: `${ri + 1} / span ${span?.rowSpan ?? 1}`,
+    };
+  };
+  const cellBorderStyle = (ri: number, ci: number): React.CSSProperties => {
+    if (!hasCellBorders) {
+      // Legacy default: a single faint grid line shared between cells.
+      return {
+        borderRight: ci < cols - 1 ? `1px solid ${stroke}` : undefined,
+        borderBottom: ri < rowCount - 1 ? `1px solid ${stroke}` : undefined,
+      };
+    }
+    const cb = el.cellBorders?.[ri]?.[ci] ?? undefined;
+    const right = mergeSide(cb?.r, el.cellBorders?.[ri]?.[ci + 1]?.l);
+    const bottom = mergeSide(cb?.b, el.cellBorders?.[ri + 1]?.[ci]?.t);
+    return {
+      // Outer top/left edges belong to the first row/column; internal top/left
+      // edges are covered by the neighbour's bottom/right so they aren't doubled.
+      borderTop: ri === 0 ? sideCss(cb?.t) : undefined,
+      borderLeft: ci === 0 ? sideCss(cb?.l) : undefined,
+      borderRight: sideCss(right),
+      borderBottom: sideCss(bottom),
+    };
+  };
   return (
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: `repeat(${cols}, 1fr)`,
-        gridAutoRows: "1fr",
+        gridTemplateColumns:
+          el.colWidths && el.colWidths.length === cols
+            ? el.colWidths.map((w) => `${w}fr`).join(" ")
+            : `repeat(${cols}, 1fr)`,
+        gridTemplateRows:
+          el.rowHeights && el.rowHeights.length === rowCount
+            ? el.rowHeights.map((h) => `${h}fr`).join(" ")
+            : `repeat(${rowCount}, 1fr)`,
         width: "100%",
         height: "100%",
         gap: 0,
         background: "transparent",
-        boxShadow: `inset 0 0 0 1px ${stroke}`,
+        // The legacy frame only applies to tables without explicit cell borders.
+        boxShadow: hasCellBorders ? undefined : `inset 0 0 0 1px ${stroke}`,
       }}
     >
       {el.rows.flatMap((row, ri) =>
-        row.map((cell, ci) => (
+        row.map((cell, ci) => {
+          // Cells merged into a neighbour aren't rendered — the spanning
+          // origin covers their grid slot.
+          if (el.cellSpans?.[ri]?.[ci]?.covered) return null;
+          // Rich runs (highlight / per-run font / bullet line breaks / ✓
+          // glyphs) take over from the flat string when present.
+          const runs = el.cellRuns?.[ri]?.[ci];
+          const content =
+            runs && runs.length
+              ? runs.map((r, i) => (
+                  <span key={i} style={runCssStyle(r)}>
+                    {r.text}
+                  </span>
+                ))
+              : cell;
+          return (
           <div
             key={`${ri}-${ci}`}
             style={{
@@ -1007,7 +1146,16 @@ function TableView({ el }: { el: TableElement }) {
               fontSize: el.fontSize,
               padding: "12px 16px",
               display: "flex",
-              alignItems: "center",
+              // Vertical alignment: honour the cell's own anchor when the
+              // source set one (<a:tcPr anchor>); otherwise fall back to the
+              // header-centred / body-top default. PPTX cells default to top.
+              alignItems: (() => {
+                const va = el.cellVAligns?.[ri]?.[ci];
+                if (va === "middle") return "center";
+                if (va === "bottom") return "flex-end";
+                if (va === "top") return "flex-start";
+                return hasHeader && ri === 0 ? "center" : "flex-start";
+              })(),
               fontWeight:
                 (hasHeader && ri === 0) || (el.firstColFill && ci === 0)
                   ? 600
@@ -1017,15 +1165,19 @@ function TableView({ el }: { el: TableElement }) {
               minHeight: 0,
               overflow: "hidden",
               wordBreak: "break-word",
-              borderRight:
-                ci < cols - 1 ? `1px solid ${stroke}` : undefined,
-              borderBottom:
-                ri < rowCount - 1 ? `1px solid ${stroke}` : undefined,
+              ...cellPlacement(ri, ci),
+              ...cellBorderStyle(ri, ci),
             }}
           >
-            {cell}
+            {/* Single inline-flow child so run spans wrap as text and the
+                "\n" bullet breaks apply (flex children would lay out in a
+                row, collapsing every bullet onto one line). */}
+            <div style={{ width: "100%", whiteSpace: "pre-wrap" }}>
+              {content}
+            </div>
           </div>
-        ))
+          );
+        })
       )}
     </div>
   );

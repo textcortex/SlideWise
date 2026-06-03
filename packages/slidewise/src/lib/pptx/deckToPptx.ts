@@ -10,6 +10,7 @@ import type {
   ImageElement,
   LineElement,
   TableElement,
+  CellBorderSide,
   IconElement,
   EmbedElement,
   ChartElement,
@@ -384,6 +385,7 @@ function addText(
             ? ({ style: "sng" } as const)
             : undefined,
           strike: (r.strike ?? el.strike) ? ("sngStrike" as const) : undefined,
+          highlight: r.highlight ? hexNoHash(r.highlight) : undefined,
           charSpacing: r.letterSpacing ?? el.letterSpacing
             ? Math.round((r.letterSpacing ?? el.letterSpacing) * 100)
             : undefined,
@@ -511,21 +513,94 @@ function addLine(
 function addTable(s: pptxgen.Slide, el: TableElement): void {
   if (!el.rows.length) return;
   const rows = el.rows.map((row, ri) =>
-    row.map((cell) => ({
-      text: cell,
-      options: {
-        bold: ri === 0,
-        fill: { color: hexNoHash(ri === 0 ? el.headerFill : el.rowFill) },
-        color: hexNoHash(el.textColor),
-        fontSize: pxToPoints(el.fontSize),
-        valign: "middle" as const,
-      },
-    }))
+    row.flatMap((cell, ci) => {
+      const span = el.cellSpans?.[ri]?.[ci];
+      // A cell merged into a neighbour is omitted; pptxgenjs reconstructs the
+      // merge from the origin cell's colspan/rowspan.
+      if (span?.covered) return [];
+      const perCellFill = el.cellFills?.[ri]?.[ci];
+      const perCellColor = el.cellTextColors?.[ri]?.[ci];
+      // In a per-cell-fill table an unset cell is transparent — fall back to
+      // the row/header default only for tables without per-cell fills, so we
+      // don't flood blank cells with a colour borrowed from another cell.
+      const transparent =
+        perCellFill === "transparent" || (el.cellFills && !perCellFill);
+      const fill = transparent
+        ? { color: "FFFFFF", transparency: 100 }
+        : {
+            color: hexNoHash(
+              perCellFill ?? (ri === 0 ? el.headerFill : el.rowFill)
+            ),
+          };
+      const cb = el.cellBorders?.[ri]?.[ci];
+      // pptxgenjs cell border order is [top, right, bottom, left]; a drawn
+      // side becomes a solid line, anything else (null / absent) is "none".
+      const side = (s: CellBorderSide | null | undefined) =>
+        s
+          ? { type: "solid" as const, color: hexNoHash(s.color), pt: pxToPoints(s.width) }
+          : { type: "none" as const };
+      const border = cb
+        ? ([side(cb.t), side(cb.r), side(cb.b), side(cb.l)] as [
+            pptxgen.BorderProps,
+            pptxgen.BorderProps,
+            pptxgen.BorderProps,
+            pptxgen.BorderProps,
+          ])
+        : undefined;
+      // Rich runs: emit per-run text (highlight/colour/weight), splitting on
+      // "\n" so bullet lines break in the exported deck.
+      const runs = el.cellRuns?.[ri]?.[ci];
+      const text:
+        | string
+        | { text: string; options?: pptxgen.TextPropsOptions }[] =
+        runs && runs.length
+          ? runs.flatMap((r) => {
+              const pieces = r.text.split("\n");
+              return pieces.map((piece, i) => ({
+                text: piece,
+                options: {
+                  fontFace: r.fontFamily,
+                  fontSize: r.fontSize ? pxToPoints(r.fontSize) : undefined,
+                  bold: r.fontWeight ? r.fontWeight >= 600 : undefined,
+                  italic: r.italic,
+                  color: hexNoHash(r.color ?? perCellColor ?? el.textColor),
+                  highlight: r.highlight ? hexNoHash(r.highlight) : undefined,
+                  breakLine: i < pieces.length - 1,
+                },
+              }));
+            })
+          : cell;
+      return [
+        {
+          text,
+          options: {
+            bold: ri === 0,
+            fill,
+            color: hexNoHash(perCellColor ?? el.textColor),
+            fontSize: pxToPoints(el.fontSize),
+            valign: "middle" as const,
+            ...(border ? { border } : {}),
+            ...(span?.colSpan ? { colspan: span.colSpan } : {}),
+            ...(span?.rowSpan ? { rowspan: span.rowSpan } : {}),
+          },
+        },
+      ];
+    })
   );
+  // EMU → inches for pptxgenjs track sizes (preserves uneven Gantt rows/cols).
+  const EMU_PER_IN = 914400;
+  const colW = el.colWidths?.length
+    ? el.colWidths.map((w) => w / EMU_PER_IN)
+    : undefined;
+  const rowH = el.rowHeights?.length
+    ? el.rowHeights.map((h) => h / EMU_PER_IN)
+    : undefined;
   s.addTable(rows, {
     ...geometry(el),
     border: { type: "none", pt: 0, color: "FFFFFF" },
     fontFace: "Inter",
+    ...(colW ? { colW } : {}),
+    ...(rowH ? { rowH } : {}),
   });
 }
 
