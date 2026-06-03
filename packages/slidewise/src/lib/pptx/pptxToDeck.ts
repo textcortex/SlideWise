@@ -13,6 +13,9 @@ import type {
   ImageElement,
   LineElement,
   TableElement,
+  CellBorders,
+  CellBorderSide,
+  CellSpan,
   ChartElement,
   ChartSeries,
   GroupElement,
@@ -860,9 +863,37 @@ function collectSlidePlaceholderKeys(spTree: any): Set<string> {
   return keys;
 }
 
-function isHiddenNode(node: any, nvKey: "p:nvSpPr" | "p:nvPicPr"): boolean {
+type NvKey =
+  | "p:nvSpPr"
+  | "p:nvPicPr"
+  | "p:nvCxnSpPr"
+  | "p:nvGraphicFramePr"
+  | "p:nvGrpSpPr";
+
+function isHiddenNode(node: any, nvKey: NvKey): boolean {
   const cNvPr = node?.[nvKey]?.["p:cNvPr"];
   return cNvPr?.["@_hidden"] === "1" || cNvPr?.["@_hidden"] === 1;
+}
+
+/** Maps a spTree child tag to the nv-wrapper key that carries its `<p:cNvPr>`. */
+const NV_KEY_BY_TAG: Record<string, NvKey> = {
+  "p:sp": "p:nvSpPr",
+  "p:pic": "p:nvPicPr",
+  "p:cxnSp": "p:nvCxnSpPr",
+  "p:graphicFrame": "p:nvGraphicFramePr",
+  "p:grpSp": "p:nvGrpSpPr",
+};
+
+/**
+ * Resolve a shape's outline colour from <p:style><a:lnRef idx="N"><clr/></a:lnRef>.
+ * The colour child is the line colour (idx selects the theme line width/dash
+ * template, which we don't need for colour). Used when an <a:ln> declares a
+ * width/dash but no explicit colour of its own.
+ */
+function resolveStyleLineRef(sp: any, ctx: ParseContext): string | undefined {
+  const lnRef = sp?.["p:style"]?.["a:lnRef"];
+  if (!lnRef) return undefined;
+  return resolveColor(lnRef, ctx.theme);
 }
 
 /**
@@ -958,6 +989,12 @@ async function parseSpTree(
     const idx = cursors[tag]++;
     const node = arr[idx];
     if (!node) continue;
+    // Shapes flagged hidden="1" on their <p:cNvPr> are never rendered by
+    // PowerPoint (e.g. think-cell's "do not delete" data object, which is a
+    // tiny off-content OLE picture). Skip them so they don't leak onto the
+    // slide.
+    const nvKey = NV_KEY_BY_TAG[tag];
+    if (nvKey && isHiddenNode(node, nvKey)) continue;
     const rawSrc = (node as any)?._elementRawSrc as string | undefined;
     if (tag === "p:sp") {
       const el = await parseSpOrText(node, ctx, outer);
@@ -1153,6 +1190,26 @@ async function parseSpOrText(
       flipV
     );
   }
+  // Block arrows (down/up/left/right): a rectangular shaft plus a triangular
+  // head. Without a synthesised path these fall back to a plain rectangle,
+  // losing the arrowhead entirely.
+  if (
+    !customPath &&
+    geom &&
+    (presetName === "downArrow" ||
+      presetName === "upArrow" ||
+      presetName === "leftArrow" ||
+      presetName === "rightArrow")
+  ) {
+    customPath = buildBlockArrowPath(
+      prstGeom,
+      presetName,
+      geom.w,
+      geom.h,
+      flipH,
+      flipV
+    );
+  }
   // Cube: three-face isometric box. The OOXML preset emits front/top/right as
   // separate sub-paths sharing edges at the inner corner — encoding all three
   // as `M…Z` sub-paths in one SVG <path> draws the 3D outline (inner edges
@@ -1205,17 +1262,65 @@ async function parseSpOrText(
       const fill =
         extractShapeFill(sp?.["p:spPr"], ctx.theme) ??
         resolveStyleFillRef(sp, ctx);
-      if (fill && fill !== "transparent") {
+      // Capture the outline too: an outline-only silhouette (e.g. a white
+      // chevron with a coloured border holding text) would otherwise vanish
+      // because only the fill — white on white — would be drawn.
+      const ln = sp?.["p:spPr"]?.["a:ln"];
+      const lnNoFill = ln?.["a:noFill"] !== undefined;
+      const strokeColor = lnNoFill
+        ? undefined
+        : resolveColor(ln?.["a:solidFill"], ctx.theme);
+      const strokeWidthEmu =
+        !lnNoFill && ln?.["@_w"] ? Number(ln["@_w"]) : undefined;
+      const hasFill = !!fill && fill !== "transparent";
+      if (hasFill || strokeColor) {
         el.backingPath = {
           d: customPath.d,
           viewW: customPath.viewW,
           viewH: customPath.viewH,
-          fill,
+          fill: hasFill ? fill! : "transparent",
           fillRule: customPath.fillRule,
+          ...(strokeColor
+            ? {
+                stroke: strokeColor,
+                strokeWidth: strokeWidthEmu
+                  ? Math.max(1, Math.round(emuToPx(strokeWidthEmu) * ctx.fit.scale))
+                  : 1,
+              }
+            : {}),
         };
         // The path now owns the rendered fill — drop any flat background
         // the placeholder-fallback path may have set so we don't double up.
         el.background = undefined;
+      }
+    } else if (presetName) {
+      // A preset shape (roundRect/rect/ellipse "speech bubble") that hosts
+      // text: keep its fill, border, and corner radius behind the text so a
+      // white-filled bordered box doesn't disappear into the slide.
+      const shapeFill = extractShapeFill(sp?.["p:spPr"], ctx.theme);
+      const ln = sp?.["p:spPr"]?.["a:ln"];
+      const lnNoFill = ln?.["a:noFill"] !== undefined;
+      const lnColor = lnNoFill
+        ? undefined
+        : resolveColor(ln?.["a:solidFill"], ctx.theme);
+      const lnWidthEmu = !lnNoFill && ln?.["@_w"] ? Number(ln["@_w"]) : undefined;
+      if (shapeFill && shapeFill !== "transparent") el.background = shapeFill;
+      if (lnColor) {
+        el.borderColor = lnColor;
+        el.borderWidth = lnWidthEmu
+          ? Math.max(1, Math.round(emuToPx(lnWidthEmu) * ctx.fit.scale))
+          : 1;
+      }
+      if (presetName === "roundRect") {
+        const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+          (g: any) => g?.["@_name"] === "adj"
+        );
+        const m =
+          typeof adj?.["@_fmla"] === "string"
+            ? /val\s+(-?\d+)/.exec(adj["@_fmla"])
+            : null;
+        const frac = m ? Number(m[1]) / 100000 : 0.16667;
+        el.borderRadius = Math.round(Math.min(geom.w, geom.h) * frac);
       }
     }
     return el;
@@ -1246,9 +1351,14 @@ async function parseSpOrText(
     ?? "transparent";
   const lineProps = spPr?.["a:ln"];
   const lineHasNoFill = lineProps?.["a:noFill"] !== undefined;
+  // A line can carry a width/dash but no explicit colour — the colour then
+  // comes from the shape's <p:style><a:lnRef> (theme line style). Without
+  // resolving that, a dashed/outlined shape (e.g. a dashed panel border) gets
+  // no stroke colour and renders invisible.
   const stroke = lineHasNoFill
     ? undefined
-    : resolveColor(lineProps?.["a:solidFill"], ctx.theme);
+    : resolveColor(lineProps?.["a:solidFill"], ctx.theme) ??
+      (lineProps ? resolveStyleLineRef(sp, ctx) : undefined);
   const strokeWidthEmu =
     !lineHasNoFill && lineProps?.["@_w"]
       ? Number(lineProps["@_w"])
@@ -1349,28 +1459,38 @@ function makeTextElement(
         : (ctx.masterTextDefaults.other ?? []);
   const masterLvl1 = masterLevels[0];
 
-  // Accumulate inheritance: slide < layout < master < masterDefaults. Each
-  // level can specify just a subset of fields (the layout might set the
-  // typeface while only the master defines the colour), so merge field by
-  // field with earlier candidates winning.
+  // A shape's own <p:txBody><a:lstStyle> sits at the top of the inheritance
+  // chain — for a non-placeholder text box (e.g. a manually-styled "02 |"
+  // label) it's the only place its font size / weight / typeface / colour
+  // live. Without it those runs fall through to the master default and render
+  // at the wrong size and font.
+  const shapeLvlPPr = collectLevelPPrs(effectiveTxBody?.["a:lstStyle"]);
+
+  // Accumulate inheritance: shape lstStyle < slide < layout < master <
+  // masterDefaults. Each level can specify just a subset of fields (the layout
+  // might set the typeface while only the master defines the colour), so merge
+  // field by field with earlier candidates winning.
   const fallbackRPr = mergeRPrChain(
+    shapeLvlPPr[0]?.["a:defRPr"],
     layoutPh?.rPr,
     masterPh?.rPr,
     masterLvl1?.["a:defRPr"]
   );
   const fallbackPPr = mergeFirst(
+    shapeLvlPPr[0],
     layoutPh?.pPr,
     masterPh?.pPr,
     masterLvl1
   );
   const fallbackBodyPr = mergeFirst(layoutPh?.bodyPr, masterPh?.bodyPr);
 
-  // Resolve a per-level [layoutLvl, masterPhLvl, masterTxStyleLvl] chain so
-  // bullet/alignment/lineSpacing each fall through independently when an
-  // earlier layer is silent on that particular field.
+  // Resolve a per-level [shapeLvl, layoutLvl, masterPhLvl, masterTxStyleLvl]
+  // chain so bullet/alignment/lineSpacing/caps each fall through independently
+  // when an earlier layer is silent on that particular field.
   const listStyle: (any | undefined)[][] = [];
   for (let i = 0; i < 9; i++) {
     const chain = [
+      shapeLvlPPr[i],
       layoutPh?.lvlPPr?.[i],
       masterPh?.lvlPPr?.[i],
       masterLevels[i],
@@ -1384,6 +1504,7 @@ function makeTextElement(
   const autoFit = readNormAutofit(
     effectiveTxBody?.["a:bodyPr"] ?? fallbackBodyPr
   );
+  const bodyPrForWrap = effectiveTxBody?.["a:bodyPr"] ?? fallbackBodyPr;
 
   const text = extractRuns(
     effectiveTxBody,
@@ -1423,7 +1544,7 @@ function makeTextElement(
       ctx.themeFonts
     ) ??
     "Inter";
-  const fontWeight = first?.bold ? 700 : 400;
+  const fontWeight = first?.fontWeight ?? (first?.bold ? 700 : 400);
   const color =
     first?.color ??
     resolveColor(fallbackRPr?.["a:solidFill"], ctx.theme) ??
@@ -1433,7 +1554,7 @@ function makeTextElement(
     text: r.text,
     fontFamily: r.fontFamily,
     fontSize: r.fontSize ? Math.max(6, Math.round(r.fontSize * scale)) : undefined,
-    fontWeight: r.bold ? 700 : r.bold === false ? 400 : undefined,
+    fontWeight: r.fontWeight ?? (r.bold ? 700 : r.bold === false ? 400 : undefined),
     italic: r.italic,
     underline: r.underline,
     strike: r.strike,
@@ -1441,6 +1562,8 @@ function makeTextElement(
     letterSpacing: r.letterSpacing
       ? Math.round(r.letterSpacing * scale)
       : undefined,
+    highlight: r.highlight,
+    cap: r.cap,
   }));
   const hasMixedFormatting = runs.length > 1 && runs.some((r, i) => {
     if (i === 0) return false;
@@ -1452,9 +1575,15 @@ function makeTextElement(
       a.fontWeight !== r.fontWeight ||
       a.italic !== r.italic ||
       a.underline !== r.underline ||
-      a.strike !== r.strike
+      a.strike !== r.strike ||
+      a.highlight !== r.highlight ||
+      a.cap !== r.cap
     );
   });
+  // highlight / cap have no flat TextElement field, so they'd be lost when runs
+  // aren't emitted (single run, or uniform formatting). Force the rich-run
+  // representation whenever any run carries one.
+  const hasHighlight = runs.some((r) => r.highlight || r.cap);
 
   const el: TextElement = {
     id: nanoid(8),
@@ -1475,7 +1604,18 @@ function makeTextElement(
     letterSpacing: first?.letterSpacing
       ? Math.round(first.letterSpacing * scale)
       : 0,
-    ...(hasMixedFormatting ? { runs } : {}),
+    ...(hasMixedFormatting || hasHighlight ? { runs } : {}),
+    // <a:bodyPr><a:spAutoFit/> (and wrap="none") size the shape to its text,
+    // so a short single-line label like "02 |" must not re-wrap when a
+    // substitute font measures wider than the original. Restricted to SHORT
+    // single-line labels: a long autofit paragraph (a content placeholder)
+    // genuinely wraps within its fixed width and must keep wrapping.
+    ...((bodyPrForWrap?.["a:spAutoFit"] !== undefined ||
+      bodyPrForWrap?.["@_wrap"] === "none") &&
+    !text.plain.includes("\n") &&
+    text.plain.trim().length <= 16
+      ? { noWrap: true }
+      : {}),
   };
   // Surface per-paragraph layout when any paragraph carries a hanging-indent
   // pair (marL + negative indent) — that's the signal for a bulleted list
@@ -1502,7 +1642,7 @@ function makeTextElement(
           fontSize: r.fontSize
             ? Math.max(6, Math.round(r.fontSize * scale))
             : undefined,
-          fontWeight: r.bold ? 700 : r.bold === false ? 400 : undefined,
+          fontWeight: r.fontWeight ?? (r.bold ? 700 : r.bold === false ? 400 : undefined),
           italic: r.italic,
           underline: r.underline,
           strike: r.strike,
@@ -1510,6 +1650,8 @@ function makeTextElement(
           letterSpacing: r.letterSpacing
             ? Math.round(r.letterSpacing * scale)
             : undefined,
+          highlight: r.highlight,
+          cap: r.cap,
         };
       });
       return {
@@ -1558,13 +1700,15 @@ function makeTextElement(
   // its bounding box. For non-rectangular presets (chevron's left notch +
   // right arrow tip), that pulls the usable text area inward — without
   // this, a centred long phrase overflows into the icon/arrow regions.
-  // Only the inscribed-rectangle insets we can derive from `adj` are added;
-  // the explicit bodyPr insets stay on top.
-  const presetTxRect = inscribedTextInsets(
-    sp?.["p:spPr"]?.["a:prstGeom"],
-    geom.w,
-    geom.h
-  );
+  // Only apply it when the shape is actually drawn (has a visible fill):
+  // a no-fill chevron/homePlate used purely as an invisible text label (e.g.
+  // the "Phase"/"Content" tabs) has no visible tip to avoid, so reserving it
+  // would only force the text to wrap in an artificially narrow column.
+  const shapeFillForInset = extractShapeFill(sp?.["p:spPr"], ctx.theme);
+  const shapeIsDrawn = !!shapeFillForInset && shapeFillForInset !== "transparent";
+  const presetTxRect = shapeIsDrawn
+    ? inscribedTextInsets(sp?.["p:spPr"]?.["a:prstGeom"], geom.w, geom.h)
+    : { l: 0, t: 0, r: 0, b: 0 };
   const padding = {
     l: Math.round(emuToPx(lIns) * ctx.fit.scale) + presetTxRect.l,
     t: Math.round(emuToPx(tIns) * ctx.fit.scale) + presetTxRect.t,
@@ -1957,6 +2101,26 @@ async function parseGraphicFrame(
 }
 
 
+/**
+ * Read one cell-border side (`<a:lnL>`/`<a:lnR>`/`<a:lnT>`/`<a:lnB>`):
+ *  - `undefined` — the side element is absent (cell doesn't specify it)
+ *  - `null`      — present with `<a:noFill>` (explicit "no line")
+ *  - `{color,width}` — a drawn line; width is the `@w` (EMU) in canvas px
+ */
+function readCellBorderSide(
+  ln: any,
+  theme: ThemeColors
+): CellBorderSide | null | undefined {
+  if (!ln) return undefined;
+  if (ln["a:noFill"]) return null;
+  const color = resolveColor(ln["a:solidFill"], theme);
+  if (!color) return null;
+  const wEmu = Number(ln["@_w"]);
+  const width =
+    Number.isFinite(wEmu) && wEmu > 0 ? Math.max(1, Math.round(emuToPx(wEmu))) : 1;
+  return { color, width };
+}
+
 function parseTable(
   gf: any,
   tbl: any,
@@ -2009,21 +2173,112 @@ function parseTable(
   let firstColor: string | undefined;
   let headerCellFill: string | undefined;
   let bodyCellFill: string | undefined;
+  // Per-cell fill / text colour, indexed [row][col]. PPTX tables (notably
+  // think-cell Gantt charts) paint individual cells, so we keep every cell's
+  // own override rather than collapsing to a single header/body fill.
+  const cellFills: (string | null)[][] = [];
+  const cellTextColors: (string | null)[][] = [];
+  const cellBorders: (CellBorders | null)[][] = [];
+  const cellSpans: (CellSpan | null)[][] = [];
+  const cellRuns: (TextRun[] | null)[][] = [];
+  const cellVAligns: (("top" | "middle" | "bottom") | null)[][] = [];
+  let anyCellFill = false;
+  let anyCellText = false;
+  let anyCellBorder = false;
+  let anyCellSpan = false;
+  let anyCellRuns = false;
+  let anyCellVAlign = false;
+
+  // Relative column widths (<a:tblGrid><a:gridCol w>) and row heights (<a:tr h>),
+  // both in EMU. Kept as proportional track sizes for the renderer's CSS grid.
+  const colWidths = asArray(tbl?.["a:tblGrid"]?.["a:gridCol"])
+    .map((gc: any) => Number(gc?.["@_w"]))
+    .filter((n: number) => Number.isFinite(n) && n > 0);
+  const rowHeights: number[] = [];
 
   for (let ri = 0; ri < trs.length; ri++) {
     const tr = trs[ri];
+    const rowH = Number(tr?.["@_h"]);
+    rowHeights.push(Number.isFinite(rowH) && rowH > 0 ? rowH : 0);
     const tcs = asArray(tr["a:tc"]);
     const cells: string[] = [];
+    const rowFills: (string | null)[] = [];
+    const rowTextColors: (string | null)[] = [];
+    const rowBorders: (CellBorders | null)[] = [];
+    const rowSpans: (CellSpan | null)[] = [];
+    const rowRuns: (TextRun[] | null)[] = [];
+    const rowVAligns: (("top" | "middle" | "bottom") | null)[] = [];
     for (const tc of tcs) {
       if (tc?.["@_hMerge"] === "1" || tc?.["@_vMerge"] === "1") {
+        // Continuation of a merged cell — its slot is covered by the spanning
+        // origin cell, so render nothing here.
         cells.push("");
+        rowFills.push(null);
+        rowTextColors.push(null);
+        rowBorders.push(null);
+        rowSpans.push({ covered: true });
+        rowRuns.push(null);
+        rowVAligns.push(null);
+        anyCellSpan = true;
         continue;
       }
+      const colSpan = Number(tc?.["@_gridSpan"]);
+      const rowSpan = Number(tc?.["@_rowSpan"]);
+      const span: CellSpan = {};
+      if (Number.isFinite(colSpan) && colSpan > 1) span.colSpan = colSpan;
+      if (Number.isFinite(rowSpan) && rowSpan > 1) span.rowSpan = rowSpan;
+      const hasSpan = span.colSpan !== undefined || span.rowSpan !== undefined;
+      if (hasSpan) anyCellSpan = true;
+      rowSpans.push(hasSpan ? span : null);
       const txBody = tc["a:txBody"];
       const text = txBody
         ? extractRuns(txBody, ctx.theme, undefined, undefined, ctx.themeFonts)
         : { plain: "", runs: [] as RunInfo[] };
       cells.push(text.plain);
+
+      // Preserve rich content (highlight / bullet line breaks / symbol glyphs)
+      // when the flat string can't represent it. The bullet prefix and "\n"
+      // breaks are already baked into the run text by extractRuns.
+      const cScale = ctx.fit.scale;
+      // A cell is "rich" when the flat table model can't represent its runs:
+      // line breaks, highlight, all-caps, italic/underline/strike, or a
+      // bold/semibold weight (the flat path otherwise hardcodes header cells
+      // to 600 and body cells to 400, dropping the real run weight).
+      const isRich =
+        text.plain.includes("\n") ||
+        text.runs.some(
+          (r) =>
+            r.highlight ||
+            r.cap ||
+            r.italic ||
+            r.underline ||
+            r.strike ||
+            (r.fontWeight !== undefined && r.fontWeight >= 600)
+        );
+      if (isRich && text.runs.length) {
+        anyCellRuns = true;
+        rowRuns.push(
+          text.runs.map((r) => ({
+            text: r.text,
+            fontFamily: r.fontFamily,
+            fontSize: r.fontSize
+              ? Math.max(6, Math.round(r.fontSize * cScale))
+              : undefined,
+            fontWeight: r.fontWeight ?? (r.bold ? 700 : r.bold === false ? 400 : undefined),
+            italic: r.italic,
+            underline: r.underline,
+            strike: r.strike,
+            color: r.color,
+            letterSpacing: r.letterSpacing
+              ? Math.round(r.letterSpacing * cScale)
+              : undefined,
+            highlight: r.highlight,
+            cap: r.cap,
+          }))
+        );
+      } else {
+        rowRuns.push(null);
+      }
 
       const r0 = text.runs[0];
       if (firstFontSizePx === undefined && r0?.fontSize) {
@@ -2032,17 +2287,55 @@ function parseTable(
       if (!firstColor && r0?.color) firstColor = r0.color;
 
       // Cell-level <a:tcPr><a:solidFill> wins over style fills (PPTX
-      // override semantics): record it here so the table-level defaults
-      // we pick below don't clobber it. We can't model per-cell fills
-      // yet, so the *first* explicit cell fill on the header / body
-      // wins for the whole row class.
-      const cellFill = resolveColor(tc?.["a:tcPr"]?.["a:solidFill"], ctx.theme);
+      // override semantics). An explicit <a:noFill> reads as transparent so
+      // the slide background shows through (e.g. the blank top-left corner).
+      const tcPr = tc?.["a:tcPr"];
+      const cellFill = resolveColor(tcPr?.["a:solidFill"], ctx.theme);
+      const fillVal = cellFill ?? (tcPr?.["a:noFill"] ? "transparent" : null);
+      rowFills.push(fillVal);
+      if (fillVal) anyCellFill = true;
+      // Record the row-class fallbacks too (back-compat with the flat model).
       if (cellFill) {
         if (ri === 0 && headerCellFill === undefined) headerCellFill = cellFill;
         else if (ri > 0 && bodyCellFill === undefined) bodyCellFill = cellFill;
       }
+
+      const cellText = r0?.color ?? null;
+      rowTextColors.push(cellText);
+      if (cellText) anyCellText = true;
+
+      // Per-cell vertical anchor (<a:tcPr anchor>): t / ctr / b.
+      const vAlign = readBodyVAlign(tcPr) ?? null;
+      rowVAligns.push(vAlign);
+      if (vAlign) anyCellVAlign = true;
+
+      // Per-side cell borders (<a:lnL/lnR/lnT/lnB>). A side may be a coloured
+      // line, an explicit <a:noFill> (null = no line), or absent (undefined).
+      const borders: CellBorders = {};
+      let hasBorder = false;
+      const SIDES: [keyof CellBorders, string][] = [
+        ["l", "a:lnL"],
+        ["r", "a:lnR"],
+        ["t", "a:lnT"],
+        ["b", "a:lnB"],
+      ];
+      for (const [key, tag] of SIDES) {
+        const side = readCellBorderSide(tcPr?.[tag], ctx.theme);
+        if (side !== undefined) {
+          borders[key] = side;
+          hasBorder = true;
+        }
+      }
+      if (hasBorder) anyCellBorder = true;
+      rowBorders.push(hasBorder ? borders : null);
     }
     rows.push(cells);
+    cellFills.push(rowFills);
+    cellTextColors.push(rowTextColors);
+    cellBorders.push(rowBorders);
+    cellSpans.push(rowSpans);
+    cellRuns.push(rowRuns);
+    cellVAligns.push(rowVAligns);
   }
 
   // Resolve final fills with precedence: cell-level override > style part > whole-table > built-in default.
@@ -2069,6 +2362,18 @@ function parseTable(
     ...(hasLastCol && lastColFill ? { lastColFill } : {}),
     ...(hasHeader && headerStyleText ? { headerTextColor: headerStyleText } : {}),
     ...(hasFirstCol && firstColText ? { firstColTextColor: firstColText } : {}),
+    ...(anyCellFill ? { cellFills } : {}),
+    ...(anyCellText ? { cellTextColors } : {}),
+    ...(anyCellBorder ? { cellBorders } : {}),
+    ...(anyCellSpan ? { cellSpans } : {}),
+    ...(anyCellRuns ? { cellRuns } : {}),
+    ...(anyCellVAlign ? { cellVAligns } : {}),
+    ...(colWidths.length === (rows[0]?.length ?? 0) && colWidths.length > 0
+      ? { colWidths }
+      : {}),
+    ...(rowHeights.length === rows.length && rowHeights.every((h) => h > 0)
+      ? { rowHeights }
+      : {}),
   };
   return table;
 }
@@ -3151,16 +3456,55 @@ function readAlign(pPr: any): "left" | "center" | "right" | undefined {
   return undefined;
 }
 
+/**
+ * Many brand fonts encode their weight in the family NAME ("Gilroy ExtraBold",
+ * "… Medium", "… Light", "… Semibold"). When that font isn't installed and we
+ * fall back to a generic, the substitute renders at the wrong heaviness unless
+ * we translate the name into a numeric font-weight. Returns undefined when the
+ * name carries no weight hint (caller then uses the bold attribute).
+ */
+function weightFromFamilyName(family?: string): number | undefined {
+  if (!family) return undefined;
+  const f = family.toLowerCase();
+  if (/extra[ -]?light|ultra[ -]?light/.test(f)) return 200;
+  if (/\bthin\b|hairline/.test(f)) return 100;
+  if (/extra[ -]?bold|ultra[ -]?bold/.test(f)) return 800;
+  if (/\bblack\b|\bheavy\b/.test(f)) return 900;
+  if (/semi[ -]?bold|demi[ -]?bold/.test(f)) return 600;
+  if (/\bbold\b/.test(f)) return 700;
+  if (/\bmedium\b/.test(f)) return 500;
+  if (/\blight\b/.test(f)) return 300;
+  return undefined;
+}
+
+/** Effective numeric weight from the family-name hint plus the bold attribute. */
+function effectiveFontWeight(
+  family: string | undefined,
+  bold: boolean | undefined
+): number | undefined {
+  const named = weightFromFamilyName(family);
+  if (named !== undefined) {
+    // A bold attribute can only push a lighter named weight up to bold.
+    return bold && named < 700 ? 700 : named;
+  }
+  if (bold === true) return 700;
+  if (bold === false) return 400;
+  return undefined;
+}
+
 interface RunInfo {
   text: string;
   fontFamily?: string;
   fontSize?: number;
   bold?: boolean;
+  fontWeight?: number;
   italic?: boolean;
   underline?: boolean;
   strike?: boolean;
   color?: string;
   letterSpacing?: number;
+  highlight?: string;
+  cap?: "all" | "small";
 }
 
 interface ParagraphInfo {
@@ -3198,7 +3542,24 @@ function extractRuns(
   const autoNumCounters = new Map<number, number>();
   let prevAutoKey: string | undefined;
 
-  for (let pi = 0; pi < paragraphs.length; pi++) {
+  // PowerPoint draws no visible line for an empty paragraph at the END of a
+  // text body, so drop trailing blank paragraphs (a run with text, a field,
+  // or a hard break counts as content). Leading / interior blanks are kept —
+  // they create real spacing (e.g. a list pushed down from the top).
+  const paragraphHasContent = (p: any): boolean => {
+    if (p?.["a:br"] || p?.["a:fld"]) return true;
+    return asArray(p?.["a:r"]).some((r: any) => {
+      const t = r?.["a:t"];
+      const s = typeof t === "string" ? t : t?.["#text"] ?? "";
+      return String(s).length > 0;
+    });
+  };
+  let lastContentIdx = -1;
+  for (let i = 0; i < paragraphs.length; i++) {
+    if (paragraphHasContent(paragraphs[i])) lastContentIdx = i;
+  }
+
+  for (let pi = 0; pi <= lastContentIdx; pi++) {
     const p = paragraphs[pi];
     const pPr = p?.["a:pPr"];
     const lvl = clampLevel(Number(pPr?.["@_lvl"] ?? 0));
@@ -3262,10 +3623,21 @@ function extractRuns(
     const flds = asArray(p?.["a:fld"]);
     const paraStart = runs.length;
     const paragraphText: string[] = [];
-    if (prefix.text) paragraphText.push(prefix.text);
+    // The bullet prefix is added later, but only when the paragraph actually
+    // has text — PowerPoint shows no bullet glyph on an empty line.
+
+    // `cap="all"`/`cap="small"` is commonly set only on the placeholder's
+    // list-style <a:defRPr>, so resolve it across the level chain when the run
+    // (and its direct fallback) are silent. Inherited along pPr defRPr too.
+    const levelCap = levelChain
+      .map((s) => s?.["a:defRPr"]?.["@_cap"] ?? s?.["@_cap"])
+      .find((v) => v !== undefined);
 
     const onRun = (r: any, isFld: boolean) => {
       const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+      if (!built.run.cap && (levelCap === "all" || levelCap === "small")) {
+        built.run.cap = levelCap;
+      }
       // PowerPoint stores field placeholders as <a:fld type="…"> with a
       // template literal in <a:t> (e.g. "‹#›" for slidenum). The literal is
       // only meant for design-time display; renderers replace it with the
@@ -3305,15 +3677,37 @@ function extractRuns(
     }
 
     // Prepend the bullet prefix to the first run of this paragraph so it
-    // survives renderers that walk `runs` instead of the joined `plain` text.
-    if (prefix.text && runs.length > paraStart) {
+    // survives renderers that walk `runs` instead of the joined `plain` text —
+    // but only when the paragraph carries real text. An empty bulleted line
+    // (template placeholder) shows no bullet in PowerPoint, so leaving the
+    // glyph off keeps lists from sprouting stray ☐ / – markers.
+    const paraHasText = runs
+      .slice(paraStart)
+      .some((r) => r.text.trim().length > 0);
+    if (prefix.text && paraHasText && runs.length > paraStart) {
       runs[paraStart].text = prefix.text + runs[paraStart].text;
+      paragraphText.unshift(prefix.text);
+      // think-cell encodes a multi-item callout as ONE bulleted paragraph with
+      // embedded line breaks ("xa\nxb\nxc"); PowerPoint shows the bullet glyph
+      // on every line. Repeat a *character* bullet after each in-paragraph
+      // break so continuation lines aren't left bullet-less. (Auto-numbered
+      // bullets are skipped — repeating the same number would be wrong.)
+      if (bullet.kind === "char") {
+        for (let ri = paraStart; ri < runs.length; ri++) {
+          runs[ri].text = runs[ri].text.replace(/\n/g, `\n${prefix.text}`);
+        }
+        // Keep the paragraph's flat text in sync with the repeated bullets.
+        const rebuilt = runs.slice(paraStart).map((r) => r.text).join("");
+        paragraphText.length = 0;
+        paragraphText.push(rebuilt);
+      }
     }
 
     // Carry the inter-paragraph break onto the last run we just emitted —
     // renderers that walk `runs` (mixed-formatting path) would otherwise
-    // concatenate paragraphs into one long line.
-    if (pi < paragraphs.length - 1 && runs.length > 0) {
+    // concatenate paragraphs into one long line. Use lastContentIdx (not the
+    // raw count) so the final kept paragraph gets no trailing break.
+    if (pi < lastContentIdx && runs.length > 0) {
       runs[runs.length - 1].text += "\n";
     }
 
@@ -3359,13 +3753,43 @@ interface ResolvedBullet {
   autoStartAt?: number;
 }
 
+/**
+ * Symbol-font bullet glyphs PowerPoint draws via a private code page (Wingdings
+ * etc.) map to nonsense Latin characters when rendered in a normal font — the
+ * classic "ü" instead of a check mark. Translate the common ones to their
+ * Unicode equivalents so they render as intended without the symbol font.
+ */
+const SYMBOL_FONT_RE = /wingdings|webdings|symbol/i;
+const SYMBOL_BULLET_MAP: Record<string, string> = {
+  "ü": "✓", // Wingdings ü → ✓ check mark
+  "ý": "✓", // Wingdings ý → ✓ (boxed check, approximated)
+  "û": "✗", // Wingdings û → ✗ ballot X
+  "þ": "✗", // Wingdings þ → ✗ (boxed X, approximated)
+  "§": "▪", // Wingdings § → ▪ small square
+  "Ø": "→", // Wingdings Ø → → arrow
+  "q": "☐", // Wingdings q → ☐ empty checkbox
+  "r": "☐", // Wingdings r → ☐ (boxed variant, approximated)
+  "R": "☒", // Wingdings R → ☒ checked box
+  "v": "❖", // Wingdings v → ❖ diamond
+};
+
+function mapSymbolBulletChar(char: string, font: string | undefined): string {
+  if (font && SYMBOL_FONT_RE.test(font) && SYMBOL_BULLET_MAP[char]) {
+    return SYMBOL_BULLET_MAP[char];
+  }
+  return char;
+}
+
 function resolveBullet(sources: (any | undefined)[]): ResolvedBullet {
   // First source that defines any of buNone/buChar/buAutoNum wins.
   for (const src of sources) {
     if (!src) continue;
     if (src["a:buNone"] !== undefined) return { kind: "none" };
-    if (src["a:buChar"]?.["@_char"])
-      return { kind: "char", char: String(src["a:buChar"]["@_char"]) };
+    if (src["a:buChar"]?.["@_char"]) {
+      const rawChar = String(src["a:buChar"]["@_char"]);
+      const font = src["a:buFont"]?.["@_typeface"];
+      return { kind: "char", char: mapSymbolBulletChar(rawChar, font) };
+    }
     if (src["a:buAutoNum"]) {
       return {
         kind: "auto",
@@ -3504,10 +3928,16 @@ function buildRunInfo(
   const color =
     resolveColor(rPr?.["a:solidFill"], theme) ??
     resolveColor(fallbackRPr?.["a:solidFill"], theme);
+  // <a:highlight> wraps a colour child (srgbClr/schemeClr) just like a fill,
+  // so resolveColor handles it directly. Rendered as the text background.
+  const highlight =
+    resolveColor(rPr?.["a:highlight"], theme) ??
+    resolveColor(fallbackRPr?.["a:highlight"], theme);
   const boldVal = rPr?.["@_b"] ?? fallbackRPr?.["@_b"];
   const italicVal = rPr?.["@_i"] ?? fallbackRPr?.["@_i"];
   const underlineVal = rPr?.["@_u"] ?? fallbackRPr?.["@_u"];
   const strikeVal = rPr?.["@_strike"] ?? fallbackRPr?.["@_strike"];
+  const capVal = rPr?.["@_cap"] ?? fallbackRPr?.["@_cap"];
   return {
     text,
     run: {
@@ -3515,11 +3945,17 @@ function buildRunInfo(
       fontFamily,
       fontSize,
       bold: boldVal === "1" || boldVal === 1,
+      fontWeight: effectiveFontWeight(
+        fontFamily,
+        boldVal === undefined ? undefined : boldVal === "1" || boldVal === 1
+      ),
       italic: italicVal === "1" || italicVal === 1,
       underline: !!(underlineVal && underlineVal !== "none"),
       strike: strikeVal === "sngStrike",
       color,
       letterSpacing,
+      highlight,
+      cap: capVal === "all" || capVal === "small" ? capVal : undefined,
     },
   };
 }
@@ -3984,6 +4420,64 @@ function buildChevronPath(
 }
 
 /**
+ * Build an SVG path for the cardinal block-arrow presets (down/up/left/right
+ * Arrow). `adj1` sets the shaft thickness and `adj2` the arrowhead length,
+ * both as a fraction of the shorter side (matching the OOXML preset guides).
+ */
+function buildBlockArrowPath(
+  prstGeom: any,
+  preset: string,
+  w: number,
+  h: number,
+  flipH: boolean,
+  flipV: boolean
+): ShapePath {
+  const W = Math.max(1, w);
+  const H = Math.max(1, h);
+  const adjBy = (name: string, fallback: number): number => {
+    const adj = asArray(prstGeom?.["a:avLst"]?.["a:gd"]).find(
+      (g: any) => g?.["@_name"] === name
+    );
+    const fmla: string | undefined = adj?.["@_fmla"];
+    const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
+    return m ? Number(m[1]) : fallback;
+  };
+  const ss = Math.min(W, H);
+  const a1 = Math.max(0, Math.min(100000, adjBy("adj1", 50000)));
+  const a2 = Math.max(0, Math.min(100000, adjBy("adj2", 50000)));
+  const shaftHalf = (ss * a1) / 200000; // half the shaft thickness
+  const headLen = (ss * a2) / 100000; // arrowhead length along the arrow axis
+  let pts: [number, number][];
+  if (preset === "downArrow" || preset === "upArrow") {
+    const x1 = W / 2 - shaftHalf;
+    const x2 = W / 2 + shaftHalf;
+    if (preset === "downArrow") {
+      const y1 = H - headLen;
+      pts = [[x1, 0], [x1, y1], [0, y1], [W / 2, H], [W, y1], [x2, y1], [x2, 0]];
+    } else {
+      const y1 = headLen;
+      pts = [[x1, H], [x1, y1], [0, y1], [W / 2, 0], [W, y1], [x2, y1], [x2, H]];
+    }
+  } else {
+    const y1 = H / 2 - shaftHalf;
+    const y2 = H / 2 + shaftHalf;
+    if (preset === "rightArrow") {
+      const x1 = W - headLen;
+      pts = [[0, y1], [x1, y1], [x1, 0], [W, H / 2], [x1, H], [x1, y2], [0, y2]];
+    } else {
+      const x1 = headLen;
+      pts = [[W, y1], [x1, y1], [x1, 0], [0, H / 2], [x1, H], [x1, y2], [W, y2]];
+    }
+  }
+  const mapped = pts.map(([x, y]) => [flipH ? W - x : x, flipV ? H - y : y]);
+  const d =
+    "M " +
+    mapped.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(" L ") +
+    " Z";
+  return { d, viewW: W, viewH: H };
+}
+
+/**
  * Build an SVG path for the cube preset. `adj` (default 25%) controls the
  * apparent depth — it's a percentage of the shorter side that becomes both
  * the top-face height and the right-face width. The path emits three
@@ -4066,10 +4560,10 @@ function mapPrstToKind(prst?: string): ShapeKind | null {
     case "plus":
     case "cube":
     case "can":
-    case "leftArrow":
-    case "rightArrow":
-    case "upArrow":
-    case "downArrow":
+    // NOTE: the cardinal block arrows (left/right/up/downArrow) are
+    // intentionally NOT mapped here — they get a synthesised arrow `path`
+    // (buildBlockArrowPath) and fall through to the null-kind branch that
+    // attaches it, so they render with their arrowhead instead of as a rect.
     case "leftRightArrow":
     case "upDownArrow":
     case "bentArrow":
