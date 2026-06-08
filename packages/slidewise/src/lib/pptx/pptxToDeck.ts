@@ -22,6 +22,7 @@ import type {
   UnknownElement,
   FontAsset,
   WebFontAsset,
+  ShadowSpec,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
 import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
@@ -811,8 +812,8 @@ async function walkUnderlay(
     registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
     out.push(el);
   };
-  for (const sp of asArray(spTree["p:sp"])) {
-    if (isHiddenNode(sp, "p:nvSpPr")) continue;
+  const handleSp = async (sp: any): Promise<void> => {
+    if (isHiddenNode(sp, "p:nvSpPr")) return;
     const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
     if (ph) {
       const isPicPrompt = ph["@_type"] === "pic";
@@ -823,7 +824,7 @@ async function walkUnderlay(
       // <p:pic> renders instead, and when it's left empty nothing renders.
       // Either way, suppress the layout/master prompt backing — otherwise an
       // unfilled picture placeholder leaks onto the slide as a grey box.
-      if (isPicPrompt) continue;
+      if (isPicPrompt) return;
       // When the slide hosts this placeholder, its fill rides on the
       // slide's text element (TextElement.background) so it stays at the
       // text's z-index. pptxgenjs can't write those fields back though —
@@ -838,7 +839,7 @@ async function walkUnderlay(
         // double-text and geometry-less shapes on re-parse. Accept the
         // backingPath/background loss for now; track in a follow-up that
         // writes raw OOXML for text elements carrying decoration fields.
-        continue;
+        return;
       }
       // Unreferenced placeholders: emit a fill-only backing so coloured
       // boxes (numbered chips, decorative panels) appear. Filler shapes
@@ -846,24 +847,51 @@ async function walkUnderlay(
       // there's no single source element to replay verbatim.
       const filler = await placeholderFillUnderlay(sp, ctx, outer);
       if (filler) out.push(filler);
-      continue;
+      return;
     }
     registerFromNode(sp, await parseSpOrText(sp, ctx, outer, { underlay: true }));
-  }
-  for (const pic of asArray(spTree["p:pic"])) {
-    if (isHiddenNode(pic, "p:nvPicPr")) continue;
+  };
+  const handlePic = async (pic: any): Promise<void> => {
+    if (isHiddenNode(pic, "p:nvPicPr")) return;
     const ph = pic?.["p:nvPicPr"]?.["p:nvPr"]?.["p:ph"];
-    if (ph && slidePhKeys.has(placeholderKey(ph))) continue;
+    if (ph && slidePhKeys.has(placeholderKey(ph))) return;
     registerFromNode(pic, await parsePic(pic, ctx, outer));
-  }
-  for (const cxn of asArray(spTree["p:cxnSp"])) {
+  };
+  const handleCxn = (cxn: any): void => {
     registerFromNode(cxn, parseCxn(cxn, ctx, outer));
-  }
-  for (const grp of asArray(spTree["p:grpSp"])) {
+  };
+  const handleGrp = async (grp: any): Promise<void> => {
     const inner = composeGroupTransform(grp, outer);
-    out.push(
-      ...(await walkUnderlay(grp, ctx, inner, slidePhKeys, slideId))
-    );
+    out.push(...(await walkUnderlay(grp, ctx, inner, slidePhKeys, slideId)));
+  };
+
+  // Walk children in document order. PPTX z-index follows source order, so a
+  // layout that lists its full-slide background <p:pic> before the translucent
+  // gradient <p:sp> drawn over it must keep that order — otherwise the opaque
+  // picture paints on top and hides the gradient (and the slide content above
+  // it). fast-xml-parser groups children by tag, so we rely on the
+  // `_childOrder` annotation; the fallback preserves the legacy tag-grouped
+  // order for hand-built trees (tests) that lack it.
+  const cursors: Record<string, number> = {
+    "p:sp": 0,
+    "p:pic": 0,
+    "p:cxnSp": 0,
+    "p:grpSp": 0,
+  };
+  const order: string[] = (spTree as any)?._childOrder ?? [
+    ...asArray(spTree["p:sp"]).map(() => "p:sp"),
+    ...asArray(spTree["p:pic"]).map(() => "p:pic"),
+    ...asArray(spTree["p:cxnSp"]).map(() => "p:cxnSp"),
+    ...asArray(spTree["p:grpSp"]).map(() => "p:grpSp"),
+  ];
+  for (const tag of order) {
+    if (!(tag in cursors)) continue;
+    const node = asArray((spTree as any)[tag])[cursors[tag]++];
+    if (!node) continue;
+    if (tag === "p:sp") await handleSp(node);
+    else if (tag === "p:pic") await handlePic(node);
+    else if (tag === "p:cxnSp") handleCxn(node);
+    else if (tag === "p:grpSp") await handleGrp(node);
   }
   return out;
 }
@@ -975,6 +1003,13 @@ interface GroupTransform {
   b: number;
   c: number;
   d: number;
+  /**
+   * The enclosing `<p:grpSp>`'s resolved fill, threaded down so descendant
+   * shapes that declare `<a:grpFill/>` ("inherit my fill from the group") can
+   * paint with it. Undefined at the slide root and inside groups that define
+   * no fill of their own. See the `p:grpSp` branch in {@link parseSpTree}.
+   */
+  groupFill?: string;
 }
 
 function identityTransform(): GroupTransform {
@@ -1046,7 +1081,13 @@ async function parseSpTree(
       }
     } else if (tag === "p:grpSp") {
       const inner = composeGroupTransform(node, outer);
-      const children = await parseSpTree(node, ctx, inner);
+      // Resolve this group's own fill so descendant shapes that use
+      // `<a:grpFill/>` (inherit-from-group) can paint with it. A group that
+      // omits a fill inherits the enclosing group's, matching PowerPoint's
+      // walk up the group chain.
+      const groupFill =
+        extractShapeFill(node?.["p:grpSpPr"], ctx.theme) ?? outer.groupFill;
+      const children = await parseSpTree(node, ctx, { ...inner, groupFill });
       if (!children.length) continue;
       const group = buildGroupElement(node, children, ctx, outer);
       // Register the whole `<p:grpSp>` so an unedited group round-trips
@@ -1329,6 +1370,10 @@ async function parseSpOrText(
         : resolveColor(ln?.["a:solidFill"], ctx.theme);
       const lnWidthEmu = !lnNoFill && ln?.["@_w"] ? Number(ln["@_w"]) : undefined;
       if (shapeFill && shapeFill !== "transparent") el.background = shapeFill;
+      // A card that hosts text (e.g. a roundRect "Budgeting" panel) carries its
+      // drop shadow here so the box reads against a same-coloured slide.
+      const cardShadow = parseOuterShadow(sp?.["p:spPr"], ctx.theme, ctx.fit);
+      if (cardShadow) el.shadow = cardShadow;
       if (lnColor) {
         el.borderColor = lnColor;
         el.borderWidth = lnWidthEmu
@@ -1367,9 +1412,16 @@ async function parseSpOrText(
   // it carries the actual art. Resolved to a url("data:…") the renderer
   // paints into the shape (clipped to its custGeom path when present).
   const blipFill = await extractShapeBlipFill(spPr, ctx);
+  // `<a:grpFill/>` means "paint with the enclosing group's fill". The group's
+  // resolved fill is threaded in via `outer.groupFill`; without this the shape
+  // falls through to transparent and disappears (e.g. decorative custGeom
+  // line-art whose every segment inherits one translucent group colour).
+  const grpFill =
+    spPr?.["a:grpFill"] !== undefined ? outer.groupFill : undefined;
   const fillColor =
     blipFill
     ?? extractShapeFill(spPr, ctx.theme)
+    ?? grpFill
     ?? (phSpPr ? extractShapeFill(phSpPr, ctx.theme) : undefined)
     ?? resolveStyleFillRef(sp, ctx)
     ?? "transparent";
@@ -1397,6 +1449,11 @@ async function parseSpOrText(
       ? strokeDashRaw
       : undefined;
 
+  // A soft drop shadow (`<a:outerShdw>`) is often the only thing separating a
+  // card from a same-coloured slide — a white card on a white background. Parse
+  // it so the silhouette survives import.
+  const shadow = parseOuterShadow(spPr, ctx.theme, ctx.fit);
+
   const kind = mapPrstToKind(presetName);
   if (!kind) {
     // Fall back to a rect with the shape's fill so it remains visible at the
@@ -1417,6 +1474,7 @@ async function parseSpOrText(
         : undefined,
       strokeDash,
       ...(customPath ? { path: customPath } : {}),
+      ...(shadow ? { shadow } : {}),
     };
     return fallback;
   }
@@ -1432,6 +1490,10 @@ async function parseSpOrText(
     const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
     const frac = m ? Number(m[1]) / 100000 : 0.16667;
     radius = Math.round(Math.min(geom.w, geom.h) * frac);
+  } else if (presetName === "flowChartTerminator") {
+    // Stadium/pill: the ends are semicircles, so the corner radius is half
+    // the shorter side.
+    radius = Math.round(Math.min(geom.w, geom.h) / 2);
   }
 
   const shape: ShapeElement = {
@@ -1447,8 +1509,39 @@ async function parseSpOrText(
       : undefined,
     strokeDash,
     radius,
+    ...(shadow ? { shadow } : {}),
   };
   return shape;
+}
+
+/**
+ * Parse an explicit `<a:effectLst><a:outerShdw>` drop shadow into a ShadowSpec
+ * (canvas px). Cards commonly rely on a soft shadow to read against a
+ * same-coloured slide (a white card on a white slide); dropping it makes the
+ * card silhouette disappear. Only the explicit effect list is handled here —
+ * theme `<a:effectRef>` styles are not yet resolved.
+ */
+function parseOuterShadow(
+  spPr: any,
+  theme: ThemeColors,
+  fit: Fit
+): ShadowSpec | undefined {
+  const shdw = spPr?.["a:effectLst"]?.["a:outerShdw"];
+  if (!shdw) return undefined;
+  const distEmu = Number(shdw["@_dist"] ?? 0);
+  const blurEmu = Number(shdw["@_blurRad"] ?? 0);
+  // OOXML `dir` is 60000ths of a degree, clockwise from 3 o'clock. cos→x,
+  // sin→y — and canvas y grows downward, matching OOXML's downward-positive
+  // direction, so a 90° (=5400000) shadow falls straight below the shape.
+  const rad = (Number(shdw["@_dir"] ?? 0) / 60000) * (Math.PI / 180);
+  const distPx = emuToPx(distEmu) * fit.scale;
+  const color = resolveColor(shdw, theme) ?? "#000000";
+  return {
+    color,
+    blur: Math.round(emuToPx(blurEmu) * fit.scale),
+    offsetX: Math.round(distPx * Math.cos(rad)),
+    offsetY: Math.round(distPx * Math.sin(rad)),
+  };
 }
 
 function makeTextElement(
@@ -1530,6 +1623,13 @@ function makeTextElement(
   );
   const bodyPrForWrap = effectiveTxBody?.["a:bodyPr"] ?? fallbackBodyPr;
 
+  // A shape's <p:style><a:fontRef> carries the colour PowerPoint paints text
+  // with when the run is silent (e.g. a card whose label is `lt1`/white). For a
+  // non-placeholder shape it outranks the master's generic text default; for a
+  // placeholder it's only the last resort below the placeholder's own colour.
+  const styleColor = resolveColor(sp?.["p:style"]?.["a:fontRef"], ctx.theme);
+  const styleColorBeatsFallback = !ph;
+
   const text = extractRuns(
     effectiveTxBody,
     ctx.theme,
@@ -1538,7 +1638,9 @@ function makeTextElement(
     ctx.themeFonts,
     listStyle,
     autoFit,
-    ctx.slideNumber
+    ctx.slideNumber,
+    styleColor,
+    styleColorBeatsFallback
   );
   const first = text.runs[0];
   // Each layer of the inheritance chain may set @algn independently — a
@@ -3290,6 +3392,21 @@ function clampPct(v: number): number {
   return v;
 }
 
+/**
+ * A text run/paragraph gradient fill (`<a:gradFill>` inside `<a:rPr>`) as a CSS
+ * gradient string, reusing the shape-fill gradient builder. PowerPoint paints
+ * the gradient across the glyphs (e.g. a multi-colour title word); the renderer
+ * maps this onto `background-clip: text`. Without this, a gradient-filled run
+ * has no `<a:solidFill>` and resolves to the default text colour — black, which
+ * vanishes on a dark slide. Returns undefined when the node is absent or yields
+ * no usable (non-transparent) stops.
+ */
+function gradientTextFillCss(node: any, theme: ThemeColors): string | undefined {
+  if (!node) return undefined;
+  const css = extractShapeFill({ "a:gradFill": node }, theme);
+  return css && css !== "transparent" ? css : undefined;
+}
+
 async function extractBackground(
   bg: any,
   ctx: ParseContext,
@@ -3549,7 +3666,9 @@ function extractRuns(
   themeFonts: ThemeFonts = {},
   listStyle: (any | undefined)[][] = [],
   autoFit?: AutoFit,
-  slideNumber?: number
+  slideNumber?: number,
+  styleColor?: string,
+  styleColorBeatsFallback?: boolean
 ): {
   runs: RunInfo[];
   plain: string;
@@ -3658,7 +3777,14 @@ function extractRuns(
       .find((v) => v !== undefined);
 
     const onRun = (r: any, isFld: boolean) => {
-      const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+      const built = buildRunInfo(
+        r,
+        theme,
+        themeFonts,
+        fallbackRPr,
+        styleColor,
+        styleColorBeatsFallback
+      );
       if (!built.run.cap && (levelCap === "all" || levelCap === "small")) {
         built.run.cap = levelCap;
       }
@@ -3931,7 +4057,9 @@ function buildRunInfo(
   r: any,
   theme: ThemeColors,
   themeFonts: ThemeFonts,
-  fallbackRPr: any
+  fallbackRPr: any,
+  styleColor?: string,
+  styleColorBeatsFallback?: boolean
 ): { run: RunInfo; text: string } {
   const t = r?.["a:t"];
   const rPr = r?.["a:rPr"] ?? {};
@@ -3949,9 +4077,22 @@ function buildRunInfo(
     rPr?.["a:latin"]?.["@_typeface"] ??
     fallbackRPr?.["a:latin"]?.["@_typeface"];
   const fontFamily = resolveFontFamily(rawFontFamily, themeFonts);
+  // The run's own fill — solid OR gradient — wins over the inherited default.
+  // Checking the inherited solidFill before the run's own gradFill would paint
+  // a gradient-filled word with the placeholder's (often black) default colour.
+  // A shape's <p:style><a:fontRef> supplies the text colour PowerPoint paints
+  // when the run sets none — e.g. a card whose fontRef is `lt1` (white) so its
+  // label reads against the fill. For a NON-placeholder shape the fontRef is
+  // the authoritative base colour and outranks the master's generic
+  // "otherStyle" default (`styleColorBeatsFallback`); for a placeholder it's
+  // only the last resort, below the placeholder's inherited colour.
   const color =
     resolveColor(rPr?.["a:solidFill"], theme) ??
-    resolveColor(fallbackRPr?.["a:solidFill"], theme);
+    gradientTextFillCss(rPr?.["a:gradFill"], theme) ??
+    (styleColorBeatsFallback ? styleColor : undefined) ??
+    resolveColor(fallbackRPr?.["a:solidFill"], theme) ??
+    gradientTextFillCss(fallbackRPr?.["a:gradFill"], theme) ??
+    styleColor;
   // <a:highlight> wraps a colour child (srgbClr/schemeClr) just like a fill,
   // so resolveColor handles it directly. Rendered as the text background.
   const highlight =
@@ -4597,9 +4738,13 @@ function mapPrstToKind(prst?: string): ShapeKind | null {
     case "callout3":
     case "wedgeRectCallout":
     case "wedgeRoundRectCallout":
+    // flowChartTerminator is a stadium/pill (rectangle with fully rounded
+    // ends) — a common "Learn More" button shape. Map it to a rounded rect;
+    // the radius branch below makes the ends semicircular.
+    case "flowChartTerminator":
+      return "rounded";
     case "flowChartProcess":
     case "flowChartDecision":
-    case "flowChartTerminator":
     case "flowChartConnector":
       return "rect";
     default:

@@ -311,6 +311,26 @@ function extractSolidColor(fill: string | undefined): string {
   return "#FFFFFF";
 }
 
+/**
+ * pptxgenjs renders text in a single solid colour. When a text colour is a CSS
+ * gradient (imported from a gradient-filled run), pick a representative stop so
+ * an *edited* gradient run still exports a valid colour instead of emitting the
+ * gradient string as a bogus hex. Unedited runs keep their true gradient — they
+ * round-trip verbatim via the source XML and never reach this synth path.
+ */
+function solidTextColor(color: string): string {
+  const parsed = parseFill(color);
+  if (
+    parsed &&
+    (parsed.kind === "linear" || parsed.kind === "radial") &&
+    parsed.stops.length
+  ) {
+    const mid = parsed.stops[Math.floor(parsed.stops.length / 2)];
+    return hexNoHash(mid.color);
+  }
+  return hexNoHash(color);
+}
+
 function geometry(el: SlideElement): {
   x: number;
   y: number;
@@ -354,7 +374,7 @@ function addText(
     fontFace: el.fontFamily,
     objectName: el.shadow || el.glow ? slidewiseShapeName(el.id) : undefined,
     fontSize: pxToPoints(el.fontSize),
-    color: hexNoHash(el.color),
+    color: solidTextColor(el.color),
     bold: el.fontWeight >= 600,
     italic: el.italic,
     underline: el.underline ? ({ style: "sng" } as const) : undefined,
@@ -388,7 +408,7 @@ function addText(
         options: {
           fontFace: r.fontFamily ?? el.fontFamily,
           fontSize: pxToPoints(r.fontSize ?? el.fontSize),
-          color: hexNoHash(r.color ?? el.color),
+          color: solidTextColor(r.color ?? el.color),
           bold: (r.fontWeight ?? el.fontWeight) >= 600,
           italic: r.italic ?? el.italic,
           underline: (r.underline ?? el.underline)

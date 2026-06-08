@@ -49,35 +49,67 @@ const SYSTEM_FAMILIES = new Set(
 const STYLESHEET_ID_PREFIX = "slidewise-google-fonts-";
 
 export function collectFontFamilies(deck: Deck): string[] {
-  const families = new Set<string>();
-  for (const slide of deck.slides) {
-    for (const el of slide.elements) {
+  return [...collectFontUsage(deck).keys()];
+}
+
+/**
+ * Collect each text family together with the numeric weights the deck actually
+ * uses (recursing into groups). Drives the Google Fonts request so it loads the
+ * REAL weight faces. Without per-weight requests, `family=Montserrat` returns
+ * only the 400 face, and a bold (700) title renders thin — there's no bold face
+ * to bind to and synthetic bold doesn't match the genuine weight.
+ */
+export function collectFontUsage(deck: Deck): Map<string, Set<number>> {
+  const usage = new Map<string, Set<number>>();
+  const add = (family: string | undefined, weight: number | undefined) => {
+    if (!family) return;
+    let set = usage.get(family);
+    if (!set) {
+      set = new Set<number>();
+      usage.set(family, set);
+    }
+    set.add(typeof weight === "number" && Number.isFinite(weight) ? weight : 400);
+  };
+  const visit = (els: any[]) => {
+    for (const el of els) {
+      if (el.type === "group" && Array.isArray(el.children)) {
+        visit(el.children);
+        continue;
+      }
       if (el.type !== "text") continue;
       const t = el as TextElement;
-      if (t.fontFamily) families.add(t.fontFamily);
-      if (t.runs) {
-        for (const r of t.runs) {
-          if (r.fontFamily) families.add(r.fontFamily);
-        }
+      add(t.fontFamily, t.fontWeight);
+      for (const r of t.runs ?? []) {
+        add(r.fontFamily ?? t.fontFamily, r.fontWeight ?? t.fontWeight);
       }
     }
-  }
-  return [...families];
+  };
+  for (const slide of deck.slides) visit(slide.elements as any[]);
+  return usage;
 }
 
 export function buildGoogleFontsHref(
-  families: string[],
+  usage: Map<string, Set<number>>,
   excluded: Set<string> = new Set()
 ): string | null {
-  const candidates = families
-    .map((f) => f.trim())
-    .filter((f) => f.length > 0)
-    .filter((f) => !SYSTEM_FAMILIES.has(f.toLowerCase()))
-    .filter((f) => !excluded.has(f.toLowerCase()));
-  if (!candidates.length) return null;
-  // Google's css2 endpoint accepts `family=Name+With+Spaces` repeated.
-  const params = candidates
-    .map((f) => `family=${encodeURIComponent(f).replace(/%20/g, "+")}`)
+  const entries = [...usage.entries()]
+    .map(([f, w]) => [f.trim(), w] as const)
+    .filter(([f]) => f.length > 0)
+    .filter(([f]) => !SYSTEM_FAMILIES.has(f.toLowerCase()))
+    .filter(([f]) => !excluded.has(f.toLowerCase()));
+  if (!entries.length) return null;
+  // css2 `family=Name:wght@w1;w2;…` — weights MUST be ascending. Always include
+  // 400 so the regular face is present even when the deck only uses bold. We
+  // request only the weights the deck uses (rather than a blanket 100–900) so a
+  // font that lacks some weight doesn't 400 the whole request.
+  const params = entries
+    .map(([f, weights]) => {
+      const ws = [...new Set<number>([400, ...weights])]
+        .filter((w) => w >= 1 && w <= 1000)
+        .sort((a, b) => a - b);
+      const name = encodeURIComponent(f).replace(/%20/g, "+");
+      return `family=${name}:wght@${ws.join(";")}`;
+    })
     .join("&");
   return `https://fonts.googleapis.com/css2?${params}&display=swap`;
 }
@@ -89,13 +121,13 @@ export function buildGoogleFontsHref(
  */
 export function ensureGoogleFontsLoaded(
   instanceId: string,
-  families: string[],
+  usage: Map<string, Set<number>>,
   excludedFamilies: Set<string> = new Set()
 ): () => void {
   if (typeof document === "undefined") return () => {};
   const id = STYLESHEET_ID_PREFIX + instanceId;
   const existing = document.getElementById(id) as HTMLLinkElement | null;
-  const href = buildGoogleFontsHref(families, excludedFamilies);
+  const href = buildGoogleFontsHref(usage, excludedFamilies);
   if (!href) {
     if (existing) existing.remove();
     return () => {};
