@@ -16,7 +16,7 @@ import {
   useEditorStore,
 } from "@/lib/StoreProvider";
 import {
-  collectFontFamilies,
+  collectFontUsage,
   ensureGoogleFontsLoaded,
   ensureWebFontsLoaded,
   resolveWebFonts,
@@ -406,7 +406,7 @@ function RootInner({
     const excluded = googleFontExclusions(store.getState().deck, resolved);
     ensureGoogleFontsLoaded(
       instanceId,
-      collectFontFamilies(store.getState().deck),
+      collectFontUsage(store.getState().deck),
       excluded
     );
   }, [fontRegistry, instanceId, store]);
@@ -419,7 +419,7 @@ function RootInner({
     const excluded = googleFontExclusions(store.getState().deck, resolved);
     ensureGoogleFontsLoaded(
       instanceId,
-      collectFontFamilies(store.getState().deck),
+      collectFontUsage(store.getState().deck),
       excluded
     );
     ensureWebFontsLoaded(instanceId, resolved);
@@ -477,7 +477,7 @@ function RootInner({
       const excluded = googleFontExclusions(store.getState().deck, resolved);
       ensureGoogleFontsLoaded(
         instanceId,
-        collectFontFamilies(state.deck),
+        collectFontUsage(state.deck),
         excluded
       );
       ensureWebFontsLoaded(instanceId, resolved);
@@ -486,7 +486,7 @@ function RootInner({
 
   useEffect(() => {
     return () => {
-      ensureGoogleFontsLoaded(instanceId, []);
+      ensureGoogleFontsLoaded(instanceId, new Map());
       ensureWebFontsLoaded(instanceId, []);
     };
   }, [instanceId]);
