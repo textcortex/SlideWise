@@ -1463,6 +1463,10 @@ async function parseSpOrText(
     const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
     const frac = m ? Number(m[1]) / 100000 : 0.16667;
     radius = Math.round(Math.min(geom.w, geom.h) * frac);
+  } else if (presetName === "flowChartTerminator") {
+    // Stadium/pill: the ends are semicircles, so the corner radius is half
+    // the shorter side.
+    radius = Math.round(Math.min(geom.w, geom.h) / 2);
   }
 
   const shape: ShapeElement = {
@@ -4707,9 +4711,13 @@ function mapPrstToKind(prst?: string): ShapeKind | null {
     case "callout3":
     case "wedgeRectCallout":
     case "wedgeRoundRectCallout":
+    // flowChartTerminator is a stadium/pill (rectangle with fully rounded
+    // ends) — a common "Learn More" button shape. Map it to a rounded rect;
+    // the radius branch below makes the ends semicircular.
+    case "flowChartTerminator":
+      return "rounded";
     case "flowChartProcess":
     case "flowChartDecision":
-    case "flowChartTerminator":
     case "flowChartConnector":
       return "rect";
     default:
