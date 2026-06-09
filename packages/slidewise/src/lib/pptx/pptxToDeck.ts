@@ -975,6 +975,13 @@ interface GroupTransform {
   b: number;
   c: number;
   d: number;
+  /**
+   * The enclosing `<p:grpSp>`'s resolved fill, threaded down so descendant
+   * shapes that declare `<a:grpFill/>` ("inherit my fill from the group") can
+   * paint with it. Undefined at the slide root and inside groups that define
+   * no fill of their own. See the `p:grpSp` branch in {@link parseSpTree}.
+   */
+  groupFill?: string;
 }
 
 function identityTransform(): GroupTransform {
@@ -1046,7 +1053,13 @@ async function parseSpTree(
       }
     } else if (tag === "p:grpSp") {
       const inner = composeGroupTransform(node, outer);
-      const children = await parseSpTree(node, ctx, inner);
+      // Resolve this group's own fill so descendant shapes that use
+      // `<a:grpFill/>` (inherit-from-group) can paint with it. A group that
+      // omits a fill inherits the enclosing group's, matching PowerPoint's
+      // walk up the group chain.
+      const groupFill =
+        extractShapeFill(node?.["p:grpSpPr"], ctx.theme) ?? outer.groupFill;
+      const children = await parseSpTree(node, ctx, { ...inner, groupFill });
       if (!children.length) continue;
       const group = buildGroupElement(node, children, ctx, outer);
       // Register the whole `<p:grpSp>` so an unedited group round-trips
@@ -1367,9 +1380,16 @@ async function parseSpOrText(
   // it carries the actual art. Resolved to a url("data:…") the renderer
   // paints into the shape (clipped to its custGeom path when present).
   const blipFill = await extractShapeBlipFill(spPr, ctx);
+  // `<a:grpFill/>` means "paint with the enclosing group's fill". The group's
+  // resolved fill is threaded in via `outer.groupFill`; without this the shape
+  // falls through to transparent and disappears (e.g. decorative custGeom
+  // line-art whose every segment inherits one translucent group colour).
+  const grpFill =
+    spPr?.["a:grpFill"] !== undefined ? outer.groupFill : undefined;
   const fillColor =
     blipFill
     ?? extractShapeFill(spPr, ctx.theme)
+    ?? grpFill
     ?? (phSpPr ? extractShapeFill(phSpPr, ctx.theme) : undefined)
     ?? resolveStyleFillRef(sp, ctx)
     ?? "transparent";
