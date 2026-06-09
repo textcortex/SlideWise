@@ -812,8 +812,8 @@ async function walkUnderlay(
     registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
     out.push(el);
   };
-  for (const sp of asArray(spTree["p:sp"])) {
-    if (isHiddenNode(sp, "p:nvSpPr")) continue;
+  const handleSp = async (sp: any): Promise<void> => {
+    if (isHiddenNode(sp, "p:nvSpPr")) return;
     const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
     if (ph) {
       const isPicPrompt = ph["@_type"] === "pic";
@@ -824,7 +824,7 @@ async function walkUnderlay(
       // <p:pic> renders instead, and when it's left empty nothing renders.
       // Either way, suppress the layout/master prompt backing — otherwise an
       // unfilled picture placeholder leaks onto the slide as a grey box.
-      if (isPicPrompt) continue;
+      if (isPicPrompt) return;
       // When the slide hosts this placeholder, its fill rides on the
       // slide's text element (TextElement.background) so it stays at the
       // text's z-index. pptxgenjs can't write those fields back though —
@@ -839,7 +839,7 @@ async function walkUnderlay(
         // double-text and geometry-less shapes on re-parse. Accept the
         // backingPath/background loss for now; track in a follow-up that
         // writes raw OOXML for text elements carrying decoration fields.
-        continue;
+        return;
       }
       // Unreferenced placeholders: emit a fill-only backing so coloured
       // boxes (numbered chips, decorative panels) appear. Filler shapes
@@ -847,24 +847,51 @@ async function walkUnderlay(
       // there's no single source element to replay verbatim.
       const filler = await placeholderFillUnderlay(sp, ctx, outer);
       if (filler) out.push(filler);
-      continue;
+      return;
     }
     registerFromNode(sp, await parseSpOrText(sp, ctx, outer, { underlay: true }));
-  }
-  for (const pic of asArray(spTree["p:pic"])) {
-    if (isHiddenNode(pic, "p:nvPicPr")) continue;
+  };
+  const handlePic = async (pic: any): Promise<void> => {
+    if (isHiddenNode(pic, "p:nvPicPr")) return;
     const ph = pic?.["p:nvPicPr"]?.["p:nvPr"]?.["p:ph"];
-    if (ph && slidePhKeys.has(placeholderKey(ph))) continue;
+    if (ph && slidePhKeys.has(placeholderKey(ph))) return;
     registerFromNode(pic, await parsePic(pic, ctx, outer));
-  }
-  for (const cxn of asArray(spTree["p:cxnSp"])) {
+  };
+  const handleCxn = (cxn: any): void => {
     registerFromNode(cxn, parseCxn(cxn, ctx, outer));
-  }
-  for (const grp of asArray(spTree["p:grpSp"])) {
+  };
+  const handleGrp = async (grp: any): Promise<void> => {
     const inner = composeGroupTransform(grp, outer);
-    out.push(
-      ...(await walkUnderlay(grp, ctx, inner, slidePhKeys, slideId))
-    );
+    out.push(...(await walkUnderlay(grp, ctx, inner, slidePhKeys, slideId)));
+  };
+
+  // Walk children in document order. PPTX z-index follows source order, so a
+  // layout that lists its full-slide background <p:pic> before the translucent
+  // gradient <p:sp> drawn over it must keep that order — otherwise the opaque
+  // picture paints on top and hides the gradient (and the slide content above
+  // it). fast-xml-parser groups children by tag, so we rely on the
+  // `_childOrder` annotation; the fallback preserves the legacy tag-grouped
+  // order for hand-built trees (tests) that lack it.
+  const cursors: Record<string, number> = {
+    "p:sp": 0,
+    "p:pic": 0,
+    "p:cxnSp": 0,
+    "p:grpSp": 0,
+  };
+  const order: string[] = (spTree as any)?._childOrder ?? [
+    ...asArray(spTree["p:sp"]).map(() => "p:sp"),
+    ...asArray(spTree["p:pic"]).map(() => "p:pic"),
+    ...asArray(spTree["p:cxnSp"]).map(() => "p:cxnSp"),
+    ...asArray(spTree["p:grpSp"]).map(() => "p:grpSp"),
+  ];
+  for (const tag of order) {
+    if (!(tag in cursors)) continue;
+    const node = asArray((spTree as any)[tag])[cursors[tag]++];
+    if (!node) continue;
+    if (tag === "p:sp") await handleSp(node);
+    else if (tag === "p:pic") await handlePic(node);
+    else if (tag === "p:cxnSp") handleCxn(node);
+    else if (tag === "p:grpSp") await handleGrp(node);
   }
   return out;
 }
@@ -1463,6 +1490,10 @@ async function parseSpOrText(
     const m = typeof fmla === "string" ? /val\s+(-?\d+)/.exec(fmla) : null;
     const frac = m ? Number(m[1]) / 100000 : 0.16667;
     radius = Math.round(Math.min(geom.w, geom.h) * frac);
+  } else if (presetName === "flowChartTerminator") {
+    // Stadium/pill: the ends are semicircles, so the corner radius is half
+    // the shorter side.
+    radius = Math.round(Math.min(geom.w, geom.h) / 2);
   }
 
   const shape: ShapeElement = {
@@ -4707,9 +4738,13 @@ function mapPrstToKind(prst?: string): ShapeKind | null {
     case "callout3":
     case "wedgeRectCallout":
     case "wedgeRoundRectCallout":
+    // flowChartTerminator is a stadium/pill (rectangle with fully rounded
+    // ends) — a common "Learn More" button shape. Map it to a rounded rect;
+    // the radius branch below makes the ends semicircular.
+    case "flowChartTerminator":
+      return "rounded";
     case "flowChartProcess":
     case "flowChartDecision":
-    case "flowChartTerminator":
     case "flowChartConnector":
       return "rect";
     default:
