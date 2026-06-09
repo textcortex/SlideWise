@@ -135,6 +135,10 @@ function TextView({
           ? "center"
           : "flex-end",
     background: el.background,
+    // A drop shadow on a text box that paints a background belongs to the card
+    // (box-shadow). Plain text boxes apply the shadow to their glyphs instead
+    // (text-shadow on the inner block, below).
+    ...(el.background ? effectStyle(el.shadow, el.glow, "box") : {}),
     // Border / radius for a text-bearing preset shape (e.g. roundRect callout).
     border: el.borderColor
       ? `${el.borderWidth ?? 1}px solid ${el.borderColor}`
@@ -148,8 +152,9 @@ function TextView({
   };
   const inner: React.CSSProperties = {
     width: "100%",
-    color: el.color,
-    ...effectStyle(el.shadow, el.glow, "text"),
+    // Glyph shadow only for a plain text box — a card-backed box puts the
+    // shadow on its outer background box (above) so the whole card casts it.
+    ...(el.background ? {} : effectStyle(el.shadow, el.glow, "text")),
     fontFamily: withGenericFallback(el.fontFamily),
     fontSize: el.fontSize,
     fontWeight: el.fontWeight,
@@ -164,6 +169,10 @@ function TextView({
     wordBreak: el.noWrap ? "normal" : "break-word",
     outline: "none",
   };
+  // el.color may be a solid hex or a CSS gradient (gradient-filled text). When
+  // it's a gradient the whole box's glyphs share one gradient; per-run colours
+  // (rendered as child spans) override it below.
+  applyTextFill(inner, el.color);
 
   const backingPath = el.backingPath;
   const positionedOuter: React.CSSProperties = backingPath
@@ -331,12 +340,37 @@ function splitRunsByNewline(runs: TextRun[]): TextRun[][] {
   return lines;
 }
 
+/**
+ * Apply a text colour that may be a solid hex OR a CSS gradient string (the
+ * PPTX importer emits `linear-gradient(...)`/`radial-gradient(...)` for
+ * gradient-filled runs). A gradient can't be a `color` value, so paint it as a
+ * background clipped to the glyphs and make the fill transparent — the standard
+ * gradient-text technique.
+ */
+function applyTextFill(s: React.CSSProperties, color: string): void {
+  if (
+    color.startsWith("linear-gradient(") ||
+    color.startsWith("radial-gradient(")
+  ) {
+    s.backgroundImage = color;
+    s.WebkitBackgroundClip = "text";
+    s.backgroundClip = "text";
+    s.color = "transparent";
+    s.WebkitTextFillColor = "transparent";
+  } else {
+    s.color = color;
+    // -webkit-text-fill-color is inherited, so a solid run nested in a
+    // gradient-filled box would otherwise stay transparent. Re-assert it.
+    s.WebkitTextFillColor = color;
+  }
+}
+
 function runCssStyle(r: TextRun): React.CSSProperties {
   const s: React.CSSProperties = {};
   if (r.fontFamily) s.fontFamily = withGenericFallback(r.fontFamily);
   if (r.fontSize) s.fontSize = r.fontSize;
   if (r.fontWeight) s.fontWeight = r.fontWeight;
-  if (r.color) s.color = r.color;
+  if (r.color) applyTextFill(s, r.color);
   if (r.highlight) {
     s.backgroundColor = r.highlight;
     // Keep the highlight painted continuously across wrapped lines.

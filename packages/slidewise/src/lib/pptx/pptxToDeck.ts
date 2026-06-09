@@ -22,6 +22,7 @@ import type {
   UnknownElement,
   FontAsset,
   WebFontAsset,
+  ShadowSpec,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
 import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
@@ -1342,6 +1343,10 @@ async function parseSpOrText(
         : resolveColor(ln?.["a:solidFill"], ctx.theme);
       const lnWidthEmu = !lnNoFill && ln?.["@_w"] ? Number(ln["@_w"]) : undefined;
       if (shapeFill && shapeFill !== "transparent") el.background = shapeFill;
+      // A card that hosts text (e.g. a roundRect "Budgeting" panel) carries its
+      // drop shadow here so the box reads against a same-coloured slide.
+      const cardShadow = parseOuterShadow(sp?.["p:spPr"], ctx.theme, ctx.fit);
+      if (cardShadow) el.shadow = cardShadow;
       if (lnColor) {
         el.borderColor = lnColor;
         el.borderWidth = lnWidthEmu
@@ -1417,6 +1422,11 @@ async function parseSpOrText(
       ? strokeDashRaw
       : undefined;
 
+  // A soft drop shadow (`<a:outerShdw>`) is often the only thing separating a
+  // card from a same-coloured slide — a white card on a white background. Parse
+  // it so the silhouette survives import.
+  const shadow = parseOuterShadow(spPr, ctx.theme, ctx.fit);
+
   const kind = mapPrstToKind(presetName);
   if (!kind) {
     // Fall back to a rect with the shape's fill so it remains visible at the
@@ -1437,6 +1447,7 @@ async function parseSpOrText(
         : undefined,
       strokeDash,
       ...(customPath ? { path: customPath } : {}),
+      ...(shadow ? { shadow } : {}),
     };
     return fallback;
   }
@@ -1467,8 +1478,39 @@ async function parseSpOrText(
       : undefined,
     strokeDash,
     radius,
+    ...(shadow ? { shadow } : {}),
   };
   return shape;
+}
+
+/**
+ * Parse an explicit `<a:effectLst><a:outerShdw>` drop shadow into a ShadowSpec
+ * (canvas px). Cards commonly rely on a soft shadow to read against a
+ * same-coloured slide (a white card on a white slide); dropping it makes the
+ * card silhouette disappear. Only the explicit effect list is handled here —
+ * theme `<a:effectRef>` styles are not yet resolved.
+ */
+function parseOuterShadow(
+  spPr: any,
+  theme: ThemeColors,
+  fit: Fit
+): ShadowSpec | undefined {
+  const shdw = spPr?.["a:effectLst"]?.["a:outerShdw"];
+  if (!shdw) return undefined;
+  const distEmu = Number(shdw["@_dist"] ?? 0);
+  const blurEmu = Number(shdw["@_blurRad"] ?? 0);
+  // OOXML `dir` is 60000ths of a degree, clockwise from 3 o'clock. cos→x,
+  // sin→y — and canvas y grows downward, matching OOXML's downward-positive
+  // direction, so a 90° (=5400000) shadow falls straight below the shape.
+  const rad = (Number(shdw["@_dir"] ?? 0) / 60000) * (Math.PI / 180);
+  const distPx = emuToPx(distEmu) * fit.scale;
+  const color = resolveColor(shdw, theme) ?? "#000000";
+  return {
+    color,
+    blur: Math.round(emuToPx(blurEmu) * fit.scale),
+    offsetX: Math.round(distPx * Math.cos(rad)),
+    offsetY: Math.round(distPx * Math.sin(rad)),
+  };
 }
 
 function makeTextElement(
@@ -1550,6 +1592,13 @@ function makeTextElement(
   );
   const bodyPrForWrap = effectiveTxBody?.["a:bodyPr"] ?? fallbackBodyPr;
 
+  // A shape's <p:style><a:fontRef> carries the colour PowerPoint paints text
+  // with when the run is silent (e.g. a card whose label is `lt1`/white). For a
+  // non-placeholder shape it outranks the master's generic text default; for a
+  // placeholder it's only the last resort below the placeholder's own colour.
+  const styleColor = resolveColor(sp?.["p:style"]?.["a:fontRef"], ctx.theme);
+  const styleColorBeatsFallback = !ph;
+
   const text = extractRuns(
     effectiveTxBody,
     ctx.theme,
@@ -1558,7 +1607,9 @@ function makeTextElement(
     ctx.themeFonts,
     listStyle,
     autoFit,
-    ctx.slideNumber
+    ctx.slideNumber,
+    styleColor,
+    styleColorBeatsFallback
   );
   const first = text.runs[0];
   // Each layer of the inheritance chain may set @algn independently — a
@@ -3310,6 +3361,21 @@ function clampPct(v: number): number {
   return v;
 }
 
+/**
+ * A text run/paragraph gradient fill (`<a:gradFill>` inside `<a:rPr>`) as a CSS
+ * gradient string, reusing the shape-fill gradient builder. PowerPoint paints
+ * the gradient across the glyphs (e.g. a multi-colour title word); the renderer
+ * maps this onto `background-clip: text`. Without this, a gradient-filled run
+ * has no `<a:solidFill>` and resolves to the default text colour — black, which
+ * vanishes on a dark slide. Returns undefined when the node is absent or yields
+ * no usable (non-transparent) stops.
+ */
+function gradientTextFillCss(node: any, theme: ThemeColors): string | undefined {
+  if (!node) return undefined;
+  const css = extractShapeFill({ "a:gradFill": node }, theme);
+  return css && css !== "transparent" ? css : undefined;
+}
+
 async function extractBackground(
   bg: any,
   ctx: ParseContext,
@@ -3569,7 +3635,9 @@ function extractRuns(
   themeFonts: ThemeFonts = {},
   listStyle: (any | undefined)[][] = [],
   autoFit?: AutoFit,
-  slideNumber?: number
+  slideNumber?: number,
+  styleColor?: string,
+  styleColorBeatsFallback?: boolean
 ): {
   runs: RunInfo[];
   plain: string;
@@ -3678,7 +3746,14 @@ function extractRuns(
       .find((v) => v !== undefined);
 
     const onRun = (r: any, isFld: boolean) => {
-      const built = buildRunInfo(r, theme, themeFonts, fallbackRPr);
+      const built = buildRunInfo(
+        r,
+        theme,
+        themeFonts,
+        fallbackRPr,
+        styleColor,
+        styleColorBeatsFallback
+      );
       if (!built.run.cap && (levelCap === "all" || levelCap === "small")) {
         built.run.cap = levelCap;
       }
@@ -3951,7 +4026,9 @@ function buildRunInfo(
   r: any,
   theme: ThemeColors,
   themeFonts: ThemeFonts,
-  fallbackRPr: any
+  fallbackRPr: any,
+  styleColor?: string,
+  styleColorBeatsFallback?: boolean
 ): { run: RunInfo; text: string } {
   const t = r?.["a:t"];
   const rPr = r?.["a:rPr"] ?? {};
@@ -3969,9 +4046,22 @@ function buildRunInfo(
     rPr?.["a:latin"]?.["@_typeface"] ??
     fallbackRPr?.["a:latin"]?.["@_typeface"];
   const fontFamily = resolveFontFamily(rawFontFamily, themeFonts);
+  // The run's own fill — solid OR gradient — wins over the inherited default.
+  // Checking the inherited solidFill before the run's own gradFill would paint
+  // a gradient-filled word with the placeholder's (often black) default colour.
+  // A shape's <p:style><a:fontRef> supplies the text colour PowerPoint paints
+  // when the run sets none — e.g. a card whose fontRef is `lt1` (white) so its
+  // label reads against the fill. For a NON-placeholder shape the fontRef is
+  // the authoritative base colour and outranks the master's generic
+  // "otherStyle" default (`styleColorBeatsFallback`); for a placeholder it's
+  // only the last resort, below the placeholder's inherited colour.
   const color =
     resolveColor(rPr?.["a:solidFill"], theme) ??
-    resolveColor(fallbackRPr?.["a:solidFill"], theme);
+    gradientTextFillCss(rPr?.["a:gradFill"], theme) ??
+    (styleColorBeatsFallback ? styleColor : undefined) ??
+    resolveColor(fallbackRPr?.["a:solidFill"], theme) ??
+    gradientTextFillCss(fallbackRPr?.["a:gradFill"], theme) ??
+    styleColor;
   // <a:highlight> wraps a colour child (srgbClr/schemeClr) just like a fill,
   // so resolveColor handles it directly. Rendered as the text background.
   const highlight =
