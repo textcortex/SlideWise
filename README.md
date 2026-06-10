@@ -138,7 +138,10 @@ const deck = await parsePptx(blob);
 //    structured (not a string) so you can trim it to your context budget.
 //    For large templates (e.g. 85 layouts) pass options:
 //      summarizeLayouts(deck, { compact: true })  // { id, name?, role, fillable }, no geometry
-//      summarizeLayouts(deck, { dedupe: true })   // collapse same role+fillable; others → `aliases`
+//      summarizeLayouts(deck, { dedupe: true })   // collapse layouts with the same role + full
+//                                                  // slot inventory (text AND chart/image/table);
+//                                                  // others → `aliases`. A chart-bearing layout
+//                                                  // never collapses into a text-only twin.
 //      summarizeLayouts(deck, { compact: true, dedupe: true })  // both
 const menu = summarizeLayouts(deck);
 // [

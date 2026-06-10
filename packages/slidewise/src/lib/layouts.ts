@@ -277,13 +277,15 @@ export function summarizeLayouts(
   deck: Deck,
   options: SummarizeLayoutsOptions = {}
 ): LayoutSummary[] {
-  const out = (deck.layouts ?? []).map((l) =>
-    summarizeLayout(l, options.compact === true)
-  );
-  return options.dedupe ? dedupeLayouts(out) : out;
+  // Always build the FULL summary first — dedupe keys off the complete
+  // placeholder inventory (text *and* non-text slots), which the compact shape
+  // doesn't carry. Compact is applied last, to the survivors.
+  const full = (deck.layouts ?? []).map(summarizeLayout);
+  const out = options.dedupe ? dedupeLayouts(full) : full;
+  return options.compact ? out.map(toCompact) : out;
 }
 
-function summarizeLayout(layout: DeckLayout, compact: boolean): LayoutSummary {
+function summarizeLayout(layout: DeckLayout): LayoutSummary {
   const placeholders: LayoutSlotSummary[] = layout.placeholders.map((ph) => ({
     key: placeholderKey(ph),
     type: ph.type,
@@ -299,15 +301,6 @@ function summarizeLayout(layout: DeckLayout, compact: boolean): LayoutSummary {
     (layout.type ? ROLE_BY_TYPE[layout.type] : undefined) ??
     roleFromPlaceholders(layout.placeholders);
   const fillable = placeholders.filter((p) => p.fillable).map((p) => p.key);
-  if (compact) {
-    return {
-      id: layout.id,
-      ...(layout.name ? { name: layout.name } : {}),
-      role,
-      fillable,
-      placeholders: [],
-    };
-  }
   return {
     id: layout.id,
     ...(layout.name ? { name: layout.name } : {}),
@@ -318,8 +311,37 @@ function summarizeLayout(layout: DeckLayout, compact: boolean): LayoutSummary {
   };
 }
 
+/** Strip a full summary down to the budget-friendly compact shape, keeping
+ *  `aliases` (set by dedupe). */
+function toCompact(s: LayoutSummary): LayoutSummary {
+  return {
+    id: s.id,
+    ...(s.name ? { name: s.name } : {}),
+    role: s.role,
+    fillable: s.fillable,
+    placeholders: [],
+    ...(s.aliases ? { aliases: s.aliases } : {}),
+  };
+}
+
 /**
- * Collapse layouts with an identical role + fillable signature into one
+ * Dedupe signature: the role plus EVERY placeholder slot (`category:key`) in a
+ * stable order — not just the text fillable keys. Including non-text slots
+ * (chart / picture / table) means a chart-bearing layout never collapses into
+ * an otherwise-identical text-only twin, so a host can't lose the data-visual
+ * variant. Geometry-only differences still collapse (that's the point), and a
+ * representative + its aliases always share the same slot kinds.
+ */
+function layoutSignature(s: LayoutSummary): string {
+  const slots = s.placeholders
+    .map((p) => `${p.category}:${p.key}`)
+    .sort()
+    .join(",");
+  return `${s.role} ${slots}`;
+}
+
+/**
+ * Collapse layouts with an identical {@link layoutSignature} into one
  * representative (the first seen, in document order), recording the rest as
  * `aliases`. Order of the surviving representatives is preserved.
  */
@@ -327,7 +349,7 @@ function dedupeLayouts(summaries: LayoutSummary[]): LayoutSummary[] {
   const byKey = new Map<string, LayoutSummary>();
   const order: string[] = [];
   for (const s of summaries) {
-    const key = `${s.role} ${s.fillable.join(",")}`;
+    const key = layoutSignature(s);
     const rep = byKey.get(key);
     if (!rep) {
       byKey.set(key, { ...s });

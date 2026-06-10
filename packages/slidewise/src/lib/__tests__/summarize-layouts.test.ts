@@ -67,6 +67,25 @@ describe("summarizeLayouts options", () => {
     expect(title.aliases).toBeUndefined();
   });
 
+  it("dedupe does NOT collapse layouts that differ in a non-text slot", () => {
+    // Same text slots (title + body:1), but one also has a chart placeholder.
+    // A host placing a native chart must keep the chart-bearing variant.
+    const deck2 = deckWith([
+      layout("slideLayout1", "obj", [ph("title"), ph("body", 1)]),
+      layout("slideLayout2", "obj", [ph("title"), ph("body", 1), ph("chart", 2)]),
+    ]);
+    const deduped = summarizeLayouts(deck2, { dedupe: true });
+    // Distinct slot inventories → both survive, neither aliases the other.
+    expect(deduped).toHaveLength(2);
+    expect(deduped.map((l) => l.id)).toEqual(["slideLayout1", "slideLayout2"]);
+    expect(deduped.every((l) => l.aliases === undefined)).toBe(true);
+    // The chart-bearing variant still exposes its chart slot geometry.
+    const chartLayout = deduped.find((l) => l.id === "slideLayout2")!;
+    expect(
+      chartLayout.placeholders.some((p) => p.category === "chart")
+    ).toBe(true);
+  });
+
   it("compact + dedupe compose", () => {
     const out = summarizeLayouts(deck, { compact: true, dedupe: true });
     expect(out).toHaveLength(2);

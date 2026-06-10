@@ -6,9 +6,11 @@ Host deck-generation ergonomics (review follow-ups for layout instantiation):
 
 - **`summarizeLayouts(deck, options)`** — `{ compact: true }` returns the minimal
   `{ id, name?, role, fillable }` shape (no geometry) for a tight model-context
-  budget; `{ dedupe: true }` collapses layouts that share a role + fillable
-  signature into one representative carrying the rest as `aliases`, so an
-  85-layout template surfaces as its handful of distinct kinds. Composable.
+  budget; `{ dedupe: true }` collapses layouts that share a role + full
+  placeholder-slot inventory (text **and** non-text chart/picture/table slots)
+  into one representative carrying the rest as `aliases`, so an 85-layout
+  template surfaces as its handful of distinct kinds — and a chart-bearing
+  layout never collapses into a text-only twin. Composable.
 - **Robust `sourceLayoutId` resolution** — a host-authored slide's
   `sourceLayoutId` now resolves from `deck.layouts` **or**, when the host didn't
   carry the layouts array, by the `ppt/slideLayouts/<id>.xml` id convention
