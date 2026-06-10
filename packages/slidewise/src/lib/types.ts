@@ -10,6 +10,7 @@ export type ElementType =
   | "icon"
   | "embed"
   | "chart"
+  | "connector"
   | "group"
   | "unknown";
 
@@ -518,6 +519,48 @@ export interface GroupElement extends BaseElement {
   children: SlideElement[];
 }
 
+/**
+ * Connector geometry families. Mirrors OOXML connector preset shapes:
+ * `straightConnector1`, `bentConnector3`, `curvedConnector3`. A connector is
+ * a first-class line that can carry arrowheads on either end and (unlike a
+ * loose `LineElement`) round-trips to a `<p:cxnSp>`, so process / timeline /
+ * flow arrows stay editable as connectors in PowerPoint instead of collapsing
+ * to anonymous shapes.
+ */
+export type ConnectorKind = "straight" | "bent" | "curved";
+
+/** Arrowhead style for a connector end. Mirrors `<a:headEnd>/<a:tailEnd>`. */
+export type ArrowheadKind = "none" | "triangle" | "stealth" | "arrow" | "oval" | "diamond";
+
+/**
+ * A connector / line primitive. The bounding box (`x/y/w/h`) defines the two
+ * anchor corners the connector spans; `flipH` / `flipV` pick which diagonal of
+ * that box the line actually runs along (this is exactly how OOXML encodes a
+ * connector's direction). Optional `startId` / `endId` bind the ends to other
+ * elements on the slide so a process diagram stays connected when nodes move.
+ */
+export interface ConnectorElement extends BaseElement {
+  type: "connector";
+  kind: ConnectorKind;
+  stroke: string;
+  strokeWidth: number;
+  dashType?: DashType;
+  /** Arrowhead at the start (the connector's begin point). Defaults to none. */
+  startArrow?: ArrowheadKind;
+  /** Arrowhead at the end (the connector's end point). Defaults to none. */
+  endArrow?: ArrowheadKind;
+  /** Mirror horizontally — flips which corners of the bbox the line spans. */
+  flipH?: boolean;
+  /** Mirror vertically. */
+  flipV?: boolean;
+  /** Optional id of the element this connector starts at. */
+  startId?: string;
+  /** Optional id of the element this connector ends at. */
+  endId?: string;
+  shadow?: ShadowSpec;
+  glow?: GlowSpec;
+}
+
 export type SlideElement =
   | TextElement
   | ShapeElement
@@ -527,6 +570,7 @@ export type SlideElement =
   | IconElement
   | EmbedElement
   | ChartElement
+  | ConnectorElement
   | GroupElement
   | UnknownElement;
 
@@ -540,6 +584,32 @@ export interface Slide {
    */
   background: string;
   elements: SlideElement[];
+  /**
+   * Which source slide this slide's chrome (background + layout reference)
+   * should be replayed from, as a 0-based index into the attached `source`
+   * PPTX's slide list (presentation order). Set this when the host clones,
+   * reorders, or subsets the imported slides so output position no longer
+   * matches source position — an AI generator that emits source slide 20 as
+   * output slide 10, reuses a layout twice, or drops slides.
+   *
+   * The importer does NOT stamp this (it relies on a non-enumerable
+   * per-slide attachment for the untouched parse→serialize path); hosts that
+   * track the mapping should set it explicitly, since it's enumerable and
+   * therefore survives `structuredClone` / `JSON` round-trips that strip the
+   * attachment. When unset, the serializer falls back to positional mapping
+   * (output slide i ← source slide i). See `serializeDeck`'s
+   * `preserveSlideBackgrounds` / `rewriteSlideLayoutRefs`.
+   */
+  sourceSlideIndex?: number;
+  /**
+   * Which master layout a host-instantiated slide is bound to, as a layout
+   * id from `Deck.layouts` (see `addSlideFromLayout`). When set, the
+   * serializer points this slide's layout relationship at that source layout
+   * instead of inferring one from `sourceSlideIndex`. Slides cloned from an
+   * existing source slide leave this unset and resolve their layout through
+   * `sourceSlideIndex` / positional fallback.
+   */
+  sourceLayoutId?: string;
 }
 
 /**
@@ -579,6 +649,56 @@ export interface WebFontAsset {
   italic?: boolean;
 }
 
+/**
+ * A placeholder slot on a master layout — the design intent the template
+ * carries that isn't visible until a slide is instantiated from the layout.
+ * Geometry is in canvas pixels (same coordinate space as `BaseElement`).
+ */
+export interface LayoutPlaceholder {
+  /**
+   * Placeholder role from OOXML `<p:ph type="…">`: title / body / ctrTitle /
+   * subTitle / pic / tbl / chart / dt / ftr / sldNum / etc. `body` when the
+   * source omits the type (OOXML's default).
+   */
+  type: string;
+  /** Placeholder index from `<p:ph idx="…">`, disambiguates same-type slots. */
+  idx?: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Default font family resolved from the layout/master list style, if any. */
+  fontFamily?: string;
+  /** Default font size (canvas px) resolved from the list style, if any. */
+  fontSize?: number;
+  /** Default text colour (CSS hex) resolved from the list style, if any. */
+  color?: string;
+  /** Default horizontal alignment, if the list style fixes one. */
+  align?: "left" | "center" | "right";
+}
+
+/**
+ * A master slide layout exposed as an instantiable template. The importer
+ * populates `Deck.layouts` from `ppt/slideLayouts/*.xml`; hosts call
+ * `addSlideFromLayout(deck, layout.id, fills)` to mint a fresh slide whose
+ * placeholders are ready to fill — the unlock for generating decks longer
+ * than the template's hand-authored slide set without repeating a layout.
+ */
+export interface DeckLayout {
+  /** Stable id (the layout's source part basename, e.g. "slideLayout7"). */
+  id: string;
+  /** Human-readable name from `<p:cSld name="…">`, when present. */
+  name?: string;
+  /** Placeholder slots this layout defines, in document order. */
+  placeholders: LayoutPlaceholder[];
+  /**
+   * Source archive path of the layout part (e.g.
+   * `ppt/slideLayouts/slideLayout7.xml`). The serializer points a
+   * layout-instantiated slide's relationship at this part.
+   */
+  sourcePath: string;
+}
+
 export interface Deck {
   /**
    * Schema version this deck conforms to. Stamped by `migrate()` and by
@@ -589,6 +709,12 @@ export interface Deck {
   version: number;
   title: string;
   slides: Slide[];
+  /**
+   * Master layouts parsed from the source PPTX, exposed as instantiable
+   * templates. Populated by `parsePptx`; consumed by `addSlideFromLayout`.
+   * Absent for decks not created from a real PPTX.
+   */
+  layouts?: DeckLayout[];
   /**
    * Opaque identifier the importer stamps when a deck is parsed from a real
    * PPTX. Slidewise keeps the source bytes in a module-level cache keyed by

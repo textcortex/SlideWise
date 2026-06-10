@@ -22,6 +22,8 @@ import type {
   UnknownElement,
   FontAsset,
   WebFontAsset,
+  DeckLayout,
+  LayoutPlaceholder,
 } from "@/lib/types";
 import { SLIDE_W, SLIDE_H } from "@/lib/types";
 import { CURRENT_DECK_VERSION } from "@/lib/schema/migrate";
@@ -356,11 +358,14 @@ export async function parsePptx(
     presentationXml,
     presentationRels
   );
+  // Master layouts exposed as instantiable templates (see addSlideFromLayout).
+  const layouts = await parseLayouts(zip, fit);
   const deck: Deck = {
     version: CURRENT_DECK_VERSION,
     title,
     slides,
     sourcePptxId,
+    ...(layouts.length ? { layouts } : {}),
     ...(fonts.length ? { fonts } : {}),
     ...(webFonts.length ? { webFonts } : {}),
   };
@@ -2906,6 +2911,157 @@ function rPrHasStyle(rPr: any): boolean {
     rPr["a:latin"] !== undefined ||
     rPr["a:solidFill"] !== undefined
   );
+}
+
+/**
+ * Build the instantiable-layout catalogue (`Deck.layouts`) from
+ * `ppt/slideLayouts/*.xml`. Each layout's placeholder slots are resolved to
+ * canvas-px geometry (applying the same letterbox `fit` slides use) with
+ * master-placeholder fallback for slots whose layout entry omits geometry, so
+ * a host can mint a fresh slide from any layout via `addSlideFromLayout`.
+ */
+async function parseLayouts(zip: JSZip, fit: Fit): Promise<DeckLayout[]> {
+  const layoutPaths: string[] = [];
+  zip.forEach((p) => {
+    if (
+      p.startsWith("ppt/slideLayouts/") &&
+      /slideLayout\d+\.xml$/.test(p) &&
+      !p.includes("/_rels/")
+    ) {
+      layoutPaths.push(p);
+    }
+  });
+  // Numeric order (slideLayout2 before slideLayout10).
+  layoutPaths.sort((a, b) => layoutNum(a) - layoutNum(b));
+
+  const out: DeckLayout[] = [];
+  for (const path of layoutPaths) {
+    const xml = await readXml(zip, path);
+    if (!xml) continue;
+    const layoutRoot = xml["p:sldLayout"];
+    if (!layoutRoot) continue;
+
+    const rels = await readRels(zip, relsPathFor(path));
+    const masterTarget = firstByType(rels, "slideMaster");
+    const masterPath = masterTarget
+      ? normalisePath(masterTarget, dirOf(path))
+      : null;
+    const masterXml = masterPath ? await readXml(zip, masterPath) : null;
+    const masterPh = masterXml ? extractPlaceholders(masterXml) : new Map();
+
+    const sps = asArray(layoutRoot?.["p:cSld"]?.["p:spTree"]?.["p:sp"]);
+    const placeholders: LayoutPlaceholder[] = [];
+    for (const sp of sps) {
+      const ph = sp?.["p:nvSpPr"]?.["p:nvPr"]?.["p:ph"];
+      if (!ph) continue;
+      // OOXML: a <p:ph> with no `type` defaults to "body".
+      const type = (ph["@_type"] as string) ?? "body";
+      const idxAttr = ph["@_idx"];
+      const idx = idxAttr != null ? Number(idxAttr) : undefined;
+
+      // Geometry: the layout placeholder's own xfrm, else the master's slot.
+      const own = phInfoFromSp(sp);
+      const info =
+        own && own.rawX != null ? own : lookupPlaceholder(masterPh, ph);
+      const geo = layoutPhGeometry(info, fit);
+      if (!geo) continue; // no resolvable geometry → not instantiable, skip
+
+      placeholders.push({
+        type,
+        ...(idx != null && Number.isFinite(idx) ? { idx } : {}),
+        ...geo,
+        ...layoutPhStyle(info, fit),
+      });
+    }
+
+    out.push({
+      id: layoutId(path),
+      ...(typeof layoutRoot?.["p:cSld"]?.["@_name"] === "string"
+        ? { name: layoutRoot["p:cSld"]["@_name"] as string }
+        : {}),
+      placeholders,
+      sourcePath: path,
+    });
+  }
+  return out;
+}
+
+function layoutNum(path: string): number {
+  return Number(/slideLayout(\d+)\.xml$/.exec(path)?.[1] ?? 0);
+}
+
+function layoutId(path: string): string {
+  return path.replace(/^.*\//, "").replace(/\.xml$/, "");
+}
+
+/** Placeholder geometry/style straight off one layout `<p:sp>` (no merge). */
+function phInfoFromSp(sp: any): PlaceholderInfo | undefined {
+  const xfrm = sp?.["p:spPr"]?.["a:xfrm"];
+  const off = xfrm?.["a:off"];
+  const ext = xfrm?.["a:ext"];
+  const txBody = sp?.["p:txBody"];
+  const firstP = asArray(txBody?.["a:p"])[0];
+  const firstR = asArray(firstP?.["a:r"])[0];
+  const lvl1 = txBody?.["a:lstStyle"]?.["a:lvl1pPr"];
+  return {
+    rawX: off ? emuToPx(Number(off["@_x"] ?? 0)) : undefined,
+    rawY: off ? emuToPx(Number(off["@_y"] ?? 0)) : undefined,
+    rawW: ext ? emuToPx(Number(ext["@_cx"] ?? 0)) : undefined,
+    rawH: ext ? emuToPx(Number(ext["@_cy"] ?? 0)) : undefined,
+    rotation: xfrm?.["@_rot"] ? Number(xfrm["@_rot"]) / 60000 : 0,
+    rPr: pickMeaningful(firstR?.["a:rPr"], lvl1?.["a:defRPr"]),
+    pPr: lvl1 ?? firstP?.["a:pPr"],
+  };
+}
+
+function layoutPhGeometry(
+  info: PlaceholderInfo | undefined,
+  fit: Fit
+): { x: number; y: number; w: number; h: number } | null {
+  if (
+    !info ||
+    info.rawX == null ||
+    info.rawY == null ||
+    info.rawW == null ||
+    info.rawH == null
+  ) {
+    return null;
+  }
+  return {
+    x: Math.round(info.rawX * fit.scale + fit.offsetX),
+    y: Math.round(info.rawY * fit.scale + fit.offsetY),
+    w: Math.max(1, Math.round(info.rawW * fit.scale)),
+    h: Math.max(1, Math.round(info.rawH * fit.scale)),
+  };
+}
+
+function layoutPhStyle(
+  info: PlaceholderInfo | undefined,
+  fit: Fit
+): Pick<LayoutPlaceholder, "fontFamily" | "fontSize" | "color" | "align"> {
+  const out: Pick<
+    LayoutPlaceholder,
+    "fontFamily" | "fontSize" | "color" | "align"
+  > = {};
+  const rPr = info?.rPr;
+  const latin = rPr?.["a:latin"]?.["@_typeface"];
+  if (typeof latin === "string" && latin) out.fontFamily = latin;
+  const sz = rPr?.["@_sz"];
+  if (sz != null) {
+    out.fontSize = Math.max(
+      1,
+      Math.round(pointsToPx(Number(sz) / 100) * fit.scale)
+    );
+  }
+  // Direct srgb fills only — schemeClr resolution needs the theme/clrMap and is
+  // intentionally left to the renderer's inheritance.
+  const srgb = rPr?.["a:solidFill"]?.["a:srgbClr"]?.["@_val"];
+  if (typeof srgb === "string") out.color = `#${srgb}`;
+  const algn = (info?.pPr as any)?.["@_algn"];
+  if (algn === "ctr") out.align = "center";
+  else if (algn === "r") out.align = "right";
+  else if (algn === "l" || algn === "just") out.align = "left";
+  return out;
 }
 
 function extractMasterTextDefaults(masterXml: any): MasterTextDefaults {

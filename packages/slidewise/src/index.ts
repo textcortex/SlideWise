@@ -94,6 +94,28 @@ export type { ParseDiagnostics, ParseResult } from "./lib/pptx/types";
 export { migrate, CURRENT_DECK_VERSION } from "./lib/schema/migrate";
 export { resolveJsonDeck } from "./lib/schema/json";
 
+/**
+ * Instantiate a fresh slide from one of the deck's master layouts
+ * (`Deck.layouts`, populated by `parsePptx`). The unlock for generating decks
+ * with more slides than the template hand-authored, using the template's own
+ * layout variety.
+ */
+export {
+  addSlideFromLayout,
+  type AddSlideFromLayoutOptions,
+} from "./lib/layouts";
+
+/**
+ * Chart-option helpers. Build the exact ECharts option Slidewise renders a
+ * `ChartElement` with — for host-side previews / server-side render-to-image —
+ * without re-implementing (and drifting from) the package's translation.
+ */
+export {
+  buildChartOption,
+  defaultPaletteColor,
+  makeValueFormatter,
+} from "./lib/chart/chartOption";
+
 export type {
   Deck,
   Slide,
@@ -115,8 +137,13 @@ export type {
   ChartKind,
   ChartGrouping,
   ChartSeries,
+  ConnectorElement,
+  ConnectorKind,
+  ArrowheadKind,
   GroupElement,
   UnknownElement,
+  DeckLayout,
+  LayoutPlaceholder,
   ElementDraft,
   ShadowSpec,
   GlowSpec,
