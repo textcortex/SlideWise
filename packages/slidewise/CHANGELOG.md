@@ -1,5 +1,72 @@
 # @textcortex/slidewise
 
+## 1.19.0
+
+### Minor Changes
+
+- 3e7c3f1: First-class **diagram** element (P3 / F3). A new `DiagramElement` models
+  process / timeline / funnel / matrix / cycle / list visuals as an ordered set
+  of labelled `nodes` instead of a hand-placed cluster of shapes and lines. The
+  renderer and the PPTX writer share one layout function (`layoutDiagram`, also
+  exported), so the on-canvas preview and the saved file can't drift. On export a
+  diagram serialises to a single labelled `<p:grpSp>` of real shapes + connectors
+  — so it stays grouped and editable in PowerPoint (move/resize as one unit)
+  rather than collapsing to anonymous floating shapes. Exposed via the
+  `DiagramElement` / `DiagramNode` / `DiagramKind` types and the `layoutDiagram`
+  helper.
+- 3e7c3f1: Host deck-generation ergonomics (review follow-ups for layout instantiation):
+
+  - **`summarizeLayouts(deck, options)`** — `{ compact: true }` returns the minimal
+    `{ id, name?, role, fillable }` shape (no geometry) for a tight model-context
+    budget; `{ dedupe: true }` collapses layouts that share a role + full
+    placeholder-slot inventory (text **and** non-text chart/picture/table slots)
+    into one representative carrying the rest as `aliases`, so an 85-layout
+    template surfaces as its handful of distinct kinds — and a chart-bearing
+    layout never collapses into a text-only twin. Composable.
+  - **Robust `sourceLayoutId` resolution** — a host-authored slide's
+    `sourceLayoutId` now resolves from `deck.layouts` **or**, when the host didn't
+    carry the layouts array, by the `ppt/slideLayouts/<id>.xml` id convention
+    against the `{ source }` archive. When it resolves to nothing, `serializeDeck`
+    emits a structured `{ code: "layout-unresolved", slideIndex, layoutId }`
+    warning instead of silently falling back.
+  - **Richer `chrome-skipped` warning** — now carries the detected `sourceAspect`
+    and `outputAspect` so a host can explain _why_ chrome was dropped.
+
+  Plus README: the host "author-a-slide" contract (`{ sourceLayoutId,
+background: "transparent", elements }` without a JS call), the recipe for
+  placing non-text slots from `summarizeLayouts` geometry, and the server-side
+  `layoutDiagram` render recipe with its DOM-free guarantee.
+
+- 3e7c3f1: Round-trip fidelity fixes (P4):
+
+  - **Image `crop` / `radius`** now round-trip. Previously an image's `crop`
+    (`<a:srcRect>`) was read on import but silently dropped on export, and corner
+    `radius` was neither parsed nor written. `serializeDeck` now routes any image
+    carrying a `crop` or `radius` through a dedicated `<p:pic>` writer (emitting
+    `<a:srcRect>` and `roundRect` geometry) instead of pptxgenjs — whose
+    cover/contain sizing emits its own `<a:srcRect>` and would fight a user crop —
+    and `parsePptx` reads a rounded picture's corner radius back. Plain
+    (uncropped, square-cornered) images keep the existing path unchanged.
+  - **Text-run letter-case (`cap`)** now round-trips. A run's `cap`
+    (`"all"` / `"small"`, OOXML `<a:rPr cap>`) was parsed on import but dropped on
+    export (pptxgenjs has no `cap` option). It's now re-applied per run in
+    post-process, so all-caps / small-caps styling survives a save.
+
+- 3e7c3f1: Harden layout instantiation for AI deck generation (P1 / F1):
+
+  - **Layout-instantiated slides now inherit their layout's background.** A slide minted by `addSlideFromLayout` with the default `transparent` background no longer serialises an explicit `<a:noFill/>` `<p:bg>` — that empty background was overriding the layout/master/theme inheritance, so instantiated slides lost their on-brand background. They now stay `<p:bg>`-less and paint from their `sourceLayoutId` layout's chrome (matching the source-slide guarantee for cloned/reordered slides).
+  - **Layout-selection metadata.** `DeckLayout.type` now carries the raw OOXML `<p:sldLayout type>` role, and the new `summarizeLayouts(deck)` returns a compact, model-context-friendly layout menu (friendly `role` label, fillable `fills` keys, per-placeholder kind/category/geometry) so a host can have a model pick a layout per slide. `placeholderKey(ph)` exposes the exact `fills` key for a placeholder.
+
+- 3e7c3f1: Machine-readable serialization diagnostics (P2 / B3). `serializeDeck` now
+  accepts `SerializeOptions.onWarning`, a callback invoked with a structured
+  `SerializeWarning` when the output degrades. The key case is
+  `"chrome-skipped"` — emitted when a `source` template's masters / layouts /
+  theme / fonts can't be carried over because its slide size is unreadable, so
+  the deck falls back to generic chrome. Hosts can now detect and surface the
+  degradation instead of only seeing a console line. (Non-16:9 sizing for 4:3 /
+  16:10 / custom templates already drives the output slide size; this adds the
+  escape-hatch signal when it can't.)
+
 ## 1.18.1
 
 ### Patch Changes
