@@ -83,11 +83,202 @@ const pptx: Blob = await serializeDeck(deck); // export
 const safe: Deck = migrate(unknownDeckJson); // normalise an external deck
 ```
 
+`serializeDeck(deck, { source })` reproduces a source template's slide size
+(16:9, 4:3, 16:10, or custom) and carries over its masters / layouts / theme /
+fonts. Degradations are reported through an optional `onWarning` diagnostics
+sink (structured `SerializeWarning`s) so the host can surface them rather than
+ship a silently off-brand deck:
+
+```ts
+await serializeDeck(deck, {
+  source,
+  onWarning: (w) => {
+    switch (w.code) {
+      case "chrome-skipped": // size unreadable → generic chrome
+        notifyHost(`${w.message} (source ${w.sourceAspect}, output ${w.outputAspect})`);
+        break;
+      case "layout-unresolved": // a slide's sourceLayoutId matched nothing
+        notifyHost(`slide ${w.slideIndex}: layout ${w.layoutId} not found`);
+        break;
+      case "element-write-failed": // one element threw; rest of slide intact
+        notifyHost(`${w.elementType} ${w.elementId} skipped`);
+        break;
+    }
+  },
+});
+```
+
 `migrate()` runs every external deck (PPTX import, JSON import, localStorage
 hydration, host props) through the schema migration chain so the rest of the
 editor only sees current-shape decks. It throws if the input was written by a
 newer Slidewise than the host has installed — pin the version range you can
 support.
+
+### Generating slides from the template's layouts
+
+`parsePptx` exposes the source template's master layouts on `deck.layouts`.
+`addSlideFromLayout(deck, layoutId, opts)` mints a fresh slide bound to one of
+them — the unlock for generating a deck with more slides than the template
+hand-authored, using the template's own layout variety. The new slide carries
+`sourceLayoutId`, so `serializeDeck(deck, { source })` paints its
+background / fonts / theme / footer chrome from that layout (not from output
+position), exactly like a cloned source slide.
+
+```ts
+import {
+  parsePptx,
+  serializeDeck,
+  summarizeLayouts,
+  addSlideFromLayout,
+} from "@textcortex/slidewise";
+
+const deck = await parsePptx(blob);
+
+// 1. Show a model a compact menu of the available layouts. The shape is
+//    structured (not a string) so you can trim it to your context budget.
+//    For large templates (e.g. 85 layouts) pass options:
+//      summarizeLayouts(deck, { compact: true })  // { id, name?, role, fillable }, no geometry
+//      summarizeLayouts(deck, { dedupe: true })   // collapse layouts with the same role + full
+//                                                  // slot inventory (text AND chart/image/table);
+//                                                  // others → `aliases`. A chart-bearing layout
+//                                                  // never collapses into a text-only twin.
+//      summarizeLayouts(deck, { compact: true, dedupe: true })  // both
+const menu = summarizeLayouts(deck);
+// [
+//   { id: "slideLayout2", name: "Title and Content", type: "obj",
+//     role: "Title and content", fillable: ["title", "body:1"],
+//     placeholders: [
+//       { key: "title", type: "title", category: "text", fillable: true, x, y, w, h },
+//       { key: "body:1", type: "body", idx: 1, category: "text", fillable: true, x, y, w, h },
+//     ] },
+//   ...
+// ]
+
+// 2. Instantiate a slide from the chosen layout, filling its text placeholders.
+const next = addSlideFromLayout(deck, "slideLayout2", {
+  fills: { title: "Q3 Results", "body:1": "Revenue up 24%" },
+});
+
+const pptx = await serializeDeck(next, { source: blob });
+```
+
+**The `fills` contract.** `fills` is keyed by placeholder, resolved
+most-specific-first: `"type:idx"` (e.g. `"body:1"`), then the bare `"type"`
+(e.g. `"title"`), then the bare index as a string. `placeholderKey(ph)` (and
+`LayoutSlotSummary.key` from `summarizeLayouts`) gives you the exact key for a
+slot. Only **text** placeholders are fillable — `title`, `ctrTitle`,
+`subTitle`, `body`, `obj`, and the untyped default (`LayoutSlotSummary.fillable
+=== true`, `category === "text"`). Those become editable text elements
+positioned per the layout. Non-text slots (pictures, tables, charts, and footer
+chrome like date / slide-number / footer) are skipped — inherit them from the
+master, or add real `image` / `table` / `chart` elements to the returned slide.
+A placeholder with no matching `fills` entry becomes an empty, editable text
+box.
+
+#### Authoring slides directly (no `addSlideFromLayout`)
+
+`addSlideFromLayout` is a convenience; the underlying contract is just a slide
+shape, so a host that builds deck JSON in another language (e.g. Python) can
+author it directly and let `serializeDeck` paint the chrome:
+
+```jsonc
+{
+  "id": "slide-7",
+  "background": "transparent",   // inherit the layout/master/theme background
+  "sourceLayoutId": "slideLayout12",
+  "elements": [ /* any text / image / chart / table / diagram elements */ ]
+}
+```
+
+Contract:
+
+- **`sourceLayoutId` alone is enough.** No JS call is required — set it on the
+  slide JSON and `serializeDeck(deck, { source })` points the slide at that
+  layout's part and paints its background / fonts / theme / footer chrome.
+- **Put arbitrary elements on the slide.** It is not limited to elements
+  `addSlideFromLayout` produced — your filled text, native charts, generated
+  images, tables, and diagrams all land normally, on top of the layout chrome.
+- **Place non-text slots yourself from the layout geometry.** For an image /
+  chart / table slot, read its geometry from `summarizeLayouts` (every
+  placeholder is listed with `category` + `x/y/w/h`, fillable or not) and add a
+  real element at that box:
+
+  ```ts
+  const slot = summarizeLayouts(deck)
+    .find((l) => l.id === "slideLayout12")!
+    .placeholders.find((p) => p.category === "picture")!;
+  authoredSlide.elements.push({
+    id: "img-1", type: "image", src: generatedPhotoDataUrl, fit: "cover",
+    x: slot.x, y: slot.y, w: slot.w, h: slot.h, rotation: 0, z: 1,
+  });
+  ```
+
+- **Background:** keep `"transparent"` to inherit the layout/master background;
+  set an explicit hex to override it.
+- **`sourceLayoutId` resolution** is by id, resolved from `deck.layouts` (if you
+  carried the array) **or** by the `ppt/slideLayouts/<id>.xml` convention
+  against the `{ source }` archive — so you don't have to ship the `layouts`
+  array. If neither resolves, the slide falls back to the first source layout
+  and `serializeDeck` emits a `{ code: "layout-unresolved", slideIndex,
+  layoutId }` warning through `onWarning` (see below) rather than failing
+  silently.
+
+### Diagrams
+
+`DiagramElement` models a process / timeline / funnel / matrix / cycle / list
+as an ordered set of labelled `nodes`, laid out by `kind`. It renders on the
+canvas and serialises to a single grouped, editable `<p:grpSp>` of real shapes
++ connectors (not a flat pile of anonymous shapes). The renderer and writer
+share `layoutDiagram`, exported so a host preview / server render stays in sync.
+
+```ts
+const slide = {
+  id: "s1",
+  background: "transparent",
+  elements: [
+    {
+      id: "d1",
+      type: "diagram",
+      kind: "process",
+      x: 120,
+      y: 240,
+      w: 1680,
+      h: 320,
+      rotation: 0,
+      z: 1,
+      nodes: [
+        { id: "n1", text: "Discover" },
+        { id: "n2", text: "Design" },
+        { id: "n3", text: "Ship" },
+      ],
+      // optional: palette?: string[], color?, fontFamily?, fontSize?,
+      // and per-node fill? / color? overrides.
+    },
+  ],
+};
+```
+
+`kind` is one of `"process" | "timeline" | "funnel" | "matrix" | "cycle" |
+"list"`. The JSON shape (`DiagramElement` / `DiagramNode`) is stable — safe to
+emit from another language.
+
+**Server-side rendering.** `layoutDiagram(el)` is **pure and DOM-free** (only
+box/arrow arithmetic — no `window` / `document` / `canvas`), the same guarantee
+`buildChartOption` gives for charts, and it's committed to staying that way. A
+host QA renderer can draw a diagram to SVG/PNG without a browser by walking the
+primitives:
+
+```ts
+import { layoutDiagram } from "@textcortex/slidewise";
+
+for (const p of layoutDiagram(el)) {
+  if (p.kind === "box") drawRect(p.x, p.y, p.w, p.h, p.fill, p.text, p.textColor);
+  else drawArrow(p.x1, p.y1, p.x2, p.y2, p.stroke, p.arrow);
+}
+```
+
+Coordinates are local to the element box (`0..w` × `0..h`); offset by the
+element's `x` / `y` to place them on the slide.
 
 ## Theming
 

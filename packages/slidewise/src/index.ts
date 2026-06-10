@@ -89,6 +89,10 @@ export {
 } from "./compound";
 
 export { parsePptx, isPptxTemplate, serializeDeck } from "./lib/pptx";
+export type {
+  SerializeOptions,
+  SerializeWarning,
+} from "./lib/pptx";
 export type { ParseDiagnostics, ParseResult } from "./lib/pptx/types";
 
 export { migrate, CURRENT_DECK_VERSION } from "./lib/schema/migrate";
@@ -102,7 +106,13 @@ export { resolveJsonDeck } from "./lib/schema/json";
  */
 export {
   addSlideFromLayout,
+  summarizeLayouts,
+  placeholderKey,
   type AddSlideFromLayoutOptions,
+  type SummarizeLayoutsOptions,
+  type LayoutSummary,
+  type LayoutSlotSummary,
+  type PlaceholderCategory,
 } from "./lib/layouts";
 
 /**
@@ -115,6 +125,20 @@ export {
   defaultPaletteColor,
   makeValueFormatter,
 } from "./lib/chart/chartOption";
+
+/**
+ * Diagram layout helper. `layoutDiagram(el)` returns the positioned boxes +
+ * arrows Slidewise renders a `DiagramElement` with (and serializes to a grouped
+ * `<p:grpSp>`) — shared so a host preview / server render can't drift from the
+ * package's own layout.
+ */
+export {
+  layoutDiagram,
+  DEFAULT_DIAGRAM_PALETTE,
+  type DiagramPrimitive,
+  type DiagramBoxPrimitive,
+  type DiagramArrowPrimitive,
+} from "./lib/diagram/layout";
 
 export type {
   Deck,
@@ -141,6 +165,9 @@ export type {
   ConnectorKind,
   ArrowheadKind,
   GroupElement,
+  DiagramElement,
+  DiagramNode,
+  DiagramKind,
   UnknownElement,
   DeckLayout,
   LayoutPlaceholder,

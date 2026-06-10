@@ -1,6 +1,7 @@
 import { nanoid } from "nanoid";
 import type {
   Deck,
+  DeckLayout,
   Slide,
   SlideElement,
   TextElement,
@@ -27,7 +28,9 @@ export interface AddSlideFromLayoutOptions {
    * Text to drop into placeholders, keyed by placeholder `type` (e.g.
    * `"title"`), or `"type:idx"` when a layout repeats a type (e.g.
    * `"body:1"`), or the bare `idx` as a string. Placeholders without a match
-   * become empty, editable text boxes.
+   * become empty, editable text boxes. Only text placeholders are fillable —
+   * see {@link placeholderKey} for the canonical key of a slot and
+   * {@link summarizeLayouts} for the fillable keys a layout accepts.
    */
   fills?: Record<string, string>;
   /** Slide background; defaults to `"transparent"` so the layout/master
@@ -93,6 +96,269 @@ function fillFor(
   const byTypeIdx = ph.idx != null ? fills[`${ph.type}:${ph.idx}`] : undefined;
   const byIdx = ph.idx != null ? fills[String(ph.idx)] : undefined;
   return byTypeIdx ?? fills[ph.type] ?? byIdx ?? "";
+}
+
+/**
+ * The `fills` key that addresses this placeholder most specifically, matching
+ * the resolution order in `fillFor`: prefer `type:idx`, then bare `type`, then
+ * the bare index. This is the key a host should pass in
+ * `AddSlideFromLayoutOptions.fills` to populate the slot deterministically.
+ */
+export function placeholderKey(ph: LayoutPlaceholder): string {
+  if (ph.type && ph.idx != null) return `${ph.type}:${ph.idx}`;
+  if (ph.type) return ph.type;
+  if (ph.idx != null) return String(ph.idx);
+  return "";
+}
+
+/** Coarse content category for a placeholder, for host-side menus. */
+export type PlaceholderCategory =
+  | "text"
+  | "picture"
+  | "table"
+  | "chart"
+  | "media"
+  | "diagram"
+  | "chrome"
+  | "other";
+
+function categoryFor(type: string): PlaceholderCategory {
+  if (TEXT_PLACEHOLDER_TYPES.has(type)) return "text";
+  switch (type) {
+    case "pic":
+    case "clipArt":
+      return "picture";
+    case "tbl":
+      return "table";
+    case "chart":
+      return "chart";
+    case "media":
+      return "media";
+    case "dgm":
+      return "diagram";
+    case "dt":
+    case "ftr":
+    case "sldNum":
+      return "chrome";
+    default:
+      return "other";
+  }
+}
+
+/**
+ * Friendly purpose label per raw OOXML `<p:sldLayout type>`. The host can show
+ * these in a model-facing layout menu instead of the cryptic OOXML tokens.
+ */
+const ROLE_BY_TYPE: Record<string, string> = {
+  title: "Title slide",
+  ctrTitle: "Title slide",
+  secHead: "Section header",
+  obj: "Title and content",
+  objTx: "Content with caption",
+  txAndObj: "Content with caption",
+  objAndTx: "Content with caption",
+  tx: "Title and text",
+  twoObj: "Two content",
+  twoTxTwoObj: "Comparison",
+  twoObjAndTx: "Comparison",
+  twoObjAndObj: "Comparison",
+  objAndTwoObj: "Comparison",
+  twoColTx: "Two columns of text",
+  fourObj: "Four content",
+  titleOnly: "Title only",
+  blank: "Blank",
+  pic: "Picture with caption",
+  picTx: "Picture with caption",
+  tbl: "Table",
+  chart: "Chart",
+  dgm: "Diagram",
+  clipArt: "Clip art and text",
+  media: "Media and text",
+  vertTx: "Vertical text",
+  vertTitleAndTx: "Vertical title and text",
+};
+
+/**
+ * Derive a role label without a `type` attribute by inspecting which kinds of
+ * placeholder the layout carries.
+ */
+function roleFromPlaceholders(phs: LayoutPlaceholder[]): string {
+  const types = new Set(phs.map((p) => p.type));
+  const hasTitle = types.has("title") || types.has("ctrTitle");
+  const bodyish = phs.filter((p) =>
+    ["body", "obj", "subTitle", ""].includes(p.type)
+  ).length;
+  if (types.has("ctrTitle") || types.has("subTitle")) return "Title slide";
+  if (hasTitle && bodyish >= 2) return "Two content";
+  if (hasTitle && bodyish === 1) return "Title and content";
+  if (hasTitle) return "Title only";
+  if (phs.length === 0) return "Blank";
+  return "Content";
+}
+
+/** Compact per-placeholder summary for a host-facing layout menu. */
+export interface LayoutSlotSummary {
+  /** The `fills` key to address this slot (see {@link placeholderKey}). */
+  key: string;
+  /** OOXML placeholder role (`title`, `body`, `pic`, …). */
+  type: string;
+  /** Placeholder index, when the layout disambiguates same-type slots. */
+  idx?: number;
+  /** Coarse content category. */
+  category: PlaceholderCategory;
+  /**
+   * Whether `addSlideFromLayout` turns this slot into an editable, fillable
+   * text element. Non-fillable slots (pictures, tables, charts, footer
+   * chrome) are inherited from the master or supplied by the host as real
+   * elements.
+   */
+  fillable: boolean;
+  /** Canvas-px geometry (same coordinate space as `BaseElement`). */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Compact per-layout summary for a host-facing (model-facing) layout menu. */
+export interface LayoutSummary {
+  id: string;
+  name?: string;
+  /** Friendly purpose label (e.g. "Title and content", "Section header"). */
+  role: string;
+  /** Raw OOXML `<p:sldLayout type>`, when present. Omitted in compact mode. */
+  type?: string;
+  /** The `fills` keys this layout accepts, in document order. */
+  fillable: string[];
+  /**
+   * Every placeholder slot, in document order. Empty in `compact` mode (where
+   * geometry is dropped to save model-context budget).
+   */
+  placeholders: LayoutSlotSummary[];
+  /**
+   * Under `dedupe`, the ids of the other layouts collapsed into this
+   * representative (same role + same fillable signature). Absent otherwise.
+   * Any alias id is still a valid `addSlideFromLayout` / `sourceLayoutId`
+   * target — they're interchangeable for instantiation purposes.
+   */
+  aliases?: string[];
+}
+
+export interface SummarizeLayoutsOptions {
+  /**
+   * Drop per-placeholder geometry (`placeholders` comes back `[]`, `type`
+   * omitted) for a minimal `{ id, name?, role, fillable }` menu that fits a
+   * tight model-context budget. The host still gets the geometry from the full
+   * (non-compact) call when it needs to place elements.
+   */
+  compact?: boolean;
+  /**
+   * Collapse layouts that share a role + fillable-key signature into a single
+   * representative carrying the rest as `aliases`, so a real 85-layout template
+   * surfaces as its handful of *distinct kinds* instead of 85 near-identical
+   * rows. Dedupe keys off the package's own role/shape knowledge, which a host
+   * can't reliably reconstruct from geometry alone.
+   */
+  dedupe?: boolean;
+}
+
+/**
+ * Summarise a deck's instantiable layouts into a compact menu a host can hand
+ * to a model when choosing which layout to instantiate for each slide. Returns
+ * a structured shape (not a string) so the host can trim it to its
+ * context-budget — or pass `{ compact: true }` for the minimal shape and/or
+ * `{ dedupe: true }` to collapse near-identical layouts. Pair each chosen `id`
+ * (or any `aliases` id) + `fills` with `addSlideFromLayout`, or set it as a
+ * slide's `sourceLayoutId`.
+ *
+ * Returns `[]` when the deck has no layouts (not parsed from a real PPTX).
+ */
+export function summarizeLayouts(
+  deck: Deck,
+  options: SummarizeLayoutsOptions = {}
+): LayoutSummary[] {
+  // Always build the FULL summary first — dedupe keys off the complete
+  // placeholder inventory (text *and* non-text slots), which the compact shape
+  // doesn't carry. Compact is applied last, to the survivors.
+  const full = (deck.layouts ?? []).map(summarizeLayout);
+  const out = options.dedupe ? dedupeLayouts(full) : full;
+  return options.compact ? out.map(toCompact) : out;
+}
+
+function summarizeLayout(layout: DeckLayout): LayoutSummary {
+  const placeholders: LayoutSlotSummary[] = layout.placeholders.map((ph) => ({
+    key: placeholderKey(ph),
+    type: ph.type,
+    ...(ph.idx != null ? { idx: ph.idx } : {}),
+    category: categoryFor(ph.type),
+    fillable: TEXT_PLACEHOLDER_TYPES.has(ph.type),
+    x: ph.x,
+    y: ph.y,
+    w: ph.w,
+    h: ph.h,
+  }));
+  const role =
+    (layout.type ? ROLE_BY_TYPE[layout.type] : undefined) ??
+    roleFromPlaceholders(layout.placeholders);
+  const fillable = placeholders.filter((p) => p.fillable).map((p) => p.key);
+  return {
+    id: layout.id,
+    ...(layout.name ? { name: layout.name } : {}),
+    role,
+    ...(layout.type ? { type: layout.type } : {}),
+    fillable,
+    placeholders,
+  };
+}
+
+/** Strip a full summary down to the budget-friendly compact shape, keeping
+ *  `aliases` (set by dedupe). */
+function toCompact(s: LayoutSummary): LayoutSummary {
+  return {
+    id: s.id,
+    ...(s.name ? { name: s.name } : {}),
+    role: s.role,
+    fillable: s.fillable,
+    placeholders: [],
+    ...(s.aliases ? { aliases: s.aliases } : {}),
+  };
+}
+
+/**
+ * Dedupe signature: the role plus EVERY placeholder slot (`category:key`) in a
+ * stable order — not just the text fillable keys. Including non-text slots
+ * (chart / picture / table) means a chart-bearing layout never collapses into
+ * an otherwise-identical text-only twin, so a host can't lose the data-visual
+ * variant. Geometry-only differences still collapse (that's the point), and a
+ * representative + its aliases always share the same slot kinds.
+ */
+function layoutSignature(s: LayoutSummary): string {
+  const slots = s.placeholders
+    .map((p) => `${p.category}:${p.key}`)
+    .sort()
+    .join(",");
+  return `${s.role} ${slots}`;
+}
+
+/**
+ * Collapse layouts with an identical {@link layoutSignature} into one
+ * representative (the first seen, in document order), recording the rest as
+ * `aliases`. Order of the surviving representatives is preserved.
+ */
+function dedupeLayouts(summaries: LayoutSummary[]): LayoutSummary[] {
+  const byKey = new Map<string, LayoutSummary>();
+  const order: string[] = [];
+  for (const s of summaries) {
+    const key = layoutSignature(s);
+    const rep = byKey.get(key);
+    if (!rep) {
+      byKey.set(key, { ...s });
+      order.push(key);
+    } else {
+      (rep.aliases ??= []).push(s.id);
+    }
+  }
+  return order.map((k) => byKey.get(k)!);
 }
 
 function placeholderToText(

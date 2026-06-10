@@ -16,6 +16,7 @@ import type {
   ChartElement,
   ConnectorElement,
   GroupElement,
+  DiagramElement,
   UnknownElement,
 } from "@/lib/types";
 import { pxToInches, pxToPoints } from "./units";
@@ -38,6 +39,8 @@ import {
   synthesiseGroup,
   synthesiseChart,
   synthesiseConnector,
+  synthesiseImage,
+  synthesiseDiagram,
   synthesiseSlideBg,
   synthesiseEmbeddedFonts,
   effectLstXml,
@@ -86,6 +89,46 @@ export interface SerializeOptions {
    * `.potx`; pass `true`/`false` to force the output kind.
    */
   asTemplate?: boolean;
+  /**
+   * Machine-readable diagnostics sink. Invoked (zero or more times) during
+   * serialization when something degrades the output in a way the host may
+   * want to surface — most importantly `"chrome-skipped"`, emitted when a
+   * `source` template's chrome (masters / layouts / theme / fonts) could not
+   * be carried over because its slide size was unreadable, so the deck falls
+   * back to generic pptxgenjs chrome. Lets a host detect the degradation
+   * instead of only seeing it in the console.
+   */
+  onWarning?: (warning: SerializeWarning) => void;
+}
+
+/** A non-fatal serialization diagnostic delivered to `SerializeOptions.onWarning`. */
+export interface SerializeWarning {
+  /**
+   * - `"chrome-skipped"` — the source template's chrome was not preserved
+   *   (slide size unreadable / aspect mismatch); the deck uses generic chrome.
+   *   `sourceAspect` / `outputAspect` carry the ratios when known.
+   * - `"layout-unresolved"` — a slide's `sourceLayoutId` matched no layout in
+   *   `deck.layouts` *and* no `ppt/slideLayouts/<id>.xml` in the source
+   *   archive; the slide falls back to the first source layout. `slideIndex`
+   *   and `layoutId` identify it.
+   * - `"element-write-failed"` — a single element threw while being written
+   *   and was skipped; the rest of the slide is intact.
+   */
+  code: "chrome-skipped" | "layout-unresolved" | "element-write-failed";
+  /** Human-readable explanation (also logged to the console). */
+  message: string;
+  /** Output slide index, when the warning is slide- or element-scoped. */
+  slideIndex?: number;
+  /** Element id, when the warning is element-scoped. */
+  elementId?: string;
+  /** Element type, when the warning is element-scoped. */
+  elementType?: string;
+  /** Unresolved `sourceLayoutId`, for `"layout-unresolved"`. */
+  layoutId?: string;
+  /** Source deck aspect ratio (cx/cy), for `"chrome-skipped"` when readable. */
+  sourceAspect?: number;
+  /** Output deck aspect ratio (cx/cy), for `"chrome-skipped"` when readable. */
+  outputAspect?: number;
 }
 
 /**
@@ -112,13 +155,25 @@ interface SynthSlideEntry {
   media: MediaPayload[];
   /** Effect XML to splice into pptxgenjs-emitted shapes by `cNvPr.name`. */
   effectsByName: Map<string, string>;
+  /**
+   * Per-run letter-case (`<a:rPr cap="…">`) to splice into a pptxgenjs-emitted
+   * text shape by `cNvPr.name`. pptxgenjs has no `cap` option, so it's applied
+   * in post-process. One entry per emitted run (`<a:r>`), in document order;
+   * `null` leaves that run untouched.
+   */
+  capRunsByName: Map<string, (("all" | "small") | null)[]>;
 }
 
 const synthBySlide = new Map<number, SynthSlideEntry>();
 function synthForSlide(i: number): SynthSlideEntry {
   let e = synthBySlide.get(i);
   if (!e) {
-    e = { items: [], media: [], effectsByName: new Map() };
+    e = {
+      items: [],
+      media: [],
+      effectsByName: new Map(),
+      capRunsByName: new Map(),
+    };
     synthBySlide.set(i, e);
   }
   return e;
@@ -143,7 +198,7 @@ export async function serializeDeck(
   applyLayout(pptx, transform);
 
   for (let i = 0; i < deck.slides.length; i++) {
-    addSlide(pptx, deck.slides[i], i, transform);
+    addSlide(pptx, deck.slides[i], i, transform, options.onWarning);
   }
 
   // Use arraybuffer (universal: works in Node + browser, accepted by JSZip
@@ -151,14 +206,21 @@ export async function serializeDeck(
   const generated = (await pptx.write({
     outputType: "arraybuffer",
   })) as ArrayBuffer;
-  return preserveUnknowns(generated, deck, sourceBuffer, options.asTemplate);
+  return preserveUnknowns(
+    generated,
+    deck,
+    sourceBuffer,
+    options.asTemplate,
+    options.onWarning
+  );
 }
 
 function addSlide(
   pptx: pptxgen,
   slide: Slide,
   slideIndex: number,
-  transform: SerializeTransform
+  transform: SerializeTransform,
+  onWarning?: (warning: SerializeWarning) => void
 ): void {
   const s = pptx.addSlide();
   // pptxgenjs only understands flat-hex slide backgrounds. For richer forms
@@ -193,10 +255,15 @@ function addSlide(
       // node (chart-with-ooxml and unknown are no-ops handled elsewhere).
       if (emitsPptxgenjsNode(el)) lastNodeId = el.id;
     } catch (err) {
-      console.warn(
-        `[slidewise/pptx] failed to write element ${el.id} (${el.type}):`,
-        err
-      );
+      const message = `[slidewise/pptx] failed to write element ${el.id} (${el.type}): ${String(err)}`;
+      console.warn(message, err);
+      onWarning?.({
+        code: "element-write-failed",
+        message,
+        slideIndex,
+        elementId: el.id,
+        elementType: el.type,
+      });
     }
   }
 }
@@ -336,6 +403,9 @@ function untransformElement<T extends SlideElement>(
     } else if (next.type === "connector") {
       const c = next as ConnectorElement;
       c.strokeWidth = c.strokeWidth / t.scale;
+    } else if (next.type === "diagram") {
+      const d = next as DiagramElement;
+      if (d.fontSize != null) d.fontSize = d.fontSize / t.scale;
     }
   }
   return next;
@@ -358,8 +428,26 @@ function shouldSynthesise(el: SlideElement): boolean {
   }
   if (el.type === "group") return true;
   if (el.type === "connector") return true;
+  if (el.type === "diagram") return true;
   if (el.type === "chart" && !el.ooxmlXml) return true;
+  // A cropped / rounded image needs a hand-written `<p:pic>`: pptxgenjs's
+  // sizing emits its own `<a:srcRect>` (fighting a user crop) and can't express
+  // a corner radius. Only inlineable data-URL sources take this path; remote
+  // URLs keep pptxgenjs's (crop/radius is dropped for those — see addImage).
+  if (
+    el.type === "image" &&
+    (hasCrop(el.crop) || (el.radius ?? 0) > 0) &&
+    isDataUrl(el.src)
+  ) {
+    return true;
+  }
   return false;
+}
+
+function hasCrop(crop: ImageElement["crop"] | undefined): boolean {
+  return (
+    !!crop && (crop.l > 0 || crop.r > 0 || crop.t > 0 || crop.b > 0)
+  );
 }
 
 function synthesiseInto(
@@ -394,6 +482,20 @@ function synthesiseInto(
   if (el.type === "chart") {
     const out = synthesiseChart(el as ChartElement);
     synth.items.push({ kind: "chart", result: out, after });
+    return;
+  }
+  if (el.type === "image") {
+    const out = synthesiseImage(el as ImageElement);
+    if (out) {
+      synth.items.push({ kind: "shape", xml: out.xml, after });
+      for (const m of out.media) synth.media.push(m);
+    }
+    return;
+  }
+  if (el.type === "diagram") {
+    const out = synthesiseDiagram(el as DiagramElement);
+    synth.items.push({ kind: "shape", xml: out.xml, after });
+    for (const m of out.media) synth.media.push(m);
     return;
   }
   if (el.type === "connector") {
@@ -577,10 +679,15 @@ function addText(
   // "\n" is split so each piece becomes its own paragraph (we use a per-run
   // `breakLine` flag on the trailing pieces).
   const items: pptxgen.TextProps[] = [];
+  // One cap entry per emitted run (pptxgenjs emits one `<a:r>` per item), so
+  // the post-process splice can re-apply `<a:rPr cap>` positionally — pptxgenjs
+  // drops the case transform otherwise.
+  const caps: (("all" | "small") | null)[] = [];
   for (const r of el.runs) {
     const pieces = r.text.split("\n");
     for (let i = 0; i < pieces.length; i++) {
       const isLast = i === pieces.length - 1;
+      caps.push(r.cap ?? null);
       items.push({
         text: pieces[i],
         options: {
@@ -601,6 +708,9 @@ function addText(
         },
       });
     }
+  }
+  if (caps.some((c) => c != null)) {
+    synth.capRunsByName.set(slidewiseShapeName(el.id), caps);
   }
   s.addText(items, baseOpts);
 }
@@ -864,7 +974,8 @@ async function preserveUnknowns(
   generated: ArrayBuffer,
   deck: Deck,
   explicitSource?: Blob | ArrayBuffer | Uint8Array,
-  asTemplate?: boolean
+  asTemplate?: boolean,
+  onWarning?: (warning: SerializeWarning) => void
 ): Promise<Blob> {
   // Prefer the caller-supplied source (survives state cloning / localStorage
   // rehydrate); fall back to the non-enumerable attachment from parsePptx
@@ -974,7 +1085,7 @@ async function preserveUnknowns(
   // on the master/layout disappears on save. Best-effort: bails when source
   // and output slide size don't match so 4:3 sources don't get their
   // masters stretched onto a 16:9 canvas.
-  await preserveDeckChrome(outZip, srcZip, deck, sourceSlidePaths);
+  await preserveDeckChrome(outZip, srcZip, deck, sourceSlidePaths, onWarning);
 
   // Per-slide `<p:bg>` preservation. pptxgenjs's slide.background only
   // emits solid colors, so gradient / image / theme-referenced
@@ -1683,17 +1794,34 @@ async function preserveDeckChrome(
   outZip: JSZip,
   srcZip: JSZip,
   deck: Deck,
-  sourceSlidePaths: string[]
+  sourceSlidePaths: string[],
+  onWarning?: (warning: SerializeWarning) => void
 ): Promise<void> {
-  if (!(await aspectRatiosMatch(outZip, srcZip))) {
+  const aspects = await readDeckAspects(outZip, srcZip);
+  if (!aspectsMatch(aspects)) {
     // We size the output slide from the source (see computeSerializeTransform),
     // so ratios should match for any parseable source. If we still land here
-    // the source's <p:sldSz> was unreadable — surface it rather than silently
-    // shipping a generic-looking deck stripped of the template's chrome.
-    console.warn(
-      "[slidewise/pptx] source slide size could not be matched; skipping " +
-        "master/layout/theme/font preservation (deck will use generic chrome)."
-    );
+    // the source's <p:sldSz> was unreadable — surface it (with the ratios we
+    // could read) rather than silently shipping a generic-looking deck stripped
+    // of the template's chrome.
+    const fmt = (r?: number) => (r != null ? r.toFixed(3) : "unknown");
+    const message =
+      "[slidewise/pptx] source slide size could not be matched " +
+      `(source aspect ${fmt(aspects.sourceAspect)}, output aspect ${fmt(
+        aspects.outputAspect
+      )}); skipping master/layout/theme/font preservation (deck will use ` +
+      "generic chrome).";
+    console.warn(message);
+    onWarning?.({
+      code: "chrome-skipped",
+      message,
+      ...(aspects.sourceAspect != null
+        ? { sourceAspect: aspects.sourceAspect }
+        : {}),
+      ...(aspects.outputAspect != null
+        ? { outputAspect: aspects.outputAspect }
+        : {}),
+    });
     return;
   }
 
@@ -1765,7 +1893,7 @@ async function preserveDeckChrome(
   //    which we just deleted. Re-point each slide at the original layout
   //    its source counterpart used. New slides (added in-editor with no
   //    source path) fall back to the first source layout.
-  await rewriteSlideLayoutRefs(outZip, srcZip, deck, sourceSlidePaths);
+  await rewriteSlideLayoutRefs(outZip, srcZip, deck, sourceSlidePaths, onWarning);
 }
 
 /**
@@ -2262,7 +2390,8 @@ async function rewriteSlideLayoutRefs(
   outZip: JSZip,
   srcZip: JSZip,
   deck: Deck,
-  sourceSlidePaths: string[]
+  sourceSlidePaths: string[],
+  onWarning?: (warning: SerializeWarning) => void
 ): Promise<void> {
   // Pre-compute a default fallback layout target for new slides that have
   // no source counterpart: the first slideLayout the source ships.
@@ -2287,10 +2416,33 @@ async function rewriteSlideLayoutRefs(
     let layoutTargetFull: string | undefined;
     // A slide instantiated from a layout (see `addSlideFromLayout`) declares
     // its layout directly — point its rels at that layout's source part,
-    // bypassing the source-slide → layout inference below.
+    // bypassing the source-slide → layout inference below. The id resolves
+    // from `deck.layouts` (carried in the deck JSON) OR, when the host didn't
+    // ship the layouts array, by the `slideLayoutN` id convention against the
+    // source archive — so authoring `{ sourceLayoutId: "slideLayout7" }` works
+    // with just the `{ source }` bytes.
     if (slide.sourceLayoutId) {
       const layout = deck.layouts?.find((l) => l.id === slide.sourceLayoutId);
-      if (layout?.sourcePath) layoutTargetFull = layout.sourcePath;
+      if (layout?.sourcePath) {
+        layoutTargetFull = layout.sourcePath;
+      } else {
+        const byConvention = `ppt/slideLayouts/${slide.sourceLayoutId}.xml`;
+        if (srcZip.file(byConvention)) layoutTargetFull = byConvention;
+      }
+      if (!layoutTargetFull) {
+        const message =
+          `[slidewise/pptx] slide ${i + 1}: sourceLayoutId ` +
+          `"${slide.sourceLayoutId}" matched no layout in deck.layouts nor ` +
+          `ppt/slideLayouts/${slide.sourceLayoutId}.xml in the source; ` +
+          "falling back to the first source layout.";
+        console.warn(message);
+        onWarning?.({
+          code: "layout-unresolved",
+          message,
+          slideIndex: i,
+          layoutId: slide.sourceLayoutId,
+        });
+      }
     }
     const sourceSlidePath = resolveSourceSlidePath(slide, i, sourceSlidePaths);
     if (!layoutTargetFull && sourceSlidePath) {
@@ -2333,23 +2485,32 @@ async function rewriteSlideLayoutRefs(
   }
 }
 
-async function aspectRatiosMatch(
+interface DeckAspects {
+  outputAspect?: number;
+  sourceAspect?: number;
+}
+
+async function readDeckAspects(
   outZip: JSZip,
   srcZip: JSZip
-): Promise<boolean> {
+): Promise<DeckAspects> {
   const [outPres, srcPres] = await Promise.all([
     outZip.file("ppt/presentation.xml")?.async("string"),
     srcZip.file("ppt/presentation.xml")?.async("string"),
   ]);
-  if (!outPres || !srcPres) return false;
-  const outSz = parseSldSz(outPres);
-  const srcSz = parseSldSz(srcPres);
-  if (!outSz || !srcSz) return false;
-  const outRatio = outSz.cx / outSz.cy;
-  const srcRatio = srcSz.cx / srcSz.cy;
+  const outSz = outPres ? parseSldSz(outPres) : null;
+  const srcSz = srcPres ? parseSldSz(srcPres) : null;
+  return {
+    ...(outSz ? { outputAspect: outSz.cx / outSz.cy } : {}),
+    ...(srcSz ? { sourceAspect: srcSz.cx / srcSz.cy } : {}),
+  };
+}
+
+function aspectsMatch(a: DeckAspects): boolean {
+  if (a.outputAspect == null || a.sourceAspect == null) return false;
   // ~1% tolerance covers floating-point drift; PPTX aspect ratios are
   // exact integer EMU.
-  return Math.abs(outRatio - srcRatio) / outRatio < 0.01;
+  return Math.abs(a.outputAspect - a.sourceAspect) / a.outputAspect < 0.01;
 }
 
 function parseSldSz(xml: string): { cx: number; cy: number } | null {
@@ -2527,6 +2688,11 @@ async function applySynth(outZip: JSZip, deck: Deck): Promise<void> {
       slideXml = spliceEffectsByName(slideXml, synth.effectsByName);
     }
 
+    // Re-apply per-run letter-case (`<a:rPr cap>`) pptxgenjs can't emit.
+    if (synth.capRunsByName.size) {
+      slideXml = spliceRunCapsByName(slideXml, synth.capRunsByName);
+    }
+
     if (newRelLines.length) {
       const insertAt = relsXml.lastIndexOf("</Relationships>");
       relsXml =
@@ -2596,6 +2762,37 @@ function spliceEffectsByName(
 }
 
 /**
+ * Re-apply per-run letter-case (`<a:rPr cap="all"|"small">`) into each
+ * pptxgenjs-emitted text `<p:sp>` whose `<p:cNvPr name>` matches a key. The
+ * value is one cap per emitted run (`<a:r>`) in document order — pptxgenjs has
+ * no `cap` option, so the importer's `TextRun.cap` would otherwise be lost on
+ * export. Runs already carry an `<a:rPr>` (our run items are styled); the cap
+ * attribute is inserted into it (one is added if somehow absent).
+ */
+function spliceRunCapsByName(
+  slideXml: string,
+  capRunsByName: Map<string, (("all" | "small") | null)[]>
+): string {
+  return slideXml.replace(/<p:sp\b[\s\S]*?<\/p:sp>/g, (sp: string) => {
+    const nameMatch = /<p:cNvPr\b[^>]*?name="([^"]*)"/.exec(sp);
+    if (!nameMatch || !nameMatch[1]) return sp;
+    const caps = capRunsByName.get(nameMatch[1]);
+    if (!caps || !caps.length) return sp;
+    let k = 0;
+    return sp.replace(/<a:r>[\s\S]*?<\/a:r>/g, (run: string) => {
+      const cap = caps[k++];
+      if (!cap) return run;
+      if (/<a:rPr\b[^>]*\bcap=/.test(run)) return run; // already set
+      if (/<a:rPr\b/.test(run)) {
+        return run.replace(/<a:rPr\b/, `<a:rPr cap="${cap}"`);
+      }
+      // No rPr (rare): insert a minimal one before the text.
+      return run.replace(/<a:r>/, `<a:r><a:rPr cap="${cap}"/>`);
+    });
+  });
+}
+
+/**
  * Write JSON-defined gradient / image slide backgrounds (PR 3). Only fires
  * when the source-PPTX bg preservation pass left the slide's `<p:bg>` empty
  * — that ensures source bytes always win.
@@ -2609,6 +2806,12 @@ async function applySynthSlideBackgrounds(
     const parsed = parseFill(slide.background);
     if (!parsed) continue;
     if (parsed.kind === "solid") continue;
+    // A layout-instantiated slide with an inherited (transparent) background
+    // must stay `<p:bg>`-less so the layout / master / theme background shows
+    // through. `preserveSlideBackgrounds` already stripped pptxgenjs's bg for
+    // this slide; synthesising an explicit `<a:noFill/>` here would re-assert
+    // an empty background and override the inheritance the host is relying on.
+    if (parsed.kind === "transparent" && slide.sourceLayoutId) continue;
     const slidePath = `ppt/slides/slide${i + 1}.xml`;
     const relsPath = `ppt/slides/_rels/slide${i + 1}.xml.rels`;
     const slideFile = outZip.file(slidePath);

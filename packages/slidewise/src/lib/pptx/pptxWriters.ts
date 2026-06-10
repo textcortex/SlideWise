@@ -25,13 +25,20 @@ import type {
   GroupElement,
   ChartElement,
   ConnectorElement,
+  ImageElement,
+  DiagramElement,
   ArrowheadKind,
   ShadowSpec,
   GlowSpec,
   FontAsset,
   Slide,
 } from "@/lib/types";
-import { pxToEmu, EMU_PER_POINT } from "./units";
+import {
+  layoutDiagram,
+  type DiagramBoxPrimitive,
+  type DiagramArrowPrimitive,
+} from "@/lib/diagram/layout";
+import { pxToEmu, pxToPoints, EMU_PER_POINT } from "./units";
 
 // -- Identifiers ------------------------------------------------------------
 
@@ -854,6 +861,182 @@ export function synthesiseConnector(el: ConnectorElement): {
     `<p:spPr>${xfrm}<a:prstGeom prst="${preset}"><a:avLst/></a:prstGeom>${ln}${effects}</p:spPr>` +
     `</p:cxnSp>`;
   return { xml, media: [] };
+}
+
+// -- Image with crop / rounded corners --------------------------------------
+
+/**
+ * Emit a synthesised `<p:pic>` for an image that carries a `crop`
+ * (`<a:srcRect>`) and/or `radius` (rounded-corner `roundRect` geometry) — the
+ * forms pptxgenjs's `addImage` can't express (its `cover`/`contain` sizing
+ * emits its *own* `<a:srcRect>`, which would fight a user crop). Bypassing
+ * pptxgenjs for these keeps `crop` / `radius` round-tripping faithfully. The
+ * image bytes are returned as a media payload with a marker rId the
+ * orchestrator rewrites. Returns `null` when the source isn't an inlineable
+ * data URL (remote URLs keep the pptxgenjs path).
+ */
+export function synthesiseImage(el: ImageElement): SynthShapeResult | null {
+  const media = mediaFromUrl(el.src, `pic_${el.id}`);
+  if (!media) return null;
+  const id = freshNvId();
+  const name = slidewiseShapeName(el.id);
+  const ridMarker = ridMarkerFor(`pic_${el.id}`, 0);
+
+  // `<a:srcRect>` chops a fraction off each edge; OOXML values are 1000ths of
+  // a percent (100% = 100000), matching the importer's `/100000` decode.
+  const srcRect = cropSrcRectXml(el.crop);
+  // `fill` stretches the (already-cropped) image across the box; cover/contain
+  // are approximated by stretch here since the crop has been applied explicitly.
+  // The picture fill wrapper for `<p:pic>` is `<p:blipFill>` (presentationml),
+  // not `<a:blipFill>` — its inner blip / srcRect / stretch stay in `a:`.
+  const fill =
+    `<p:blipFill><a:blip r:embed="${ridMarker}"/>` +
+    srcRect +
+    `<a:stretch><a:fillRect/></a:stretch></p:blipFill>`;
+  const geom = imageGeometryXml(el.radius, el.w, el.h);
+  const xfrm = xfrmXml(el.x, el.y, el.w, el.h, el.rotation);
+
+  const xml =
+    `<p:pic>` +
+    `<p:nvPicPr>` +
+    `<p:cNvPr id="${id}" name="${escapeAttr(name)}"${el.alt ? ` descr="${escapeAttr(el.alt)}"` : ""}/>` +
+    `<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>` +
+    `<p:nvPr/>` +
+    `</p:nvPicPr>` +
+    fill +
+    `<p:spPr>${xfrm}${geom}</p:spPr>` +
+    `</p:pic>`;
+  return { xml, media: [media] };
+}
+
+function cropSrcRectXml(
+  crop: ImageElement["crop"] | undefined
+): string {
+  if (!crop) return "";
+  const pct = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 100000);
+  const l = pct(crop.l);
+  const t = pct(crop.t);
+  const r = pct(crop.r);
+  const b = pct(crop.b);
+  if (!l && !t && !r && !b) return "";
+  return `<a:srcRect${l ? ` l="${l}"` : ""}${t ? ` t="${t}"` : ""}${r ? ` r="${r}"` : ""}${b ? ` b="${b}"` : ""}/>`;
+}
+
+function imageGeometryXml(
+  radius: number | undefined,
+  w: number,
+  h: number
+): string {
+  if (!radius || radius <= 0) {
+    return `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>`;
+  }
+  // roundRect `adj` is a fraction of the shorter side (ST_Percentage, 1000ths
+  // of a percent), capped at 50% (a full pill).
+  const frac = Math.min(0.5, radius / Math.max(1, Math.min(w, h)));
+  const adj = Math.round(frac * 100000);
+  return `<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val ${adj}"/></a:avLst></a:prstGeom>`;
+}
+
+// -- Diagram (process / timeline / funnel / matrix / cycle / list) ----------
+
+const DIAGRAM_PRESET: Record<DiagramBoxPrimitive["shape"], string> = {
+  rect: "rect",
+  roundRect: "roundRect",
+  ellipse: "ellipse",
+};
+
+/**
+ * Emit a `<p:grpSp>` for a diagram: one labelled `<p:sp>` per node plus
+ * `<p:cxnSp>` arrows, laid out by `layoutDiagram` (shared with the renderer).
+ * The group's external frame is the element box (`off=el.x,el.y` `ext=w×h`)
+ * with a child frame of `chOff=0,0` `chExt=w×h`, so the layout's local
+ * coordinates serialise unchanged. The result stays grouped and editable in
+ * PowerPoint instead of collapsing to anonymous floating shapes.
+ */
+export function synthesiseDiagram(el: DiagramElement): {
+  xml: string;
+  media: MediaPayload[];
+} {
+  const primitives = layoutDiagram(el);
+  const w = Math.max(1, el.w);
+  const h = Math.max(1, el.h);
+  const fontPt = pxToPoints(el.fontSize ?? 18);
+  const fontFamily = el.fontFamily ?? "Inter";
+
+  const children = primitives
+    .map((p) =>
+      p.kind === "box"
+        ? diagramBoxXml(p, fontPt, fontFamily)
+        : diagramArrowXml(p)
+    )
+    .join("");
+
+  const xfrm =
+    `<a:xfrm>` +
+    `<a:off x="${pxToEmu(el.x)}" y="${pxToEmu(el.y)}"/>` +
+    `<a:ext cx="${pxToEmu(w)}" cy="${pxToEmu(h)}"/>` +
+    `<a:chOff x="0" y="0"/>` +
+    `<a:chExt cx="${pxToEmu(w)}" cy="${pxToEmu(h)}"/>` +
+    `</a:xfrm>`;
+  const xml =
+    `<p:grpSp>` +
+    `<p:nvGrpSpPr><p:cNvPr id="${freshNvId()}" name="${escapeAttr(slidewiseShapeName(el.id))}"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` +
+    `<p:grpSpPr>${xfrm}</p:grpSpPr>` +
+    children +
+    `</p:grpSp>`;
+  return { xml, media: [] };
+}
+
+function diagramBoxXml(
+  b: DiagramBoxPrimitive,
+  fontPt: number,
+  fontFamily: string
+): string {
+  const id = freshNvId();
+  const preset = DIAGRAM_PRESET[b.shape] ?? "rect";
+  const xfrm =
+    `<a:xfrm>` +
+    `<a:off x="${pxToEmu(b.x)}" y="${pxToEmu(b.y)}"/>` +
+    `<a:ext cx="${pxToEmu(b.w)}" cy="${pxToEmu(b.h)}"/>` +
+    `</a:xfrm>`;
+  const sz = Math.max(100, Math.round(fontPt * 100));
+  const run = b.text
+    ? `<a:r><a:rPr lang="en-US" sz="${sz}" b="1"><a:solidFill><a:srgbClr val="${hexBare(b.textColor)}"/></a:solidFill><a:latin typeface="${escapeAttr(fontFamily)}"/></a:rPr><a:t>${escapeText(b.text)}</a:t></a:r>`
+    : `<a:endParaRPr lang="en-US" sz="${sz}"/>`;
+  return (
+    `<p:sp>` +
+    `<p:nvSpPr><p:cNvPr id="${id}" name="${escapeAttr(slidewiseShapeName(b.id))}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr>${xfrm}<a:prstGeom prst="${preset}"><a:avLst/></a:prstGeom>${solidFillXml(b.fill)}</p:spPr>` +
+    `<p:txBody><a:bodyPr wrap="square" anchor="ctr"/><a:lstStyle/><a:p><a:pPr algn="ctr"/>${run}</a:p></p:txBody>` +
+    `</p:sp>`
+  );
+}
+
+function diagramArrowXml(a: DiagramArrowPrimitive): string {
+  const id = freshNvId();
+  const x = Math.min(a.x1, a.x2);
+  const y = Math.min(a.y1, a.y2);
+  const w = Math.abs(a.x2 - a.x1);
+  const h = Math.abs(a.y2 - a.y1);
+  const flipH = a.x2 < a.x1 ? ` flipH="1"` : "";
+  const flipV = a.y2 < a.y1 ? ` flipV="1"` : "";
+  const xfrm =
+    `<a:xfrm${flipH}${flipV}>` +
+    `<a:off x="${pxToEmu(x)}" y="${pxToEmu(y)}"/>` +
+    `<a:ext cx="${pxToEmu(Math.max(1, w))}" cy="${pxToEmu(Math.max(1, h))}"/>` +
+    `</a:xfrm>`;
+  const head = a.arrow ? `<a:tailEnd type="triangle"/>` : "";
+  const ln =
+    `<a:ln w="${Math.max(1, Math.round(2 * EMU_PER_POINT))}">` +
+    `<a:solidFill><a:srgbClr val="${hexBare(a.stroke)}"/></a:solidFill>` +
+    head +
+    `</a:ln>`;
+  return (
+    `<p:cxnSp>` +
+    `<p:nvCxnSpPr><p:cNvPr id="${id}" name="${escapeAttr(slidewiseShapeName(a.id))}"/><p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr>` +
+    `<p:spPr>${xfrm}<a:prstGeom prst="straightConnector1"><a:avLst/></a:prstGeom>${ln}</p:spPr>` +
+    `</p:cxnSp>`
+  );
 }
 
 // -- Slide background synthesis (PR 3) --------------------------------------
