@@ -14,10 +14,18 @@ import type {
   IconElement,
   EmbedElement,
   ChartElement,
+  ConnectorElement,
   GroupElement,
   UnknownElement,
 } from "@/lib/types";
 import { pxToInches, pxToPoints } from "./units";
+import {
+  EMU_PER_PX,
+  EMU_PER_INCH,
+  PPTX_SLIDE_W_INCHES,
+  PPTX_SLIDE_H_INCHES,
+} from "./units";
+import { SLIDE_W, SLIDE_H } from "@/lib/types";
 import {
   SOURCE_PPTX,
   SOURCE_SLIDE_PATH,
@@ -29,6 +37,7 @@ import {
   synthesiseShape,
   synthesiseGroup,
   synthesiseChart,
+  synthesiseConnector,
   synthesiseSlideBg,
   synthesiseEmbeddedFonts,
   effectLstXml,
@@ -113,10 +122,18 @@ export async function serializeDeck(
 
   const pptx = new pptxgen();
   pptx.title = deck.title || "Untitled";
-  pptx.layout = "LAYOUT_WIDE"; // 13.333 × 7.5 in
+
+  // Resolve the source once (reused by preserveUnknowns) and derive the output
+  // slide size from it. A non-16:9 template (4:3, 16:10, custom) is emitted at
+  // its own size with a custom layout, and model-emitted element coordinates
+  // are mapped back out of the fixed 1920×1080 authoring canvas into the
+  // source's coordinate space (the inverse of the parse-time letterbox fit).
+  const sourceBuffer = await resolveSource(deck, options.source);
+  const transform = await computeSerializeTransform(sourceBuffer);
+  applyLayout(pptx, transform);
 
   for (let i = 0; i < deck.slides.length; i++) {
-    addSlide(pptx, deck.slides[i], i);
+    addSlide(pptx, deck.slides[i], i, transform);
   }
 
   // Use arraybuffer (universal: works in Node + browser, accepted by JSZip
@@ -124,10 +141,15 @@ export async function serializeDeck(
   const generated = (await pptx.write({
     outputType: "arraybuffer",
   })) as ArrayBuffer;
-  return preserveUnknowns(generated, deck, options.source, options.asTemplate);
+  return preserveUnknowns(generated, deck, sourceBuffer, options.asTemplate);
 }
 
-function addSlide(pptx: pptxgen, slide: Slide, slideIndex: number): void {
+function addSlide(
+  pptx: pptxgen,
+  slide: Slide,
+  slideIndex: number,
+  transform: SerializeTransform
+): void {
   const s = pptx.addSlide();
   // pptxgenjs only understands flat-hex slide backgrounds. For richer forms
   // (gradients / image fills) we leave a sentinel hex here and overwrite the
@@ -136,12 +158,17 @@ function addSlide(pptx: pptxgen, slide: Slide, slideIndex: number): void {
 
   const synth = synthForSlide(slideIndex);
   const sorted = [...slide.elements].sort((a, b) => a.z - b.z);
-  for (const el of sorted) {
+  for (const rawEl of sorted) {
     // Skip elements whose imported OOXML survived this far AND haven't
     // been edited — the post-process step replays their source XML
     // verbatim, sidestepping pptxgenjs's lossy translation of
-    // gradient / custGeom / backing fields.
-    if (isPristineImportedElement(el)) continue;
+    // gradient / custGeom / backing fields. Done BEFORE the transform so the
+    // verbatim-source check sees the untouched element.
+    if (isPristineImportedElement(rawEl)) continue;
+    // Map model-emitted coordinates back into the source coordinate space
+    // (no-op for 16:9 / source-less decks — `untransformElement` returns the
+    // same object when the transform is the identity).
+    const el = untransformElement(rawEl, transform);
     if (shouldSynthesise(el)) {
       synthesiseInto(synth, el);
       continue;
@@ -155,6 +182,128 @@ function addSlide(pptx: pptxgen, slide: Slide, slideIndex: number): void {
       );
     }
   }
+}
+
+/**
+ * How model-emitted element coordinates map from the fixed 1920×1080 authoring
+ * canvas onto the output slide. For a 16:9 (or source-less) deck this is the
+ * identity and `LAYOUT_WIDE` is used unchanged. For a non-16:9 source we emit
+ * the slide at the source's real size and invert the parse-time fit:
+ *   sourcePx = (canvasPx - offset) / scale
+ * which is exactly the inverse of `computeFit`'s `canvasPx = sourcePx*scale +
+ * offset`. `scale` also un-does the font/stroke scaling the importer applied.
+ */
+interface SerializeTransform {
+  scale: number;
+  offsetX: number;
+  offsetY: number;
+  /** Output slide width / height in inches. */
+  widthIn: number;
+  heightIn: number;
+  /** Whether a custom (non-LAYOUT_WIDE) layout is needed. */
+  custom: boolean;
+}
+
+const IDENTITY_TRANSFORM: SerializeTransform = {
+  scale: 1,
+  offsetX: 0,
+  offsetY: 0,
+  widthIn: PPTX_SLIDE_W_INCHES,
+  heightIn: PPTX_SLIDE_H_INCHES,
+  custom: false,
+};
+
+const SIXTEEN_NINE = 16 / 9;
+
+async function computeSerializeTransform(
+  sourceBuffer?: ArrayBuffer
+): Promise<SerializeTransform> {
+  if (!sourceBuffer) return IDENTITY_TRANSFORM;
+  try {
+    const zip = await JSZip.loadAsync(sourceBuffer);
+    const pres = await zip.file("ppt/presentation.xml")?.async("string");
+    if (!pres) return IDENTITY_TRANSFORM;
+    const sz = parseSldSz(pres);
+    if (!sz || !sz.cx || !sz.cy) return IDENTITY_TRANSFORM;
+    const ratio = sz.cx / sz.cy;
+    // Aspect ratio already 16:9 → the existing LAYOUT_WIDE path is correct and
+    // proven (any 16:9 size renders proportionally on the 13.333×7.5 slide).
+    // Leave it exactly as-is to avoid perturbing the common case.
+    if (Math.abs(ratio - SIXTEEN_NINE) / SIXTEEN_NINE < 0.01) {
+      return IDENTITY_TRANSFORM;
+    }
+    // Mirror computeFit (parse-time) so we can invert it.
+    const sourceWpx = sz.cx / EMU_PER_PX;
+    const sourceHpx = sz.cy / EMU_PER_PX;
+    const scale = Math.min(SLIDE_W / sourceWpx, SLIDE_H / sourceHpx);
+    const offsetX = Math.round((SLIDE_W - sourceWpx * scale) / 2);
+    const offsetY = Math.round((SLIDE_H - sourceHpx * scale) / 2);
+    return {
+      scale,
+      offsetX,
+      offsetY,
+      widthIn: sz.cx / EMU_PER_INCH,
+      heightIn: sz.cy / EMU_PER_INCH,
+      custom: true,
+    };
+  } catch {
+    return IDENTITY_TRANSFORM;
+  }
+}
+
+function applyLayout(pptx: pptxgen, t: SerializeTransform): void {
+  if (!t.custom) {
+    pptx.layout = "LAYOUT_WIDE"; // 13.333 × 7.5 in
+    return;
+  }
+  // defineLayout takes inches; pptxgenjs writes round(inches*914400) EMU, which
+  // is exact here because widthIn/heightIn = integer EMU / 914400.
+  pptx.defineLayout({
+    name: "SLIDEWISE_SRC",
+    width: t.widthIn,
+    height: t.heightIn,
+  });
+  pptx.layout = "SLIDEWISE_SRC";
+}
+
+/**
+ * Return a shallow copy of `el` with its geometry (and font/stroke sizes)
+ * mapped from the authoring canvas into the output slide's coordinate space.
+ * Returns the SAME object for the identity transform so 16:9 / source-less
+ * decks are byte-for-byte unchanged (and the pristine-snapshot check upstream
+ * still matches).
+ */
+function untransformElement<T extends SlideElement>(
+  el: T,
+  t: SerializeTransform
+): T {
+  if (!t.custom) return el;
+  const next = {
+    ...el,
+    x: (el.x - t.offsetX) / t.scale,
+    y: (el.y - t.offsetY) / t.scale,
+    w: el.w / t.scale,
+    h: el.h / t.scale,
+  } as T;
+  // Un-scale type-specific sizes the importer scaled by `fit.scale`.
+  if (t.scale !== 1) {
+    if (next.type === "text") {
+      const txt = next as TextElement;
+      txt.fontSize = txt.fontSize / t.scale;
+      if (txt.runs) {
+        txt.runs = txt.runs.map((r) =>
+          r.fontSize != null ? { ...r, fontSize: r.fontSize / t.scale } : r
+        );
+      }
+    } else if (next.type === "shape" || next.type === "line") {
+      const s = next as ShapeElement | LineElement;
+      if (s.strokeWidth != null) s.strokeWidth = s.strokeWidth / t.scale;
+    } else if (next.type === "connector") {
+      const c = next as ConnectorElement;
+      c.strokeWidth = c.strokeWidth / t.scale;
+    }
+  }
+  return next;
 }
 
 /**
@@ -173,6 +322,7 @@ function shouldSynthesise(el: SlideElement): boolean {
     return false;
   }
   if (el.type === "group") return true;
+  if (el.type === "connector") return true;
   if (el.type === "chart" && !el.ooxmlXml) return true;
   return false;
 }
@@ -205,6 +355,12 @@ function synthesiseInto(synth: SynthSlideEntry, el: SlideElement): void {
   if (el.type === "chart") {
     const out = synthesiseChart(el as ChartElement);
     synth.charts.push(out);
+    return;
+  }
+  if (el.type === "connector") {
+    const out = synthesiseConnector(el as ConnectorElement);
+    synth.shapeXml.push(out.xml);
+    for (const m of out.media) synth.media.push(m);
     return;
   }
 }
@@ -293,6 +449,9 @@ function addElement(
       return;
     case "group":
       // Groups are handled by the synth path before reaching here.
+      return;
+    case "connector":
+      // Connectors are handled by the synth path (synthesiseConnector).
       return;
     case "unknown":
       // Preserved by preserveUnknowns() after pptxgenjs writes the zip.
@@ -738,8 +897,11 @@ async function preserveUnknowns(
     // fragments; each pristine fragment carries its own (layout / master)
     // source path so the injector can resolve r:id references against
     // the correct rels file.
-    const slideSourcePath =
-      unknownGroup?.sourcePath ?? sourceSlidePaths[slideIndex] ?? undefined;
+    const slideSourcePath = resolveSourceSlidePath(
+      deck.slides[slideIndex],
+      slideIndex,
+      sourceSlidePaths
+    );
     const unknownFragments: PristineFragment[] =
       unknownGroup && slideSourcePath
         ? unknownGroup.unknowns.map((u) => ({
@@ -826,6 +988,41 @@ async function resolveSource(
   //    the deck object hasn't been spread / cloned since import.
   const attached = (deck as unknown as Record<string, unknown>)[SOURCE_PPTX];
   return attached instanceof ArrayBuffer ? attached : undefined;
+}
+
+/**
+ * Resolve which source slide's chrome (background + layout reference) a given
+ * output slide should replay from. Precedence:
+ *
+ *   1. `slide.sourceSlideIndex` — an explicit, host-declared 0-based index
+ *      into the source slide list. Wins because the host is the only party
+ *      that knows it reordered / subset / duplicated slides, and the field is
+ *      enumerable so it survives the state cloning that strips (2).
+ *   2. The non-enumerable `SOURCE_SLIDE_PATH` attachment stamped at parse —
+ *      correct for the untouched parse → serialize path with no host state in
+ *      between.
+ *   3. Positional: output slide `i` ← source slide `i`. The legacy behaviour;
+ *      only correct when output order matches source order.
+ */
+function resolveSourceSlidePath(
+  slide: Slide,
+  outputIndex: number,
+  sourceSlidePaths: string[]
+): string | undefined {
+  const declared = slide.sourceSlideIndex;
+  if (
+    typeof declared === "number" &&
+    Number.isInteger(declared) &&
+    declared >= 0 &&
+    declared < sourceSlidePaths.length
+  ) {
+    return sourceSlidePaths[declared];
+  }
+  const attached = (slide as unknown as Record<string, unknown>)[
+    SOURCE_SLIDE_PATH
+  ];
+  if (typeof attached === "string") return attached;
+  return sourceSlidePaths[outputIndex];
 }
 
 /**
@@ -956,6 +1153,13 @@ async function injectIntoSlide(
    * `r:NAME="rIdN"` style attribute the schema uses. Restricting to the
    * value pattern `rId\d+` keeps unrelated `r:*` attributes untouched.
    */
+  // Parts the fragment directly references (e.g. a chart's `chartN.xml`) get
+  // copied inside the synchronous replace below; their OWN dependency trees
+  // (a chart's embedded workbook, colors/style parts, and the rels that bind
+  // them) are deep-copied afterwards — `.replace` is synchronous so it can't
+  // await the recursive rels walk.
+  const deepCopyJobs: Array<{ srcFull: string; outFull: string }> = [];
+
   const rewriteFragment = async (frag: PristineFragment): Promise<string> => {
     const srcRels = await getSrcRels(frag.sourcePath);
     const sourceDir = dirOf(frag.sourcePath);
@@ -982,6 +1186,10 @@ async function injectIntoSlide(
               binary: true,
             });
             target = newTarget;
+            deepCopyJobs.push({
+              srcFull: srcFullTarget,
+              outFull: newFullTarget,
+            });
           }
         }
         newRelLines.push(buildRelXml(newRid, srcRel.type, target));
@@ -996,6 +1204,21 @@ async function injectIntoSlide(
   const rewrittenUnknowns = await Promise.all(
     unknownFragments.map(rewriteFragment)
   );
+
+  // Deep-copy each referenced part's dependency tree so e.g. a preserved
+  // chart's embedded Excel workbook + colors/style parts (and the content
+  // types declaring them) come along. Sequential so the shared
+  // `[Content_Types].xml` read/modify/write doesn't race.
+  const copied = new Set<string>();
+  for (const job of deepCopyJobs) {
+    await copyPartDependencies(
+      srcZip,
+      outZip,
+      job.srcFull,
+      job.outFull,
+      copied
+    );
+  }
 
   let updatedSlide = slideXml;
   // Pristine fragments → prepend after `<p:grpSpPr/>` (low z, decoration
@@ -1036,6 +1259,148 @@ async function injectIntoSlide(
           );
     outZip.file(generatedRelsPath, updatedRels);
   }
+}
+
+/**
+ * Recursively copy a part's dependency tree from the source archive into the
+ * output zip, registering each copied part's content type. Called for every
+ * part a preserved fragment references (charts especially): the directly
+ * referenced `chartN.xml` is copied by the caller, then this walks
+ * `chartN.xml`'s own rels to bring along the embedded Excel workbook
+ * (`ppt/embeddings/*.xlsx`), the `colors*.xml` / `style*.xml` parts, and any
+ * media — rewriting the copied part's rels to point at the (renamed) copies.
+ *
+ * The copied part keeps its ORIGINAL relationship ids, so the rIds embedded in
+ * its XML still resolve; only the rel Targets change to the renamed parts.
+ *
+ * Without this a preserved chart renders from its baked `numCache`/`strCache`
+ * but PowerPoint flags a repair (its rels dangle) and "Edit Data" / custom
+ * chart colours + styles are lost.
+ */
+async function copyPartDependencies(
+  srcZip: JSZip,
+  outZip: JSZip,
+  srcPartPath: string,
+  outPartPath: string,
+  copied: Set<string>
+): Promise<void> {
+  // Guard against cycles and redundant work (two charts sharing one workbook).
+  if (copied.has(srcPartPath)) return;
+  copied.add(srcPartPath);
+
+  await ensureContentType(srcZip, outZip, srcPartPath, outPartPath);
+
+  const srcRelsPath = relsPathFor(srcPartPath);
+  const srcRelsXml = await srcZip.file(srcRelsPath)?.async("string");
+  if (!srcRelsXml) return;
+  const rels = parseRels(srcRelsXml);
+  if (!rels.size) return;
+
+  const srcDir = dirOf(srcPartPath);
+  const outDir = dirOf(outPartPath);
+  const newRelLines: string[] = [];
+  for (const [id, rel] of rels) {
+    const isExternal = /^https?:\/\//i.test(rel.target);
+    const isInternalPart =
+      !isExternal && !rel.target.startsWith("/");
+    if (!isInternalPart) {
+      newRelLines.push(buildRelXml(id, rel.type, rel.target));
+      continue;
+    }
+    const childSrcFull = normalisePath(rel.target, srcDir);
+    const childSrcFile = srcZip.file(childSrcFull);
+    if (!childSrcFile) {
+      // Dangling in the source too — keep the rel verbatim rather than drop it.
+      newRelLines.push(buildRelXml(id, rel.type, rel.target));
+      continue;
+    }
+    const childOutTarget = uniqueTarget(rel.target, outZip, outDir);
+    const childOutFull = normalisePath(childOutTarget, outDir);
+    outZip.file(childOutFull, childSrcFile.async("uint8array"), {
+      binary: true,
+    });
+    await copyPartDependencies(
+      srcZip,
+      outZip,
+      childSrcFull,
+      childOutFull,
+      copied
+    );
+    newRelLines.push(buildRelXml(id, rel.type, childOutTarget));
+  }
+
+  const outRelsPath = relsPathFor(outPartPath);
+  outZip.file(
+    outRelsPath,
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      newRelLines.join("") +
+      `</Relationships>`
+  );
+}
+
+/** Parsed `[Content_Types].xml` of a source archive: part-name Overrides +
+ *  extension Defaults. Cached per source zip so we parse it once per save. */
+const srcContentTypeCache = new WeakMap<
+  JSZip,
+  { overrides: Map<string, string>; defaults: Map<string, string> }
+>();
+
+async function getSourceContentTypes(
+  srcZip: JSZip
+): Promise<{ overrides: Map<string, string>; defaults: Map<string, string> }> {
+  const cached = srcContentTypeCache.get(srcZip);
+  if (cached) return cached;
+  const xml = (await srcZip.file("[Content_Types].xml")?.async("string")) ?? "";
+  const overrides = new Map<string, string>();
+  const defaults = new Map<string, string>();
+  for (const m of xml.matchAll(/<Override\b[^>]*\/>/g)) {
+    const part = /PartName="([^"]+)"/.exec(m[0])?.[1];
+    const ct = /ContentType="([^"]+)"/.exec(m[0])?.[1];
+    if (part && ct) overrides.set(part, ct);
+  }
+  for (const m of xml.matchAll(/<Default\b[^>]*\/>/g)) {
+    const ext = /Extension="([^"]+)"/.exec(m[0])?.[1];
+    const ct = /ContentType="([^"]+)"/.exec(m[0])?.[1];
+    if (ext && ct) defaults.set(ext.toLowerCase(), ct);
+  }
+  const parsed = { overrides, defaults };
+  srcContentTypeCache.set(srcZip, parsed);
+  return parsed;
+}
+
+/**
+ * Ensure the output `[Content_Types].xml` declares a content type for a part
+ * we copied from the source, reusing the source's own declaration (Override by
+ * part name, else Default by extension). Added as an Override against the new
+ * (possibly renamed) part path. No-op when the part is already declared or the
+ * source has no type for it.
+ */
+async function ensureContentType(
+  srcZip: JSZip,
+  outZip: JSZip,
+  srcPartPath: string,
+  outPartPath: string
+): Promise<void> {
+  const { overrides, defaults } = await getSourceContentTypes(srcZip);
+  const ext = srcPartPath.slice(srcPartPath.lastIndexOf(".") + 1).toLowerCase();
+  const ct = overrides.get(`/${srcPartPath}`) ?? defaults.get(ext);
+  if (!ct) return;
+  const ctFile = outZip.file("[Content_Types].xml");
+  if (!ctFile) return;
+  const xml = await ctFile.async("string");
+  // Add an Override keyed by the new part name. An Override always supersedes
+  // a Default for that part, so we add it even when a `<Default>` for the
+  // extension exists — pptxgenjs declares a generic `Default Extension="xml"`,
+  // but a chart / chartstyle / chartcolorstyle part needs its specific type.
+  if (xml.includes(`PartName="/${outPartPath}"`)) return;
+  const override = `<Override PartName="/${outPartPath}" ContentType="${ct}"/>`;
+  const close = xml.lastIndexOf("</Types>");
+  if (close < 0) return;
+  outZip.file(
+    "[Content_Types].xml",
+    xml.slice(0, close) + override + xml.slice(close)
+  );
 }
 
 /**
@@ -1187,7 +1552,17 @@ async function preserveDeckChrome(
   deck: Deck,
   sourceSlidePaths: string[]
 ): Promise<void> {
-  if (!(await aspectRatiosMatch(outZip, srcZip))) return;
+  if (!(await aspectRatiosMatch(outZip, srcZip))) {
+    // We size the output slide from the source (see computeSerializeTransform),
+    // so ratios should match for any parseable source. If we still land here
+    // the source's <p:sldSz> was unreadable — surface it rather than silently
+    // shipping a generic-looking deck stripped of the template's chrome.
+    console.warn(
+      "[slidewise/pptx] source slide size could not be matched; skipping " +
+        "master/layout/theme/font preservation (deck will use generic chrome)."
+    );
+    return;
+  }
 
   // 1. Find every chrome path that exists in the source.
   const srcChromePaths = listPaths(srcZip, CHROME_PREFIXES);
@@ -1278,11 +1653,16 @@ async function preserveSlideBackgrounds(
 ): Promise<void> {
   for (let i = 0; i < deck.slides.length; i++) {
     const slide = deck.slides[i];
-    const sourceSlidePath =
-      ((slide as unknown as Record<string, unknown>)[SOURCE_SLIDE_PATH] as
-        | string
-        | undefined) ?? sourceSlidePaths[i];
-    if (!sourceSlidePath) continue;
+    const sourceSlidePath = resolveSourceSlidePath(slide, i, sourceSlidePaths);
+    if (!sourceSlidePath) {
+      // A slide instantiated from a layout (addSlideFromLayout) has no source
+      // slide. Drop pptxgenjs's flat bg so the layout/master background shows
+      // through, unless the host set an explicit non-transparent background.
+      if (slide.sourceLayoutId && isInheritedBackground(slide.background)) {
+        await stripOutputBg(outZip, i);
+      }
+      continue;
+    }
     const srcSlideFile = srcZip.file(sourceSlidePath);
     if (!srcSlideFile) continue;
     const srcXml = await srcSlideFile.async("string");
@@ -1771,12 +2151,16 @@ async function rewriteSlideLayoutRefs(
     const outSlideRelsXml = await outZip.file(slideRelsPath)?.async("string");
     if (!outSlideRelsXml) continue;
 
-    const sourceSlidePath =
-      ((slide as unknown as Record<string, unknown>)[SOURCE_SLIDE_PATH] as
-        | string
-        | undefined) ?? sourceSlidePaths[i];
     let layoutTargetFull: string | undefined;
-    if (sourceSlidePath) {
+    // A slide instantiated from a layout (see `addSlideFromLayout`) declares
+    // its layout directly — point its rels at that layout's source part,
+    // bypassing the source-slide → layout inference below.
+    if (slide.sourceLayoutId) {
+      const layout = deck.layouts?.find((l) => l.id === slide.sourceLayoutId);
+      if (layout?.sourcePath) layoutTargetFull = layout.sourcePath;
+    }
+    const sourceSlidePath = resolveSourceSlidePath(slide, i, sourceSlidePaths);
+    if (!layoutTargetFull && sourceSlidePath) {
       const srcSlideRelsPath = relsPathFor(sourceSlidePath);
       const srcSlideRelsXml = await srcZip
         .file(srcSlideRelsPath)
@@ -1914,6 +2298,12 @@ function hexNoHash(color: string): string {
 
 function isDataUrl(src: string): boolean {
   return /^data:image\//i.test(src);
+}
+
+/** A background that means "inherit from layout/master" rather than paint a
+ *  fill — used to decide whether to strip a layout-instantiated slide's bg. */
+function isInheritedBackground(bg: string | undefined): boolean {
+  return !bg || bg === "transparent" || bg === "none";
 }
 
 function clamp01(n: number): number {

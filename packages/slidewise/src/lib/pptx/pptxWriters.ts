@@ -24,6 +24,8 @@ import type {
   ShapeElement,
   GroupElement,
   ChartElement,
+  ConnectorElement,
+  ArrowheadKind,
   ShadowSpec,
   GlowSpec,
   FontAsset,
@@ -793,6 +795,65 @@ export function synthesiseGroup(
     childXml.join("") +
     `</p:grpSp>`;
   return { xml, media: childMedia };
+}
+
+// -- Connector ---------------------------------------------------------------
+
+const CONNECTOR_PRESET: Record<ConnectorElement["kind"], string> = {
+  straight: "straightConnector1",
+  bent: "bentConnector3",
+  curved: "curvedConnector3",
+};
+
+/** Map our arrowhead names onto OOXML `<a:headEnd>/<a:tailEnd>` `type` values
+ *  (which share the same vocabulary). */
+function lineEndXml(tag: "headEnd" | "tailEnd", kind?: ArrowheadKind): string {
+  if (!kind || kind === "none") return "";
+  // Our names are already the OOXML values (triangle/stealth/arrow/oval/diamond).
+  return `<a:${tag} type="${kind}"/>`;
+}
+
+/**
+ * Emit a `<p:cxnSp>` connector. The bounding box spans the two anchor corners;
+ * `flipH`/`flipV` select which diagonal the line runs along (exactly how OOXML
+ * encodes connector direction). Straight / bent (elbow) / curved presets map to
+ * the `straightConnector1` / `bentConnector3` / `curvedConnector3` geometries.
+ */
+export function synthesiseConnector(el: ConnectorElement): {
+  xml: string;
+  media: MediaPayload[];
+} {
+  const id = freshNvId();
+  const name = slidewiseShapeName(el.id);
+  const rot = el.rotation ? ` rot="${Math.round(el.rotation * 60000)}"` : "";
+  const flip =
+    (el.flipH ? ` flipH="1"` : "") + (el.flipV ? ` flipV="1"` : "");
+  const xfrm =
+    `<a:xfrm${rot}${flip}>` +
+    `<a:off x="${pxToEmu(el.x)}" y="${pxToEmu(el.y)}"/>` +
+    `<a:ext cx="${pxToEmu(Math.max(1, el.w))}" cy="${pxToEmu(Math.max(1, el.h))}"/>` +
+    `</a:xfrm>`;
+  const preset = CONNECTOR_PRESET[el.kind] ?? "straightConnector1";
+  const widthEmu = Math.max(1, Math.round((el.strokeWidth ?? 1) * EMU_PER_POINT));
+  const dash = el.dashType ? `<a:prstDash val="${el.dashType}"/>` : "";
+  const ln =
+    `<a:ln w="${widthEmu}">` +
+    `<a:solidFill><a:srgbClr val="${hexBare(el.stroke)}"/></a:solidFill>` +
+    dash +
+    lineEndXml("headEnd", el.startArrow) +
+    lineEndXml("tailEnd", el.endArrow) +
+    `</a:ln>`;
+  const effects = effectLstXml(el.shadow, el.glow);
+  const xml =
+    `<p:cxnSp>` +
+    `<p:nvCxnSpPr>` +
+    `<p:cNvPr id="${id}" name="${escapeAttr(name)}"/>` +
+    `<p:cNvCxnSpPr/>` +
+    `<p:nvPr/>` +
+    `</p:nvCxnSpPr>` +
+    `<p:spPr>${xfrm}<a:prstGeom prst="${preset}"><a:avLst/></a:prstGeom>${ln}${effects}</p:spPr>` +
+    `</p:cxnSp>`;
+  return { xml, media: [] };
 }
 
 // -- Slide background synthesis (PR 3) --------------------------------------

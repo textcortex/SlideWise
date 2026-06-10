@@ -11,11 +11,13 @@ import type {
   IconElement,
   EmbedElement,
   ChartElement,
+  ConnectorElement,
   GroupElement,
   UnknownElement,
   ShadowSpec,
   GlowSpec,
 } from "@/lib/types";
+import { buildChartOption } from "@/lib/chart/chartOption";
 
 export function ElementView({
   el,
@@ -43,6 +45,8 @@ export function ElementView({
       return <EmbedView el={el} />;
     case "chart":
       return <ChartView el={el} />;
+    case "connector":
+      return <ConnectorView el={el} />;
     case "group":
       return <GroupView el={el} editing={editing} onTextCommit={onTextCommit} />;
     case "unknown":
@@ -1014,6 +1018,92 @@ function LineView({ el }: { el: LineElement }) {
   );
 }
 
+/**
+ * Render a connector — a first-class line between two anchor corners of its
+ * bounding box. `flipH`/`flipV` pick the diagonal; `kind` selects straight /
+ * bent (elbow) / curved geometry; `startArrow`/`endArrow` add arrowheads.
+ * Mirrors the `<p:cxnSp>` the writer emits so the editor preview matches save.
+ */
+function ConnectorView({ el }: { el: ConnectorElement }) {
+  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const w = Math.abs(el.w) || 1;
+  const h = Math.abs(el.h) || 1;
+  const sx = el.flipH ? w : 0;
+  const sy = el.flipV ? h : 0;
+  const ex = el.flipH ? 0 : w;
+  const ey = el.flipV ? 0 : h;
+
+  let d: string;
+  if (el.kind === "bent") {
+    const mx = (sx + ex) / 2;
+    d = `M ${sx} ${sy} L ${mx} ${sy} L ${mx} ${ey} L ${ex} ${ey}`;
+  } else if (el.kind === "curved") {
+    const mx = (sx + ex) / 2;
+    d = `M ${sx} ${sy} C ${mx} ${sy} ${mx} ${ey} ${ex} ${ey}`;
+  } else {
+    d = `M ${sx} ${sy} L ${ex} ${ey}`;
+  }
+
+  const startId = `cxn-s-${uid}`;
+  const endId = `cxn-e-${uid}`;
+  const hasStart = el.startArrow && el.startArrow !== "none";
+  const hasEnd = el.endArrow && el.endArrow !== "none";
+
+  return (
+    <svg
+      viewBox={`0 0 ${w} ${h}`}
+      preserveAspectRatio="none"
+      width="100%"
+      height="100%"
+      style={{ overflow: "visible", ...effectStyle(el.shadow, el.glow, "filter") }}
+    >
+      <defs>
+        {hasStart && <ArrowMarker id={startId} color={el.stroke} orient="auto-start-reverse" />}
+        {hasEnd && <ArrowMarker id={endId} color={el.stroke} orient="auto" />}
+      </defs>
+      <path
+        d={d}
+        fill="none"
+        stroke={el.stroke}
+        strokeWidth={el.strokeWidth}
+        strokeDasharray={dashStyleFor(el.dashType, el.strokeWidth).dasharray}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        vectorEffect="non-scaling-stroke"
+        markerStart={hasStart ? `url(#${startId})` : undefined}
+        markerEnd={hasEnd ? `url(#${endId})` : undefined}
+      />
+    </svg>
+  );
+}
+
+/** A reusable triangular arrowhead marker. The PPTX writer encodes the exact
+ *  arrowhead family; the preview uses a single triangular glyph. */
+function ArrowMarker({
+  id,
+  color,
+  orient,
+}: {
+  id: string;
+  color: string;
+  orient: string;
+}) {
+  return (
+    <marker
+      id={id}
+      viewBox="0 0 10 10"
+      refX="9"
+      refY="5"
+      markerWidth="7"
+      markerHeight="7"
+      orient={orient}
+      markerUnits="strokeWidth"
+    >
+      <path d="M 0 0 L 10 5 L 0 10 z" fill={color} />
+    </marker>
+  );
+}
+
 function TableView({ el }: { el: TableElement }) {
   const cols = el.rows[0]?.length ?? 1;
   const rowCount = el.rows.length;
@@ -1315,110 +1405,6 @@ function ChartView({ el }: { el: ChartElement }) {
   return <div ref={ref} style={{ width: "100%", height: "100%" }} />;
 }
 
-/**
- * Translate a Slidewise ChartElement into an ECharts option object. Handles
- * bar / column / line / area / pie / doughnut, including stacked + percent
- * stacked variants. Value labels are surfaced when the source deck had
- * `<c:showVal val="1"/>` on at least one series.
- */
-function buildChartOption(el: ChartElement) {
-  const palette = el.series.map((s, i) => s.color ?? defaultPaletteColor(i));
-  const isPercent = el.grouping === "percentStacked";
-  const valueFormatter = makeValueFormatter(el.valueFormat, isPercent);
-
-  if (el.kind === "pie" || el.kind === "doughnut") {
-    const data = el.categories.map((cat, i) => ({
-      name: cat || `Slice ${i + 1}`,
-      value: el.series[0]?.values[i] ?? 0,
-    }));
-    return {
-      color: palette,
-      title: el.title ? { text: el.title, left: "center", top: 4 } : undefined,
-      tooltip: { trigger: "item", valueFormatter },
-      legend: { bottom: 4 },
-      series: [
-        {
-          type: "pie",
-          radius: el.kind === "doughnut" ? ["45%", "75%"] : "70%",
-          data,
-          label: el.showDataLabels
-            ? { formatter: (p: { value: number }) => valueFormatter(p.value) }
-            : { show: false },
-        },
-      ],
-    };
-  }
-
-  const isHorizontal = el.kind === "bar"; // "column" + everything else: vertical
-  const xAxis = isHorizontal
-    ? { type: "value", axisLabel: { formatter: valueFormatter } }
-    : { type: "category", data: el.categories };
-  const yAxis = isHorizontal
-    ? { type: "category", data: el.categories }
-    : { type: "value", axisLabel: { formatter: valueFormatter } };
-
-  const stackKey =
-    el.grouping === "stacked" || el.grouping === "percentStacked"
-      ? "total"
-      : undefined;
-
-  const series = el.series.map((s, i) => {
-    const color = s.color ?? defaultPaletteColor(i);
-    const base = {
-      name: s.name,
-      type: el.kind === "line" ? "line" : el.kind === "area" ? "line" : "bar",
-      data: s.values.map((v) => (v === null ? 0 : v)),
-      // Pin the colour explicitly so ECharts can't reassign via palette
-      // cycling when multiple series share the same `name` (PowerPoint
-      // decks routinely do this — same label, distinct colour fills).
-      itemStyle: { color },
-      ...(el.kind === "area" ? { areaStyle: { color } } : {}),
-      ...(el.kind === "line"
-        ? { lineStyle: { color }, symbol: "circle", symbolSize: 6 }
-        : {}),
-      ...(stackKey ? { stack: stackKey } : {}),
-      label: el.showDataLabels
-        ? {
-            show: true,
-            position: stackKey ? "inside" : "top",
-            formatter: (p: { value: number }) => valueFormatter(p.value),
-            fontSize: 11,
-            color: stackKey ? "#FFFFFF" : "#111111",
-          }
-        : { show: false },
-    };
-    return base;
-  });
-
-  return {
-    color: palette,
-    title: el.title ? { text: el.title, left: "center", top: 4 } : undefined,
-    tooltip: { trigger: "axis", valueFormatter },
-    legend: { bottom: 4, type: "scroll" },
-    grid: { left: 56, right: 24, top: el.title ? 36 : 16, bottom: 56 },
-    xAxis,
-    yAxis,
-    series,
-  };
-}
-
-function defaultPaletteColor(i: number): string {
-  // Office-ish accent rotation, used when a series omits explicit fill.
-  const palette = ["#4F81BD", "#C0504D", "#9BBB59", "#8064A2", "#4BACC6", "#F79646"];
-  return palette[i % palette.length];
-}
-
-function makeValueFormatter(formatCode: string | undefined, percent: boolean) {
-  return (value: number) => {
-    if (typeof value !== "number" || !Number.isFinite(value)) return "";
-    if (percent) return `${Math.round(value * 100)}%`;
-    if (formatCode && formatCode.includes("$")) {
-      const decimals = (formatCode.match(/0\.(0+)/)?.[1] ?? "").length;
-      return `$${value.toLocaleString(undefined, {
-        minimumFractionDigits: decimals,
-        maximumFractionDigits: decimals,
-      })}`;
-    }
-    return value.toLocaleString();
-  };
-}
+// Chart-option construction (buildChartOption / defaultPaletteColor /
+// makeValueFormatter) lives in @/lib/chart/chartOption so it can be shared with
+// hosts via the public API for server-side previews. ChartView imports it.
