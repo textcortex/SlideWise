@@ -93,11 +93,21 @@ export interface SerializeOptions {
  * to inject. Populated by `addSlide`, drained by `preserveUnknowns`. Reset
  * at the start of each `serializeDeck` so concurrent calls don't bleed.
  */
+/**
+ * One synthesised spTree child plus the z-anchor that decides where it lands.
+ * `after` is the element id of the pptxgenjs-emitted node this item should sit
+ * directly on top of (the highest-z model element below it) — or `null` when
+ * the item is below every pptxgenjs node and belongs at the back. Honouring
+ * this is what keeps a synth chart / custGeom "svg" / connector from being
+ * forced behind the background cards pptxgenjs wrote on top of it.
+ */
+type SynthItem =
+  | { kind: "shape"; xml: string; after: string | null }
+  | { kind: "chart"; result: SynthChartResult; after: string | null };
+
 interface SynthSlideEntry {
-  /** Shape / group XML (high-z content) for this slide. */
-  shapeXml: string[];
-  /** In-app chart parts for this slide. */
-  charts: SynthChartResult[];
+  /** Synthesised shapes / groups / connectors / charts, in z (emission) order. */
+  items: SynthItem[];
   /** Media payloads to drop into `ppt/media/` referenced from the slide. */
   media: MediaPayload[];
   /** Effect XML to splice into pptxgenjs-emitted shapes by `cNvPr.name`. */
@@ -108,7 +118,7 @@ const synthBySlide = new Map<number, SynthSlideEntry>();
 function synthForSlide(i: number): SynthSlideEntry {
   let e = synthBySlide.get(i);
   if (!e) {
-    e = { shapeXml: [], charts: [], media: [], effectsByName: new Map() };
+    e = { items: [], media: [], effectsByName: new Map() };
     synthBySlide.set(i, e);
   }
   return e;
@@ -158,6 +168,10 @@ function addSlide(
 
   const synth = synthForSlide(slideIndex);
   const sorted = [...slide.elements].sort((a, b) => a.z - b.z);
+  // The id of the most recent element that produced a pptxgenjs spTree node.
+  // Synth items anchor after it so they interleave with pptxgenjs content at
+  // the right z instead of being forced to the back of the slide.
+  let lastNodeId: string | null = null;
   for (const rawEl of sorted) {
     // Skip elements whose imported OOXML survived this far AND haven't
     // been edited — the post-process step replays their source XML
@@ -170,17 +184,38 @@ function addSlide(
     // same object when the transform is the identity).
     const el = untransformElement(rawEl, transform);
     if (shouldSynthesise(el)) {
-      synthesiseInto(synth, el);
+      synthesiseInto(synth, el, lastNodeId);
       continue;
     }
     try {
       addElement(s, el, synth);
+      // Track the anchor only for elements that actually emit a pptxgenjs
+      // node (chart-with-ooxml and unknown are no-ops handled elsewhere).
+      if (emitsPptxgenjsNode(el)) lastNodeId = el.id;
     } catch (err) {
       console.warn(
         `[slidewise/pptx] failed to write element ${el.id} (${el.type}):`,
         err
       );
     }
+  }
+}
+
+/** Element types `addElement` turns into a real pptxgenjs spTree node (so a
+ *  later synth item can anchor on top of it). Charts that carry preserved
+ *  OOXML and unknowns are injected elsewhere and emit nothing here. */
+function emitsPptxgenjsNode(el: SlideElement): boolean {
+  switch (el.type) {
+    case "text":
+    case "shape":
+    case "image":
+    case "line":
+    case "table":
+    case "icon":
+    case "embed":
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -327,7 +362,11 @@ function shouldSynthesise(el: SlideElement): boolean {
   return false;
 }
 
-function synthesiseInto(synth: SynthSlideEntry, el: SlideElement): void {
+function synthesiseInto(
+  synth: SynthSlideEntry,
+  el: SlideElement,
+  after: string | null
+): void {
   if (el.type === "shape") {
     // Cross-process replay: an unedited custGeom shape carries its verbatim
     // source `<p:sp>` in the deck JSON (see `stampPristineOoxml`). Replaying
@@ -336,11 +375,11 @@ function synthesiseInto(synth: SynthSlideEntry, el: SlideElement): void {
     // registry isn't available (parse + serialize in different processes).
     const verbatim = pristineShapeXml(el);
     if (verbatim) {
-      synth.shapeXml.push(verbatim);
+      synth.items.push({ kind: "shape", xml: verbatim, after });
       return;
     }
     const out = synthesiseShape(el);
-    synth.shapeXml.push(out.xml);
+    synth.items.push({ kind: "shape", xml: out.xml, after });
     for (const m of out.media) synth.media.push(m);
     return;
   }
@@ -348,18 +387,18 @@ function synthesiseInto(synth: SynthSlideEntry, el: SlideElement): void {
     const out = synthesiseGroup(el as GroupElement, (child) =>
       renderGroupChild(child)
     );
-    synth.shapeXml.push(out.xml);
+    synth.items.push({ kind: "shape", xml: out.xml, after });
     for (const m of out.media) synth.media.push(m);
     return;
   }
   if (el.type === "chart") {
     const out = synthesiseChart(el as ChartElement);
-    synth.charts.push(out);
+    synth.items.push({ kind: "chart", result: out, after });
     return;
   }
   if (el.type === "connector") {
     const out = synthesiseConnector(el as ConnectorElement);
-    synth.shapeXml.push(out.xml);
+    synth.items.push({ kind: "shape", xml: out.xml, after });
     for (const m of out.media) synth.media.push(m);
     return;
   }
@@ -511,7 +550,7 @@ function addText(
   const baseOpts = {
     ...geometry(el),
     fontFace: el.fontFamily,
-    objectName: el.shadow || el.glow ? slidewiseShapeName(el.id) : undefined,
+    objectName: slidewiseShapeName(el.id),
     fontSize: pxToPoints(el.fontSize),
     color: hexNoHash(el.color),
     bold: el.fontWeight >= 600,
@@ -613,7 +652,7 @@ function addShape(
       el.shape === "rounded" && el.radius != null
         ? clamp01(el.radius / Math.min(el.w, el.h))
         : undefined,
-    objectName: el.shadow || el.glow ? slidewiseShapeName(el.id) : undefined,
+    objectName: slidewiseShapeName(el.id),
   });
 }
 
@@ -638,6 +677,7 @@ function shapeDashType(
 function addImage(s: pptxgen.Slide, el: ImageElement): void {
   const opts: Parameters<typeof s.addImage>[0] = {
     ...geometry(el),
+    objectName: slidewiseShapeName(el.id),
     sizing:
       el.fit === "cover"
         ? { type: "cover", w: pxToInches(el.w), h: pxToInches(el.h) }
@@ -674,7 +714,7 @@ function addLine(
         dashType: lineDashType(el),
         endArrowType: el.arrow ? "triangle" : "none",
       },
-      objectName: el.shadow || el.glow ? slidewiseShapeName(el.id) : undefined,
+      objectName: slidewiseShapeName(el.id),
     }
   );
 }
@@ -766,6 +806,7 @@ function addTable(s: pptxgen.Slide, el: TableElement): void {
     : undefined;
   s.addTable(rows, {
     ...geometry(el),
+    objectName: slidewiseShapeName(el.id),
     border: { type: "none", pt: 0, color: "FFFFFF" },
     fontFace: "Inter",
     ...(colW ? { colW } : {}),
@@ -778,6 +819,7 @@ function addIcon(s: pptxgen.Slide, el: IconElement): void {
   const fontSize = Math.min(el.w, el.h) * 0.7;
   s.addText(el.icon, {
     ...geometry(el),
+    objectName: slidewiseShapeName(el.id),
     fontFace: "Segoe UI Symbol",
     fontSize: pxToPoints(fontSize),
     color: hexNoHash(el.color),
@@ -797,6 +839,7 @@ function addEmbed(s: pptxgen.Slide, el: EmbedElement): void {
     ],
     {
       ...geometry(el),
+      objectName: slidewiseShapeName(el.id),
       fill: { color: "0E1330" },
       color: "FFFFFF",
       align: "center",
@@ -1423,6 +1466,96 @@ function findSpTreeContentInsertionPoint(slideXml: string): number {
   // No grpSpPr → fall back to just after `<p:spTree>`'s opening tag.
   const opTagEnd = slideXml.indexOf(">", spTreeOpen);
   return opTagEnd >= 0 ? opTagEnd + 1 : -1;
+}
+
+/**
+ * Insert synthesised spTree blobs at their z-anchors. Each blob carries an
+ * `after` element id: the blob is spliced immediately after the pptxgenjs node
+ * named `slidewise:<after>` (so it stacks on top of that node), or at the back
+ * of the spTree when `after` is null (below every pptxgenjs node). Anchor
+ * offsets are resolved against the ORIGINAL xml and applied back-to-front so
+ * earlier offsets stay valid; blobs sharing one anchor keep emission order.
+ */
+function insertSynthBlobs(
+  slideXml: string,
+  blobs: { xml: string; after: string | null }[]
+): string {
+  if (!blobs.length) return slideXml;
+  const backPos = (() => {
+    const p = findSpTreeContentInsertionPoint(slideXml);
+    if (p >= 0) return p;
+    const close = slideXml.lastIndexOf("</p:spTree>");
+    return close >= 0 ? close : -1;
+  })();
+  if (backPos < 0) return slideXml;
+
+  // Group blobs by their resolved insertion offset, preserving emission order.
+  const byOffset = new Map<number, string[]>();
+  for (const b of blobs) {
+    let offset = backPos;
+    if (b.after) {
+      const e = endOffsetOfNamedNode(slideXml, slidewiseShapeName(b.after));
+      if (e >= 0) offset = e;
+    }
+    const arr = byOffset.get(offset) ?? [];
+    arr.push(b.xml);
+    byOffset.set(offset, arr);
+  }
+  // Apply from the highest offset down so each splice leaves lower offsets put.
+  let out = slideXml;
+  for (const off of [...byOffset.keys()].sort((a, b) => b - a)) {
+    const chunk = byOffset.get(off)!.join("");
+    out = out.slice(0, off) + chunk + out.slice(off);
+  }
+  return out;
+}
+
+/**
+ * Byte offset just past the end of the top-level spTree child whose
+ * `cNvPr.name` equals `name` — used to anchor a synth blob right on top of a
+ * specific pptxgenjs node. Returns -1 when the name isn't found. Depth-aware so
+ * it finds the matching close of the enclosing `<p:sp>` / `<p:pic>` /
+ * `<p:graphicFrame>` / `<p:cxnSp>`.
+ */
+function endOffsetOfNamedNode(xml: string, name: string): number {
+  const at = xml.indexOf(`name="${name}"`);
+  if (at < 0) return -1;
+  // Nearest enclosing element open tag, searching backwards from the name.
+  const tags = ["p:sp", "p:pic", "p:graphicFrame", "p:cxnSp"];
+  let openIdx = -1;
+  let tag = "";
+  for (const t of tags) {
+    const idx = xml.lastIndexOf(`<${t}`, at);
+    if (idx > openIdx) {
+      openIdx = idx;
+      tag = t;
+    }
+  }
+  if (openIdx < 0) return -1;
+  const openMark = `<${tag}`;
+  const closeMark = `</${tag}>`;
+  let depth = 0;
+  let i = openIdx;
+  while (i < xml.length) {
+    const no = xml.indexOf(openMark, i);
+    const nc = xml.indexOf(closeMark, i);
+    if (nc < 0) return -1;
+    if (no >= 0 && no < nc) {
+      const after = xml[no + openMark.length];
+      // Only count a genuine element open (`<p:sp ` / `<p:sp>`), not a prefix
+      // collision like `<p:spPr>` against `<p:sp`.
+      if (after === " " || after === ">" || after === "\t" || after === "\n") {
+        const gt = xml.indexOf(">", no);
+        if (gt >= 0 && xml[gt - 1] !== "/") depth++;
+      }
+      i = no + openMark.length;
+    } else {
+      depth--;
+      i = nc + closeMark.length;
+      if (depth <= 0) return i;
+    }
+  }
+  return -1;
 }
 
 async function readSourceSlidePaths(srcZip: JSZip): Promise<string[]> {
@@ -2335,30 +2468,31 @@ async function applySynth(outZip: JSZip, deck: Deck): Promise<void> {
     let nextRid = highestRid(rels) + 1;
     const newRelLines: string[] = [];
 
-    // Combine shape/group XML with chart graphicFrames. Marker rIds embed
-    // their owning element id, so we walk shape XML in emission order and
-    // pair each *first-seen* marker with a media payload of the matching
-    // scope. That keeps multi-image shapes correct without a separate map.
+    // Rewrite each synth item's marker rIds (and write chart parts) in
+    // emission order, carrying each item's z-anchor through. Marker rIds embed
+    // their owning element id, so we walk shapes in emission order and pair
+    // each *first-seen* marker with a media payload of the matching scope.
     const mediaQueue = [...synth.media];
     const consumeMedia = (): MediaPayload | undefined => mediaQueue.shift();
-    const shapeBlobs: string[] = [];
-    for (const shapeXml of synth.shapeXml) {
-      let rewritten = shapeXml;
-      const markers = unique(shapeXml.match(RID_MARKER_RE) ?? []);
-      for (const marker of markers) {
-        const rid = `rId${nextRid++}`;
-        rewritten = rewritten.replaceAll(marker, rid);
-        const media = consumeMedia();
-        if (media) {
-          outZip.file(media.fullPath, media.data, { binary: true });
-          newRelLines.push(buildRelXml(rid, media.relType, media.relTarget));
+    const blobs: { xml: string; after: string | null }[] = [];
+    for (const item of synth.items) {
+      if (item.kind === "shape") {
+        let rewritten = item.xml;
+        const markers = unique(item.xml.match(RID_MARKER_RE) ?? []);
+        for (const marker of markers) {
+          const rid = `rId${nextRid++}`;
+          rewritten = rewritten.replaceAll(marker, rid);
+          const media = consumeMedia();
+          if (media) {
+            outZip.file(media.fullPath, media.data, { binary: true });
+            newRelLines.push(buildRelXml(rid, media.relType, media.relTarget));
+          }
         }
+        blobs.push({ xml: rewritten, after: item.after });
+        continue;
       }
-      shapeBlobs.push(rewritten);
-    }
-
-    // Charts: rewrite marker rIds, write part + rels, register Content_Types.
-    for (const chart of synth.charts) {
+      // Chart: rewrite marker rIds, write part + rels, register Content_Types.
+      const chart = item.result;
       const ridMarkers = unique(chart.graphicFrameXml.match(RID_MARKER_RE) ?? []);
       let frame = chart.graphicFrameXml;
       for (const marker of ridMarkers) {
@@ -2378,31 +2512,15 @@ async function applySynth(outZip: JSZip, deck: Deck): Promise<void> {
       outZip.file(chart.partPath, chart.chartXml);
       outZip.file(chart.partRelsPath, chart.chartRelsXml);
       await registerChartContentType(outZip, chart.partPath);
-      shapeBlobs.push(frame);
+      blobs.push({ xml: frame, after: item.after });
     }
 
-    if (shapeBlobs.length) {
-      // Prepend at the low-z position (right after `<p:grpSpPr/>`) so
-      // synth shapes — gradient panels, custGeom backdrops, the underlay
-      // for text-on-tint cards — sit BELOW the text/images pptxgenjs
-      // already wrote. Appending at `</p:spTree>` would put them on top
-      // and cover the very content they're supposed to back.
-      const insertAt = findSpTreeContentInsertionPoint(slideXml);
-      if (insertAt >= 0) {
-        slideXml =
-          slideXml.slice(0, insertAt) +
-          shapeBlobs.join("") +
-          slideXml.slice(insertAt);
-      } else {
-        const close = slideXml.lastIndexOf("</p:spTree>");
-        if (close >= 0) {
-          slideXml =
-            slideXml.slice(0, close) +
-            shapeBlobs.join("") +
-            slideXml.slice(close);
-        }
-      }
-    }
+    // Insert each synth blob at its z-anchor: directly after the pptxgenjs
+    // node it sits on top of (matched by `cNvPr.name`), or at the back of the
+    // spTree when it's below every pptxgenjs node. This is what keeps a synth
+    // chart / custGeom "svg" / connector from being buried under the
+    // background cards pptxgenjs wrote after it.
+    slideXml = insertSynthBlobs(slideXml, blobs);
 
     // PR 7: splice `<a:effectLst>` into pptxgenjs-emitted shapes by name.
     if (synth.effectsByName.size) {
