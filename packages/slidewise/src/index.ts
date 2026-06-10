@@ -109,6 +109,7 @@ export {
   summarizeLayouts,
   placeholderKey,
   type AddSlideFromLayoutOptions,
+  type SummarizeLayoutsOptions,
   type LayoutSummary,
   type LayoutSlotSummary,
   type PlaceholderCategory,

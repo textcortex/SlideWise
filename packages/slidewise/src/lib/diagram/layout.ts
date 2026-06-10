@@ -74,8 +74,11 @@ function textFor(ctx: LayoutCtx, node: DiagramNode): string {
 }
 
 /**
- * Compute the laid-out primitives for a diagram. Pure and deterministic — no
- * randomness, no time — so renderer and writer agree byte-for-byte.
+ * Compute the laid-out primitives for a diagram. Pure, deterministic, and
+ * DOM-free — no randomness, no time, no `window` / `document` / `canvas` — so
+ * the renderer and writer agree byte-for-byte AND a host can render diagrams
+ * server-side without a browser (same guarantee `buildChartOption` gives for
+ * charts). This DOM-free contract is intentional; keep it that way.
  */
 export function layoutDiagram(el: DiagramElement): DiagramPrimitive[] {
   const w = Math.max(1, el.w);

@@ -6,6 +6,11 @@ import {
   addSlideFromLayout,
   summarizeLayouts,
 } from "../../../index";
+import type { ImageElement, Slide } from "@/lib/types";
+
+// 1×1 transparent PNG for host-authored image-slot tests.
+const PNG_1x1 =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 /**
  * F1: master layouts are exposed as instantiable templates (Deck.layouts), and
@@ -147,6 +152,78 @@ function sourceWithTwoLayouts(): JSZip {
     "ppt/theme/theme1.xml",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office"><a:themeElements><a:clrScheme name="Office"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4><a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme name="Office"><a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme><a:fmtScheme name="Office"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>`
   );
+  return zip;
+}
+
+function themeXml(name: string): string {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="${name}"><a:themeElements><a:clrScheme name="${name}"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4><a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme name="${name}"><a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme><a:fmtScheme name="${name}"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>`;
+}
+
+/**
+ * A two-master source: master1 owns slideLayout1 + theme1, master2 owns
+ * slideLayout2 + theme2. Instantiating from a layout under master2 must route
+ * its chrome through master2 / theme2, not master1.
+ */
+function sourceWithTwoMasters(): JSZip {
+  const zip = new JSZip();
+  zip.file(
+    "[Content_Types].xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout2.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+  <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+  <Override PartName="/ppt/slideMasters/slideMaster2.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+  <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+  <Override PartName="/ppt/theme/theme2.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+</Types>`
+  );
+  zip.file(
+    "_rels/.rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/officeDocument" Target="ppt/presentation.xml"/></Relationships>`
+  );
+  zip.file(
+    "ppt/presentation.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="${REL}"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId2"/><p:sldMasterId id="2147483649" r:id="rId3"/></p:sldMasterIdLst><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>`
+  );
+  zip.file(
+    "ppt/_rels/presentation.xml.rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="${REL}/slideMaster" Target="slideMasters/slideMaster1.xml"/><Relationship Id="rId3" Type="${REL}/slideMaster" Target="slideMasters/slideMaster2.xml"/></Relationships>`
+  );
+  zip.file(
+    "ppt/slides/slide1.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld></p:sld>`
+  );
+  zip.file(
+    "ppt/slides/_rels/slide1.xml.rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>`
+  );
+  for (const [n, master] of [
+    [1, 1],
+    [2, 2],
+  ]) {
+    zip.file(
+      `ppt/slideLayouts/slideLayout${n}.xml`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" type="obj"><p:cSld name="Layout ${n}"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="914400" y="457200"/><a:ext cx="10363200" cy="1143000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr/></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sldLayout>`
+    );
+    zip.file(
+      `ppt/slideLayouts/_rels/slideLayout${n}.xml.rels`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/slideMaster" Target="../slideMasters/slideMaster${master}.xml"/></Relationships>`
+    );
+    zip.file(
+      `ppt/slideMasters/slideMaster${n}.xml`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld><p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/><p:sldLayoutIdLst><p:sldLayoutId id="${2147483650 + n}" r:id="rId1"/></p:sldLayoutIdLst></p:sldMaster>`
+    );
+    zip.file(
+      `ppt/slideMasters/_rels/slideMaster${n}.xml.rels`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/slideLayout" Target="../slideLayouts/slideLayout${n}.xml"/><Relationship Id="rId2" Type="${REL}/theme" Target="../theme/theme${n}.xml"/></Relationships>`
+    );
+    zip.file(`ppt/theme/theme${n}.xml`, themeXml(`Office${n}`));
+  }
   return zip;
 }
 
@@ -336,5 +413,157 @@ describe("F1: instantiated slides carry their layout's chrome", () => {
     // Host asked for an opaque fill, so the bg is kept (not stripped to inherit).
     const slide2 = await out.file("ppt/slides/slide2.xml")!.async("string");
     expect(slide2).toMatch(/<p:bg\b/);
+  });
+});
+
+describe("F1: host author-a-slide contract", () => {
+  it("filled placeholder text survives the round-trip and re-parses", async () => {
+    const source = await sourceWithLayout().generateAsync({
+      type: "arraybuffer",
+    });
+    const deck = await parsePptx(source);
+    const next = addSlideFromLayout(deck, "slideLayout1", {
+      fills: { title: "Quarterly Review", "body:1": "Revenue up 24%" },
+    });
+
+    const blob = await serializeDeck(next, { source });
+    const reparsed = await parsePptx(await blob.arrayBuffer());
+    // The instantiated slide (index 1) carries its filled text.
+    const dump = JSON.stringify(reparsed.slides[1]);
+    expect(dump).toContain("Quarterly Review");
+    expect(dump).toContain("Revenue up 24%");
+  });
+
+  it("a host-authored element placed at a layout slot lands with layout chrome", async () => {
+    // The Python-host path: read a slot's geometry from summarizeLayouts, set
+    // sourceLayoutId, and drop a real element there — no addSlideFromLayout.
+    const source = await sourceWithLayout().generateAsync({
+      type: "arraybuffer",
+    });
+    const deck = await parsePptx(source);
+    const slot = summarizeLayouts(deck)[0].placeholders.find(
+      (p) => p.type === "body"
+    )!;
+
+    const image: ImageElement = {
+      id: "hostimg",
+      type: "image",
+      x: slot.x,
+      y: slot.y,
+      w: slot.w,
+      h: slot.h,
+      rotation: 0,
+      z: 1,
+      src: PNG_1x1,
+      fit: "cover",
+    };
+    const authored: Slide = {
+      id: "authored1",
+      background: "transparent",
+      sourceLayoutId: "slideLayout1",
+      elements: [image],
+    };
+    const next = { ...deck, slides: [...deck.slides, authored] };
+
+    const blob = await serializeDeck(next, { source });
+    const out = await JSZip.loadAsync(await blob.arrayBuffer());
+    // The image landed on the instantiated slide…
+    const slide2 = await out.file("ppt/slides/slide2.xml")!.async("string");
+    expect(slide2).toContain("<p:pic>");
+    // …pointed at the layout's chrome, with no opaque bg blocking inheritance.
+    const rels2 = await out
+      .file("ppt/slides/_rels/slide2.xml.rels")!
+      .async("string");
+    expect(rels2).toMatch(/slideLayout1\.xml/);
+    expect(slide2).not.toMatch(/<p:bg\b/);
+  });
+
+  it("resolves sourceLayoutId by id convention even without deck.layouts", async () => {
+    const source = await sourceWithLayout().generateAsync({
+      type: "arraybuffer",
+    });
+    const deck = await parsePptx(source);
+    // Host authored a deck WITHOUT carrying the layouts array — only the id.
+    const authored: Slide = {
+      id: "a1",
+      background: "transparent",
+      sourceLayoutId: "slideLayout1",
+      elements: [],
+    };
+    const next = { ...deck, layouts: undefined, slides: [...deck.slides, authored] };
+
+    const warnings: { code: string }[] = [];
+    const blob = await serializeDeck(next, {
+      source,
+      onWarning: (w) => warnings.push(w),
+    });
+    const out = await JSZip.loadAsync(await blob.arrayBuffer());
+    const rels2 = await out
+      .file("ppt/slides/_rels/slide2.xml.rels")!
+      .async("string");
+    // Resolved from the source archive by the slideLayoutN convention.
+    expect(rels2).toMatch(/slideLayout1\.xml/);
+    expect(warnings.some((w) => w.code === "layout-unresolved")).toBe(false);
+  });
+
+  it("warns (machine-readably) when sourceLayoutId resolves to nothing", async () => {
+    const source = await sourceWithLayout().generateAsync({
+      type: "arraybuffer",
+    });
+    const deck = await parsePptx(source);
+    const authored: Slide = {
+      id: "a1",
+      background: "transparent",
+      sourceLayoutId: "slideLayoutNope",
+      elements: [],
+    };
+    const next = { ...deck, slides: [...deck.slides, authored] };
+
+    const warnings: { code: string; layoutId?: string; slideIndex?: number }[] =
+      [];
+    await serializeDeck(next, { source, onWarning: (w) => warnings.push(w) });
+    const unresolved = warnings.find((w) => w.code === "layout-unresolved");
+    expect(unresolved).toBeTruthy();
+    expect(unresolved!.layoutId).toBe("slideLayoutNope");
+    expect(unresolved!.slideIndex).toBe(1);
+  });
+
+  it("instantiating from a second master routes chrome through that master/theme", async () => {
+    const source = await sourceWithTwoMasters().generateAsync({
+      type: "arraybuffer",
+    });
+    const deck = await parsePptx(source);
+    expect(deck.layouts!.map((l) => l.id)).toEqual([
+      "slideLayout1",
+      "slideLayout2",
+    ]);
+
+    // Instantiate from slideLayout2, which lives under master2 / theme2.
+    const next = addSlideFromLayout(deck, "slideLayout2", {
+      fills: { title: "Under master 2" },
+    });
+    const blob = await serializeDeck(next, { source });
+    const out = await JSZip.loadAsync(await blob.arrayBuffer());
+
+    // Both masters + both themes survived into the output.
+    const paths = Object.keys(out.files);
+    expect(paths).toContain("ppt/slideMasters/slideMaster1.xml");
+    expect(paths).toContain("ppt/slideMasters/slideMaster2.xml");
+    expect(paths).toContain("ppt/theme/theme1.xml");
+    expect(paths).toContain("ppt/theme/theme2.xml");
+
+    // The instantiated slide → layout2 → master2 → theme2 chain resolves.
+    const slideRels = await out
+      .file("ppt/slides/_rels/slide2.xml.rels")!
+      .async("string");
+    expect(slideRels).toMatch(/slideLayout2\.xml/);
+    const layoutRels = await out
+      .file("ppt/slideLayouts/_rels/slideLayout2.xml.rels")!
+      .async("string");
+    expect(layoutRels).toMatch(/slideMaster2\.xml/);
+    const masterRels = await out
+      .file("ppt/slideMasters/_rels/slideMaster2.xml.rels")!
+      .async("string");
+    expect(masterRels).toMatch(/theme2\.xml/);
   });
 });

@@ -226,29 +226,64 @@ export interface LayoutSummary {
   name?: string;
   /** Friendly purpose label (e.g. "Title and content", "Section header"). */
   role: string;
-  /** Raw OOXML `<p:sldLayout type>`, when present. */
+  /** Raw OOXML `<p:sldLayout type>`, when present. Omitted in compact mode. */
   type?: string;
   /** The `fills` keys this layout accepts, in document order. */
   fillable: string[];
-  /** Every placeholder slot, in document order. */
+  /**
+   * Every placeholder slot, in document order. Empty in `compact` mode (where
+   * geometry is dropped to save model-context budget).
+   */
   placeholders: LayoutSlotSummary[];
+  /**
+   * Under `dedupe`, the ids of the other layouts collapsed into this
+   * representative (same role + same fillable signature). Absent otherwise.
+   * Any alias id is still a valid `addSlideFromLayout` / `sourceLayoutId`
+   * target — they're interchangeable for instantiation purposes.
+   */
+  aliases?: string[];
+}
+
+export interface SummarizeLayoutsOptions {
+  /**
+   * Drop per-placeholder geometry (`placeholders` comes back `[]`, `type`
+   * omitted) for a minimal `{ id, name?, role, fillable }` menu that fits a
+   * tight model-context budget. The host still gets the geometry from the full
+   * (non-compact) call when it needs to place elements.
+   */
+  compact?: boolean;
+  /**
+   * Collapse layouts that share a role + fillable-key signature into a single
+   * representative carrying the rest as `aliases`, so a real 85-layout template
+   * surfaces as its handful of *distinct kinds* instead of 85 near-identical
+   * rows. Dedupe keys off the package's own role/shape knowledge, which a host
+   * can't reliably reconstruct from geometry alone.
+   */
+  dedupe?: boolean;
 }
 
 /**
  * Summarise a deck's instantiable layouts into a compact menu a host can hand
  * to a model when choosing which layout to instantiate for each slide. Returns
  * a structured shape (not a string) so the host can trim it to its
- * context-budget — e.g. drop geometry, or keep only `{id, role, fillable}` —
- * before serialising. Pair each chosen `id` + `fills` with
- * `addSlideFromLayout`.
+ * context-budget — or pass `{ compact: true }` for the minimal shape and/or
+ * `{ dedupe: true }` to collapse near-identical layouts. Pair each chosen `id`
+ * (or any `aliases` id) + `fills` with `addSlideFromLayout`, or set it as a
+ * slide's `sourceLayoutId`.
  *
  * Returns `[]` when the deck has no layouts (not parsed from a real PPTX).
  */
-export function summarizeLayouts(deck: Deck): LayoutSummary[] {
-  return (deck.layouts ?? []).map(summarizeLayout);
+export function summarizeLayouts(
+  deck: Deck,
+  options: SummarizeLayoutsOptions = {}
+): LayoutSummary[] {
+  const out = (deck.layouts ?? []).map((l) =>
+    summarizeLayout(l, options.compact === true)
+  );
+  return options.dedupe ? dedupeLayouts(out) : out;
 }
 
-function summarizeLayout(layout: DeckLayout): LayoutSummary {
+function summarizeLayout(layout: DeckLayout, compact: boolean): LayoutSummary {
   const placeholders: LayoutSlotSummary[] = layout.placeholders.map((ph) => ({
     key: placeholderKey(ph),
     type: ph.type,
@@ -260,16 +295,48 @@ function summarizeLayout(layout: DeckLayout): LayoutSummary {
     w: ph.w,
     h: ph.h,
   }));
+  const role =
+    (layout.type ? ROLE_BY_TYPE[layout.type] : undefined) ??
+    roleFromPlaceholders(layout.placeholders);
+  const fillable = placeholders.filter((p) => p.fillable).map((p) => p.key);
+  if (compact) {
+    return {
+      id: layout.id,
+      ...(layout.name ? { name: layout.name } : {}),
+      role,
+      fillable,
+      placeholders: [],
+    };
+  }
   return {
     id: layout.id,
     ...(layout.name ? { name: layout.name } : {}),
-    role:
-      (layout.type ? ROLE_BY_TYPE[layout.type] : undefined) ??
-      roleFromPlaceholders(layout.placeholders),
+    role,
     ...(layout.type ? { type: layout.type } : {}),
-    fillable: placeholders.filter((p) => p.fillable).map((p) => p.key),
+    fillable,
     placeholders,
   };
+}
+
+/**
+ * Collapse layouts with an identical role + fillable signature into one
+ * representative (the first seen, in document order), recording the rest as
+ * `aliases`. Order of the surviving representatives is preserved.
+ */
+function dedupeLayouts(summaries: LayoutSummary[]): LayoutSummary[] {
+  const byKey = new Map<string, LayoutSummary>();
+  const order: string[] = [];
+  for (const s of summaries) {
+    const key = `${s.role} ${s.fillable.join(",")}`;
+    const rep = byKey.get(key);
+    if (!rep) {
+      byKey.set(key, { ...s });
+      order.push(key);
+    } else {
+      (rep.aliases ??= []).push(s.id);
+    }
+  }
+  return order.map((k) => byKey.get(k)!);
 }
 
 function placeholderToText(

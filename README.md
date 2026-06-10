@@ -85,16 +85,25 @@ const safe: Deck = migrate(unknownDeckJson); // normalise an external deck
 
 `serializeDeck(deck, { source })` reproduces a source template's slide size
 (16:9, 4:3, 16:10, or custom) and carries over its masters / layouts / theme /
-fonts. If that chrome can't be preserved — e.g. the source's slide size is
-unreadable — it falls back to generic chrome and reports it through an optional
-diagnostics sink so the host can surface the degradation rather than ship a
-silently off-brand deck:
+fonts. Degradations are reported through an optional `onWarning` diagnostics
+sink (structured `SerializeWarning`s) so the host can surface them rather than
+ship a silently off-brand deck:
 
 ```ts
 await serializeDeck(deck, {
   source,
   onWarning: (w) => {
-    if (w.code === "chrome-skipped") notifyHost(w.message);
+    switch (w.code) {
+      case "chrome-skipped": // size unreadable → generic chrome
+        notifyHost(`${w.message} (source ${w.sourceAspect}, output ${w.outputAspect})`);
+        break;
+      case "layout-unresolved": // a slide's sourceLayoutId matched nothing
+        notifyHost(`slide ${w.slideIndex}: layout ${w.layoutId} not found`);
+        break;
+      case "element-write-failed": // one element threw; rest of slide intact
+        notifyHost(`${w.elementType} ${w.elementId} skipped`);
+        break;
+    }
   },
 });
 ```
@@ -126,8 +135,11 @@ import {
 const deck = await parsePptx(blob);
 
 // 1. Show a model a compact menu of the available layouts. The shape is
-//    structured (not a string) so you can trim it to your context budget —
-//    e.g. keep only { id, role, fillable } and drop geometry.
+//    structured (not a string) so you can trim it to your context budget.
+//    For large templates (e.g. 85 layouts) pass options:
+//      summarizeLayouts(deck, { compact: true })  // { id, name?, role, fillable }, no geometry
+//      summarizeLayouts(deck, { dedupe: true })   // collapse same role+fillable; others → `aliases`
+//      summarizeLayouts(deck, { compact: true, dedupe: true })  // both
 const menu = summarizeLayouts(deck);
 // [
 //   { id: "slideLayout2", name: "Title and Content", type: "obj",
@@ -160,6 +172,54 @@ master, or add real `image` / `table` / `chart` elements to the returned slide.
 A placeholder with no matching `fills` entry becomes an empty, editable text
 box.
 
+#### Authoring slides directly (no `addSlideFromLayout`)
+
+`addSlideFromLayout` is a convenience; the underlying contract is just a slide
+shape, so a host that builds deck JSON in another language (e.g. Python) can
+author it directly and let `serializeDeck` paint the chrome:
+
+```jsonc
+{
+  "id": "slide-7",
+  "background": "transparent",   // inherit the layout/master/theme background
+  "sourceLayoutId": "slideLayout12",
+  "elements": [ /* any text / image / chart / table / diagram elements */ ]
+}
+```
+
+Contract:
+
+- **`sourceLayoutId` alone is enough.** No JS call is required — set it on the
+  slide JSON and `serializeDeck(deck, { source })` points the slide at that
+  layout's part and paints its background / fonts / theme / footer chrome.
+- **Put arbitrary elements on the slide.** It is not limited to elements
+  `addSlideFromLayout` produced — your filled text, native charts, generated
+  images, tables, and diagrams all land normally, on top of the layout chrome.
+- **Place non-text slots yourself from the layout geometry.** For an image /
+  chart / table slot, read its geometry from `summarizeLayouts` (every
+  placeholder is listed with `category` + `x/y/w/h`, fillable or not) and add a
+  real element at that box:
+
+  ```ts
+  const slot = summarizeLayouts(deck)
+    .find((l) => l.id === "slideLayout12")!
+    .placeholders.find((p) => p.category === "picture")!;
+  authoredSlide.elements.push({
+    id: "img-1", type: "image", src: generatedPhotoDataUrl, fit: "cover",
+    x: slot.x, y: slot.y, w: slot.w, h: slot.h, rotation: 0, z: 1,
+  });
+  ```
+
+- **Background:** keep `"transparent"` to inherit the layout/master background;
+  set an explicit hex to override it.
+- **`sourceLayoutId` resolution** is by id, resolved from `deck.layouts` (if you
+  carried the array) **or** by the `ppt/slideLayouts/<id>.xml` convention
+  against the `{ source }` archive — so you don't have to ship the `layouts`
+  array. If neither resolves, the slide falls back to the first source layout
+  and `serializeDeck` emits a `{ code: "layout-unresolved", slideIndex,
+  layoutId }` warning through `onWarning` (see below) rather than failing
+  silently.
+
 ### Diagrams
 
 `DiagramElement` models a process / timeline / funnel / matrix / cycle / list
@@ -188,10 +248,34 @@ const slide = {
         { id: "n2", text: "Design" },
         { id: "n3", text: "Ship" },
       ],
+      // optional: palette?: string[], color?, fontFamily?, fontSize?,
+      // and per-node fill? / color? overrides.
     },
   ],
 };
 ```
+
+`kind` is one of `"process" | "timeline" | "funnel" | "matrix" | "cycle" |
+"list"`. The JSON shape (`DiagramElement` / `DiagramNode`) is stable — safe to
+emit from another language.
+
+**Server-side rendering.** `layoutDiagram(el)` is **pure and DOM-free** (only
+box/arrow arithmetic — no `window` / `document` / `canvas`), the same guarantee
+`buildChartOption` gives for charts, and it's committed to staying that way. A
+host QA renderer can draw a diagram to SVG/PNG without a browser by walking the
+primitives:
+
+```ts
+import { layoutDiagram } from "@textcortex/slidewise";
+
+for (const p of layoutDiagram(el)) {
+  if (p.kind === "box") drawRect(p.x, p.y, p.w, p.h, p.fill, p.text, p.textColor);
+  else drawArrow(p.x1, p.y1, p.x2, p.y2, p.stroke, p.arrow);
+}
+```
+
+Coordinates are local to the element box (`0..w` × `0..h`); offset by the
+element's `x` / `y` to place them on the slide.
 
 ## Theming
 

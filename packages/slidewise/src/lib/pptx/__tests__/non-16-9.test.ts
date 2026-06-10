@@ -210,7 +210,12 @@ describe("B3: non-16:9 source", () => {
       `<p:sldSz cx="bad" cy="bad"/>`
     ).generateAsync({ type: "arraybuffer" });
 
-    const warnings: { code: string; message: string }[] = [];
+    const warnings: {
+      code: string;
+      message: string;
+      sourceAspect?: number;
+      outputAspect?: number;
+    }[] = [];
     await serializeDeck(deck, {
       source: brokenSource,
       onWarning: (w) => warnings.push(w),
@@ -219,5 +224,9 @@ describe("B3: non-16:9 source", () => {
     const skipped = warnings.find((w) => w.code === "chrome-skipped");
     expect(skipped).toBeTruthy();
     expect(skipped!.message).toMatch(/generic chrome/);
+    // Output ratio is known (16:9 fallback ≈ 1.333); source ratio was
+    // unreadable, so it's absent — the host can still report the output side.
+    expect(skipped!.outputAspect).toBeCloseTo(16 / 9, 2);
+    expect(skipped!.sourceAspect).toBeUndefined();
   });
 });
