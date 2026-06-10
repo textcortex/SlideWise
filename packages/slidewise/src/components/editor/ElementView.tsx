@@ -13,11 +13,13 @@ import type {
   ChartElement,
   ConnectorElement,
   GroupElement,
+  DiagramElement,
   UnknownElement,
   ShadowSpec,
   GlowSpec,
 } from "@/lib/types";
 import { buildChartOption } from "@/lib/chart/chartOption";
+import { layoutDiagram } from "@/lib/diagram/layout";
 
 export function ElementView({
   el,
@@ -49,9 +51,101 @@ export function ElementView({
       return <ConnectorView el={el} />;
     case "group":
       return <GroupView el={el} editing={editing} onTextCommit={onTextCommit} />;
+    case "diagram":
+      return <DiagramView el={el} />;
     case "unknown":
       return <UnknownView el={el} />;
   }
+}
+
+/**
+ * Render a diagram from its shared layout (the same `layoutDiagram` the PPTX
+ * writer uses, so preview and export match). Boxes are absolutely-positioned
+ * divs; arrows are drawn in a single SVG overlay behind them.
+ */
+function DiagramView({ el }: { el: DiagramElement }) {
+  const markerId = useId().replace(/[:]/g, "");
+  const primitives = layoutDiagram(el);
+  const boxes = primitives.filter((p) => p.kind === "box");
+  const arrows = primitives.filter((p) => p.kind === "arrow");
+  const fontSize = el.fontSize ?? 18;
+  const fontFamily = el.fontFamily ?? "Inter";
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      {arrows.length > 0 && (
+        <svg
+          width="100%"
+          height="100%"
+          viewBox={`0 0 ${Math.max(1, el.w)} ${Math.max(1, el.h)}`}
+          preserveAspectRatio="none"
+          style={{ position: "absolute", inset: 0, overflow: "visible" }}
+        >
+          <defs>
+            <marker
+              id={`arrow-${markerId}`}
+              viewBox="0 0 10 10"
+              refX="8"
+              refY="5"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M0,0 L10,5 L0,10 z" fill="#595959" />
+            </marker>
+          </defs>
+          {arrows.map((a) =>
+            a.kind === "arrow" ? (
+              <line
+                key={a.id}
+                x1={a.x1}
+                y1={a.y1}
+                x2={a.x2}
+                y2={a.y2}
+                stroke={a.stroke}
+                strokeWidth={2}
+                markerEnd={a.arrow ? `url(#arrow-${markerId})` : undefined}
+              />
+            ) : null
+          )}
+        </svg>
+      )}
+      {boxes.map((b) =>
+        b.kind === "box" ? (
+          <div
+            key={b.id}
+            style={{
+              position: "absolute",
+              left: b.x,
+              top: b.y,
+              width: b.w,
+              height: b.h,
+              background: b.fill,
+              color: b.textColor,
+              borderRadius:
+                b.shape === "ellipse"
+                  ? "50%"
+                  : b.shape === "roundRect"
+                    ? Math.min(b.w, b.h) * 0.12
+                    : 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              textAlign: "center",
+              padding: 8,
+              boxSizing: "border-box",
+              fontFamily,
+              fontSize,
+              fontWeight: 600,
+              lineHeight: 1.15,
+              overflow: "hidden",
+            }}
+          >
+            {b.text}
+          </div>
+        ) : null
+      )}
+    </div>
+  );
 }
 
 /**

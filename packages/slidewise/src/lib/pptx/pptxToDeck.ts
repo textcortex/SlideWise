@@ -1882,6 +1882,23 @@ async function parsePic(
   const hasCrop =
     crop && (crop.l > 0 || crop.r > 0 || crop.t > 0 || crop.b > 0);
 
+  // Rounded-corner picture: `<a:prstGeom prst="roundRect">`'s `adj` is a
+  // fraction (1000ths of a percent) of the shorter side. Convert back to a
+  // canvas-px radius so the renderer + writer can reproduce it.
+  const picGeom = pic?.["p:spPr"]?.["a:prstGeom"];
+  let radius: number | undefined;
+  if (picGeom?.["@_prst"] === "roundRect") {
+    const adj = asArray(picGeom?.["a:avLst"]?.["a:gd"]).find(
+      (g: any) => g?.["@_name"] === "adj"
+    );
+    const fmla = typeof adj?.["@_fmla"] === "string" ? adj["@_fmla"] : "";
+    const m = /val\s+(\d+)/.exec(fmla);
+    // Default roundRect adj is 16667 (~1/6) when avLst omits it.
+    const frac = (m ? Number(m[1]) : 16667) / 100000;
+    const r = Math.round(frac * Math.min(geom.w, geom.h));
+    if (r > 0) radius = r;
+  }
+
   const image: ImageElement = {
     id: nanoid(8),
     type: "image",
@@ -1890,6 +1907,7 @@ async function parsePic(
     src: `data:${mime};base64,${base64}`,
     fit: fitMode,
     ...(hasCrop ? { crop } : {}),
+    ...(radius ? { radius } : {}),
   };
   return image;
 }
@@ -2978,6 +2996,9 @@ async function parseLayouts(zip: JSZip, fit: Fit): Promise<DeckLayout[]> {
       id: layoutId(path),
       ...(typeof layoutRoot?.["p:cSld"]?.["@_name"] === "string"
         ? { name: layoutRoot["p:cSld"]["@_name"] as string }
+        : {}),
+      ...(typeof layoutRoot?.["@_type"] === "string"
+        ? { type: layoutRoot["@_type"] as string }
         : {}),
       placeholders,
       sourcePath: path,

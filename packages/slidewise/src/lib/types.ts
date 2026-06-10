@@ -12,6 +12,7 @@ export type ElementType =
   | "chart"
   | "connector"
   | "group"
+  | "diagram"
   | "unknown";
 
 /**
@@ -561,6 +562,59 @@ export interface ConnectorElement extends BaseElement {
   glow?: GlowSpec;
 }
 
+/**
+ * Diagram families. A diagram is a *semantic* structure — an ordered set of
+ * labelled nodes the renderer lays out by `kind` (boxes + arrows for a
+ * process, stacked bars for a funnel, a 2×N grid for a matrix, …). Unlike a
+ * hand-placed cluster of shapes + lines, it stays editable as one unit and
+ * serialises to a single labelled `<p:grpSp>` of real shapes/connectors so
+ * PowerPoint keeps it grouped (move/resize as a whole) rather than as
+ * anonymous floating shapes.
+ */
+export type DiagramKind =
+  | "process"
+  | "timeline"
+  | "funnel"
+  | "matrix"
+  | "cycle"
+  | "list";
+
+/** One labelled node in a {@link DiagramElement}. */
+export interface DiagramNode {
+  id: string;
+  /** Node label. */
+  text: string;
+  /** Optional per-node fill (CSS hex); falls back to the diagram palette. */
+  fill?: string;
+  /** Optional per-node label color (CSS hex); falls back to the diagram. */
+  color?: string;
+}
+
+/**
+ * A first-class, editable diagram. The renderer and the PPTX writer share one
+ * layout function (`layoutDiagram`) keyed off `kind`, so the on-canvas preview
+ * and the saved `<p:grpSp>` match. The unlock for AI-generated process /
+ * timeline / funnel / matrix / cycle visuals that round-trip as a grouped,
+ * editable object instead of a flat pile of shapes.
+ */
+export interface DiagramElement extends BaseElement {
+  type: "diagram";
+  kind: DiagramKind;
+  /** Ordered nodes; the layout per `kind` decides how they're arranged. */
+  nodes: DiagramNode[];
+  /**
+   * Node fill palette (CSS hex), cycled across nodes when a node sets no
+   * `fill` of its own. Defaults to a built-in accent palette.
+   */
+  palette?: string[];
+  /** Default label color (CSS hex) for nodes that set none. */
+  color?: string;
+  /** Label font family for all nodes. */
+  fontFamily?: string;
+  /** Label font size (canvas px). */
+  fontSize?: number;
+}
+
 export type SlideElement =
   | TextElement
   | ShapeElement
@@ -572,6 +626,7 @@ export type SlideElement =
   | ChartElement
   | ConnectorElement
   | GroupElement
+  | DiagramElement
   | UnknownElement;
 
 export interface Slide {
@@ -689,6 +744,14 @@ export interface DeckLayout {
   id: string;
   /** Human-readable name from `<p:cSld name="…">`, when present. */
   name?: string;
+  /**
+   * Raw OOXML layout role from `<p:sldLayout type="…">` (e.g. `"title"`,
+   * `"obj"`, `"twoObj"`, `"secHead"`, `"pic"`, `"blank"`). The design intent
+   * of the layout, independent of its placeholder inventory. Absent when the
+   * source omits the attribute. `summarizeLayouts` maps this to a friendlier
+   * `role` label for model-facing layout menus.
+   */
+  type?: string;
   /** Placeholder slots this layout defines, in document order. */
   placeholders: LayoutPlaceholder[];
   /**

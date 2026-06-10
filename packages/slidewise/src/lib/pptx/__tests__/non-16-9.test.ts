@@ -21,6 +21,24 @@ const CT_THEME = "application/vnd.openxmlformats-officedocument.theme+xml";
 /** A 4:3 source (9144000 × 6858000 EMU = 10 × 7.5 in) with one slide, one
  *  layout, one master, one theme. */
 function fourThreeSource(): JSZip {
+  return sizedSource(
+    `<p:sldSz cx="9144000" cy="6858000" type="screen4x3"/>`
+  );
+}
+
+/** A 16:10 source (9144000 × 5715000 EMU = 10 × 6.25 in). */
+function sixteenTenSource(): JSZip {
+  return sizedSource(
+    `<p:sldSz cx="9144000" cy="5715000" type="screen16x10"/>`
+  );
+}
+
+/**
+ * Same one-slide template, with a caller-supplied `<p:sldSz>` fragment so we
+ * can exercise different aspect ratios (and an unreadable size for the
+ * chrome-skipped diagnostic).
+ */
+function sizedSource(sldSzXml: string): JSZip {
   const zip = new JSZip();
   zip.file(
     "[Content_Types].xml",
@@ -41,7 +59,7 @@ function fourThreeSource(): JSZip {
   );
   zip.file(
     "ppt/presentation.xml",
-    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="${REL}"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId2"/></p:sldMasterIdLst><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000" type="screen4x3"/></p:presentation>`
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="${REL}"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId2"/></p:sldMasterIdLst><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>${sldSzXml}</p:presentation>`
   );
   zip.file(
     "ppt/_rels/presentation.xml.rels",
@@ -153,5 +171,53 @@ describe("B3: non-16:9 source", () => {
     expect(slide1).toContain('x="914400"');
     expect(slide1).toContain('cx="1828800"');
     expect(slide1).not.toContain('x="1524000"');
+  });
+
+  it("preserves chrome and emits the 16:10 slide size", async () => {
+    const source = await sixteenTenSource().generateAsync({
+      type: "arraybuffer",
+    });
+    const deck = await parsePptx(source);
+    const warnings: { code: string }[] = [];
+    const blob = await serializeDeck(deck, {
+      source,
+      onWarning: (w) => warnings.push(w),
+    });
+    const out = await load(blob);
+
+    const pres = await out.file("ppt/presentation.xml")!.async("string");
+    expect(pres).toMatch(/<p:sldSz[^>]*cx="9144000"/);
+    expect(pres).toMatch(/<p:sldSz[^>]*cy="5715000"/);
+    expect(pres).not.toContain('cx="12192000"');
+
+    const paths = Object.keys(out.files);
+    expect(paths).toContain("ppt/slideMasters/slideMaster1.xml");
+    expect(paths).toContain("ppt/slideLayouts/slideLayout1.xml");
+    expect(paths).toContain("ppt/theme/theme1.xml");
+
+    // A matchable aspect ratio means chrome was preserved — no diagnostic.
+    expect(warnings.some((w) => w.code === "chrome-skipped")).toBe(false);
+  });
+
+  it("reports a machine-readable chrome-skipped warning when the source size is unreadable", async () => {
+    // Valid deck, but a source whose <p:sldSz> can't be parsed → the chrome
+    // preserve can't match aspect ratios and bails to generic chrome. The host
+    // gets a structured warning instead of only a console line.
+    const deck = await parsePptx(
+      await fourThreeSource().generateAsync({ type: "arraybuffer" })
+    );
+    const brokenSource = await sizedSource(
+      `<p:sldSz cx="bad" cy="bad"/>`
+    ).generateAsync({ type: "arraybuffer" });
+
+    const warnings: { code: string; message: string }[] = [];
+    await serializeDeck(deck, {
+      source: brokenSource,
+      onWarning: (w) => warnings.push(w),
+    });
+
+    const skipped = warnings.find((w) => w.code === "chrome-skipped");
+    expect(skipped).toBeTruthy();
+    expect(skipped!.message).toMatch(/generic chrome/);
   });
 });
