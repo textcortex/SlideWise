@@ -1001,9 +1001,11 @@ async function preserveUnknowns(
     // PowerPoint refuses to open the file when declared parts are missing
     // (Keynote is lenient and just warns). Always sanitise.
     const outZip = await JSZip.loadAsync(generated);
+    await fixSvgRasterFallbacks(outZip);
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
+    await reconcileDanglingRels(outZip);
     await sanitiseRels(outZip);
     pruneEmptyDirectories(outZip);
     return finalizeOutput(outZip, asTemplate === true);
@@ -1015,9 +1017,11 @@ async function preserveUnknowns(
     await applySynth(outZip, deck);
     await applySynthSlideBackgrounds(outZip, deck);
     await applyEmbeddedFontsFromJson(outZip, deck);
+    await fixSvgRasterFallbacks(outZip);
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
+    await reconcileDanglingRels(outZip);
     await sanitiseRels(outZip);
     pruneEmptyDirectories(outZip);
     return finalizeOutput(outZip, asTemplate === true);
@@ -1105,8 +1109,21 @@ async function preserveUnknowns(
   // copy any — avoids duplicating font entries when both source + deck.fonts
   // are set.
   await applyEmbeddedFontsFromJson(outZip, deck);
+  // Replace pptxgenjs's SVG-bytes-in-.png raster fallbacks with valid PNGs.
+  await fixSvgRasterFallbacks(outZip);
+  // Strip Content_Types overrides for parts that don't exist. preserveDeckChrome
+  // rewrites most, but pptxgenjs's stale slideMaster1..N / notesSlide overrides
+  // can survive (and all of them survive when chrome preservation bails on an
+  // aspect mismatch) — PowerPoint refuses to open a file that declares a part
+  // it can't find, so always sanitise here too.
+  await pruneDanglingContentTypes(outZip);
   await sanitisePresentationXml(outZip);
   await sanitiseSlideXml(outZip);
+  // Final invariant: every internal rel target must resolve to a shipped part.
+  // Repairs renamed-but-clobbered targets (tags) and drops genuinely absent
+  // ones (notesMaster with no source part) — must run after every part
+  // add/remove above.
+  await reconcileDanglingRels(outZip);
   await sanitiseRels(outZip);
   pruneEmptyDirectories(outZip);
 
@@ -3176,5 +3193,315 @@ async function sanitiseSlideXml(outZip: JSZip): Promise<void> {
       "<$1$2/>"
     );
     if (updated !== xml) outZip.file(p, updated);
+  }
+}
+
+// -- Package invariant: every internal rel target resolves to a part --------
+
+/**
+ * Basename prefix the preserve paths stamp onto copied-in parts to dodge
+ * collisions with whatever pptxgenjs already wrote (`uniqueTarget`,
+ * `slidewise_chrome_*`). Used by the dangling-rel repair below to recover the
+ * original part name a rel should resolve to.
+ */
+const PRESERVE_PREFIX_RE = /^slidewise_(?:preserved|chrome)_\d+_/;
+
+/**
+ * Relationship types that are SAFE to drop when their target part is missing:
+ * each is optional in the package and removing it leaves a still-valid file.
+ * Critical *implicit* rels (slideLayout, slideMaster, theme) are deliberately
+ * absent — a slide without its layout (or a layout without its master) is just
+ * as invalid as one pointing at a missing part, so dropping those would only
+ * trade one corruption for another. Those shouldn't dangle anyway
+ * (rewriteSlideLayoutRefs / preserveDeckChrome repoint them); if one ever does
+ * we keep it and warn rather than make the package worse.
+ *
+ * Matched against the last path segment of the relationship Type URI.
+ */
+const DROPPABLE_REL_TYPES = new Set([
+  "notesMaster",
+  "notesSlide",
+  "tags",
+  "comments",
+  "commentAuthors",
+  "glossaryDocument",
+]);
+
+function relTypeSuffix(type: string): string {
+  const slash = type.lastIndexOf("/");
+  return slash >= 0 ? type.slice(slash + 1) : type;
+}
+
+/** The owning part directory for a `*.rels` file, e.g.
+ * `ppt/slides/_rels/slide1.xml.rels` → `ppt/slides`, `_rels/.rels` → ``. */
+function ownerDirForRels(relsPath: string): string {
+  const stripped = relsPath.replace(/(^|\/)_rels\/[^/]+$/, "");
+  return stripped === relsPath ? dirOf(relsPath) : stripped;
+}
+
+/**
+ * Final guard: every INTERNAL relationship target must resolve to a part that
+ * actually ships in the package. PowerPoint flags a repair (and stricter
+ * consumers reject outright) when a `.rels` points at a missing part.
+ *
+ * Two danglers slip past the individual preserve paths:
+ *
+ *  - **Renamed-but-clobbered** (e.g. `tags`): `injectIntoSlide` copies a
+ *    slide-referenced part under a `slidewise_preserved_N_` name and points the
+ *    slide rel there, but `preserveDeckChrome` later wipes the whole
+ *    `ppt/tags/` (a chrome prefix) and re-copies the source parts under their
+ *    ORIGINAL names. The prefixed copy is gone; the rel dangles. Here the part
+ *    still exists under its de-prefixed name, so we re-point the rel at it.
+ *
+ *  - **Genuinely absent** (e.g. `notesMaster`): pptxgenjs writes a notesSlide
+ *    per slide, each rel-linked to `notesMasters/notesMaster1.xml`, then
+ *    `preserveDeckChrome` removes that part (chrome prefix) without a source
+ *    replacement when the source has no notes master. Nothing resolves it, so
+ *    we drop the relationship — but only when the slide/notes body doesn't
+ *    reference its rId (implicit rels like `notesMaster` never do; dropping a
+ *    body-referenced rId would just move the corruption into the XML).
+ *
+ * Exported for direct unit testing.
+ */
+export async function reconcileDanglingRels(outZip: JSZip): Promise<void> {
+  const present = new Set<string>();
+  outZip.forEach((path, entry) => {
+    if (!entry.dir) present.add(path);
+  });
+
+  const relsPaths: string[] = [];
+  outZip.forEach((path, entry) => {
+    if (!entry.dir && path.endsWith(".rels")) relsPaths.push(path);
+  });
+
+  for (const relsPath of relsPaths) {
+    const file = outZip.file(relsPath);
+    if (!file) continue;
+    const xml = await file.async("string");
+    const ownerDir = ownerDirForRels(relsPath);
+
+    // The body of the part this rels file describes — read lazily, only when a
+    // drop candidate appears, so we can check whether its rId is referenced.
+    const ownerPath = relsPath.replace(/(^|\/)_rels\/([^/]+)\.rels$/, "$1$2");
+    let ownerBody: string | null | undefined;
+    const ownerReferences = async (rid: string): Promise<boolean> => {
+      if (ownerBody === undefined) {
+        ownerBody = (await outZip.file(ownerPath)?.async("string")) ?? null;
+      }
+      return ownerBody != null && new RegExp(`"${rid}"`).test(ownerBody);
+    };
+
+    let changed = false;
+    const rewritten: string[] = [];
+    let last = 0;
+    const re = /<Relationship\b[^>]*?\/>/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(xml))) {
+      const tag = m[0];
+      rewritten.push(xml.slice(last, m.index));
+      last = m.index + tag.length;
+
+      const mode = /\bTargetMode="([^"]+)"/.exec(tag)?.[1];
+      const target = /\bTarget="([^"]+)"/.exec(tag)?.[1];
+      const id = /\bId="([^"]+)"/.exec(tag)?.[1];
+      const type = /\bType="([^"]+)"/.exec(tag)?.[1];
+      const isExternal =
+        mode === "External" || (target ? /^https?:\/\//i.test(target) : false);
+      if (!target || !id || isExternal) {
+        rewritten.push(tag);
+        continue;
+      }
+      const full = normalisePath(target, ownerDir);
+      if (present.has(full)) {
+        rewritten.push(tag);
+        continue;
+      }
+
+      // Try to recover the part under its de-prefixed (original) name.
+      const slash = target.lastIndexOf("/");
+      const dir = slash >= 0 ? target.slice(0, slash + 1) : "";
+      const base = slash >= 0 ? target.slice(slash + 1) : target;
+      const deprefixed = base.replace(PRESERVE_PREFIX_RE, "");
+      if (deprefixed !== base) {
+        const repairedTarget = `${dir}${deprefixed}`;
+        if (present.has(normalisePath(repairedTarget, ownerDir))) {
+          rewritten.push(
+            tag.replace(/\bTarget="[^"]+"/, `Target="${repairedTarget}"`)
+          );
+          changed = true;
+          continue;
+        }
+      }
+
+      // Genuinely missing and unrepairable. Drop only when (a) the type is
+      // safe to remove and (b) the owner body doesn't reference its rId —
+      // dropping a body-referenced rId would just move the dangle into the
+      // XML. Anything else we keep and warn about: there's no safe action,
+      // and dropping a critical rel (e.g. a slide's only layout) would make
+      // the package no less broken.
+      const droppable = type ? DROPPABLE_REL_TYPES.has(relTypeSuffix(type)) : false;
+      if (droppable && !(await ownerReferences(id))) {
+        changed = true;
+        continue; // (tag intentionally omitted — relationship removed.)
+      }
+      console.warn(
+        `[slidewise/pptx] ${relsPath}: relationship ${id} → ${target} ` +
+          "resolves to a missing part and cannot be safely repaired or dropped; " +
+          "leaving it in place."
+      );
+      rewritten.push(tag);
+    }
+    if (!changed) continue;
+    rewritten.push(xml.slice(last));
+    outZip.file(relsPath, rewritten.join(""));
+  }
+}
+
+// -- Bug fix: SVG markup written into the .png raster fallback ----------------
+
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47] as const;
+
+/** A valid 1×1 fully-transparent PNG, used as a last-resort raster fallback
+ * when no rasterizer is available (SSR / Node) — a degraded-but-VALID image
+ * beats SVG-bytes-in-a-.png, which corrupts the whole package for strict
+ * consumers (Google Slides, LibreOffice, thumbnail renderers, OOXML
+ * validators). PowerPoint itself renders from the `<asvg:svgBlip>` regardless. */
+const TRANSPARENT_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+function decodeBase64ToBytes(b64: string): Uint8Array {
+  if (typeof atob === "function") {
+    const bin = atob(b64.replace(/\s+/g, ""));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  const B = (
+    globalThis as unknown as { Buffer?: { from(b: string, e: string): Uint8Array } }
+  ).Buffer;
+  if (B) return B.from(b64, "base64");
+  throw new Error("[slidewise] no base64 decoder available");
+}
+
+function isPngBytes(bytes: Uint8Array): boolean {
+  return (
+    bytes.length >= 4 &&
+    bytes[0] === PNG_MAGIC[0] &&
+    bytes[1] === PNG_MAGIC[1] &&
+    bytes[2] === PNG_MAGIC[2] &&
+    bytes[3] === PNG_MAGIC[3]
+  );
+}
+
+/** True when the bytes are XML/SVG markup rather than a raster — i.e. the
+ * first non-whitespace byte is `<` and an `<svg` tag appears near the start. */
+function looksLikeSvgBytes(bytes: Uint8Array): boolean {
+  let i = 0;
+  // Skip a UTF-8 BOM, then leading whitespace.
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    i = 3;
+  }
+  while (
+    i < bytes.length &&
+    (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d)
+  ) {
+    i++;
+  }
+  if (bytes[i] !== 0x3c /* '<' */) return false;
+  const head = new TextDecoder()
+    .decode(bytes.subarray(i, Math.min(bytes.length, i + 512)))
+    .toLowerCase();
+  return head.includes("<svg");
+}
+
+/**
+ * Rasterize SVG bytes to PNG bytes using the browser canvas pipeline. Returns
+ * null when no canvas/Image API is available (SSR, Node, jsdom without SVG
+ * rendering) or decoding fails — the caller then falls back to a valid
+ * transparent PNG so the package is never left holding a corrupt one.
+ */
+async function rasterizeSvgToPng(svgBytes: Uint8Array): Promise<Uint8Array | null> {
+  try {
+    if (
+      typeof Image === "undefined" ||
+      typeof URL === "undefined" ||
+      typeof URL.createObjectURL !== "function"
+    ) {
+      return null;
+    }
+    const copy = new Uint8Array(svgBytes);
+    const blob = new Blob([copy.buffer as ArrayBuffer], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    try {
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("svg decode failed"));
+        img.src = url;
+      });
+      const w = Math.max(1, Math.round(img.naturalWidth || img.width || 512));
+      const h = Math.max(1, Math.round(img.naturalHeight || img.height || 512));
+      let canvas: HTMLCanvasElement | OffscreenCanvas;
+      if (typeof OffscreenCanvas !== "undefined") {
+        canvas = new OffscreenCanvas(w, h);
+      } else if (typeof document !== "undefined") {
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        canvas = c;
+      } else {
+        return null;
+      }
+      const ctx = canvas.getContext("2d") as
+        | CanvasRenderingContext2D
+        | OffscreenCanvasRenderingContext2D
+        | null;
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, w, h);
+      let outBlob: Blob | null;
+      if ("convertToBlob" in canvas) {
+        outBlob = await canvas.convertToBlob({ type: "image/png" });
+      } else {
+        outBlob = await new Promise<Blob | null>((resolve) =>
+          (canvas as HTMLCanvasElement).toBlob((b) => resolve(b), "image/png")
+        );
+      }
+      if (!outBlob) return null;
+      const out = new Uint8Array(await outBlob.arrayBuffer());
+      return isPngBytes(out) ? out : null;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * pptxgenjs emits a dual-blip for SVG images (`<a:blip>` raster + an
+ * `<asvg:svgBlip>` vector) but writes the SVG SOURCE into the `.png` raster
+ * fallback part instead of a rasterized PNG (its `isSvgPng` rel carries the
+ * SVG `data:` URL verbatim). The `.png` extension + `image/png` content type
+ * are correct — only the bytes are wrong, so PowerPoint renders fine off the
+ * svgBlip while every strict consumer rejects the bogus PNG.
+ *
+ * Replace those bytes with a real rasterized PNG when a canvas is available,
+ * else a valid transparent PNG. The `<asvg:svgBlip>` .svg part is left intact.
+ */
+async function fixSvgRasterFallbacks(outZip: JSZip): Promise<void> {
+  const pngPaths: string[] = [];
+  outZip.forEach((path, entry) => {
+    if (!entry.dir && /^ppt\/media\/.+\.png$/i.test(path)) pngPaths.push(path);
+  });
+  let placeholder: Uint8Array | null = null;
+  for (const p of pngPaths) {
+    const file = outZip.file(p);
+    if (!file) continue;
+    const bytes = await file.async("uint8array");
+    if (isPngBytes(bytes) || !looksLikeSvgBytes(bytes)) continue;
+    const raster =
+      (await rasterizeSvgToPng(bytes)) ??
+      (placeholder ??= decodeBase64ToBytes(TRANSPARENT_PNG_BASE64));
+    outZip.file(p, raster, { binary: true });
   }
 }

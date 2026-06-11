@@ -35,12 +35,74 @@ async function loadFixture(name: string): Promise<ArrayBuffer> {
 const hasEon = await fixtureExists("eon-deck.pptx");
 const hasDickinson = await fixtureExists("Dickinson_Sample_Slides.pptx");
 
+// Templates from the dangling-rel bug report (1a tags / 1b notesMaster).
+const DANGLING_FIXTURES = [
+  "Intero Master Template.pptx",
+  "Intero.pptx",
+  "44 - Education.pptx",
+  "eon-deck.pptx",
+  "Dickinson_Sample_Slides.pptx",
+] as const;
+const danglingFixtures = (
+  await Promise.all(
+    DANGLING_FIXTURES.map(async (name) =>
+      (await fixtureExists(name)) ? name : null
+    )
+  )
+).filter((n): n is (typeof DANGLING_FIXTURES)[number] => n !== null);
+
 async function listZipPaths(buf: ArrayBuffer | Blob): Promise<Set<string>> {
   const ab = buf instanceof Blob ? await buf.arrayBuffer() : buf;
   const zip = await JSZip.loadAsync(ab);
   const paths = new Set<string>();
   zip.forEach((p) => paths.add(p));
   return paths;
+}
+
+/**
+ * Walk every `*.rels` in the package and return the internal relationship
+ * targets that don't resolve to a shipped part. A non-empty result means the
+ * output would trigger a PowerPoint repair prompt / strict-consumer rejection.
+ */
+async function findDanglingRels(
+  buf: Blob | ArrayBuffer
+): Promise<Array<{ rels: string; id: string; target: string }>> {
+  const ab = buf instanceof Blob ? await buf.arrayBuffer() : buf;
+  const zip = await JSZip.loadAsync(ab);
+  const present = new Set<string>();
+  const relsPaths: string[] = [];
+  zip.forEach((p, e) => {
+    if (e.dir) return;
+    present.add(p);
+    if (p.endsWith(".rels")) relsPaths.push(p);
+  });
+  const normalise = (target: string, base: string): string => {
+    if (target.startsWith("/")) return target.slice(1);
+    let t = target;
+    const segs = base.split("/").filter(Boolean);
+    while (t.startsWith("../")) {
+      segs.pop();
+      t = t.slice(3);
+    }
+    return [...segs, t].filter(Boolean).join("/");
+  };
+  const dangling: Array<{ rels: string; id: string; target: string }> = [];
+  for (const relsPath of relsPaths) {
+    const xml = await zip.file(relsPath)!.async("string");
+    const ownerDir = relsPath.replace(/(^|\/)_rels\/[^/]+$/, "");
+    const re = /<Relationship\b[^>]*?\/>/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(xml))) {
+      const tag = m[0];
+      const mode = /\bTargetMode="([^"]+)"/.exec(tag)?.[1];
+      const target = /\bTarget="([^"]+)"/.exec(tag)?.[1];
+      const id = /\bId="([^"]+)"/.exec(tag)?.[1] ?? "?";
+      if (!target || mode === "External" || /^https?:\/\//i.test(target)) continue;
+      const full = normalise(target, ownerDir === relsPath ? "" : ownerDir);
+      if (!present.has(full)) dangling.push({ rels: relsPath, id, target });
+    }
+  }
+  return dangling;
 }
 
 async function countSlidesWithSpTreeChildren(
@@ -184,4 +246,23 @@ describe("deck chrome preservation", () => {
       expect(fontCount).toBe(5);
     }
   );
+
+  // Package invariant: no internal relationship may point at a missing part.
+  // Catches the tags (1a) and notesMaster (1b) danglers the chrome-preserve
+  // path used to emit. Runs per available fixture (skipped in CI where the
+  // branded decks aren't committed).
+  for (const name of danglingFixtures) {
+    it(`emits no dangling internal relationships (${name})`, async () => {
+      const source = await loadFixture(name);
+      const deck = await parsePptx(source);
+      const blob = await serializeDeck(deck, { source });
+      const dangling = await findDanglingRels(blob);
+      expect(
+        dangling,
+        `dangling rels:\n${dangling
+          .map((d) => `  ${d.rels} ${d.id} → ${d.target}`)
+          .join("\n")}`
+      ).toEqual([]);
+    });
+  }
 });
