@@ -99,7 +99,41 @@ export interface SerializeOptions {
    * instead of only seeing it in the console.
    */
   onWarning?: (warning: SerializeWarning) => void;
+  /**
+   * Rasterize an SVG to PNG bytes. pptxgenjs emits SVG images as a dual blip
+   * (`<a:blip>` raster + `<asvg:svgBlip>` vector) but writes the SVG *source*
+   * into the `.png` raster fallback; the fallback must be a real PNG or strict
+   * consumers (Google Slides, LibreOffice, thumbnail/raster renderers, OOXML
+   * validators) reject the package.
+   *
+   * In the browser the fallback is rasterized via canvas automatically. On the
+   * headless Node/SSR path there is no canvas, so without this hook the
+   * fallback degrades to a 1×1 transparent PNG (valid, but the image is blank
+   * outside PowerPoint). Provide a rasterizer to emit a faithful fallback —
+   * the library stays dependency-free and the host chooses the engine:
+   *
+   * ```ts
+   * import { Resvg } from "@resvg/resvg-js";
+   * serializeDeck(deck, {
+   *   source,
+   *   rasterizeSvg: (svg) => new Resvg(Buffer.from(svg)).render().asPng(),
+   * });
+   * ```
+   *
+   * Return `null`/`undefined` (or throw — it's caught) to defer to the next
+   * fallback. Output that isn't valid PNG bytes is ignored. May be sync or async.
+   */
+  rasterizeSvg?: SvgRasterizer;
 }
+
+/**
+ * Host-provided SVG→PNG rasterizer (see {@link SerializeOptions.rasterizeSvg}).
+ * Receives the SVG bytes, returns PNG bytes (or null to defer to the built-in
+ * fallback). Sync or async.
+ */
+export type SvgRasterizer = (
+  svg: Uint8Array
+) => Uint8Array | null | undefined | Promise<Uint8Array | null | undefined>;
 
 /** A non-fatal serialization diagnostic delivered to `SerializeOptions.onWarning`. */
 export interface SerializeWarning {
@@ -211,7 +245,8 @@ export async function serializeDeck(
     deck,
     sourceBuffer,
     options.asTemplate,
-    options.onWarning
+    options.onWarning,
+    options.rasterizeSvg
   );
 }
 
@@ -975,7 +1010,8 @@ async function preserveUnknowns(
   deck: Deck,
   explicitSource?: Blob | ArrayBuffer | Uint8Array,
   asTemplate?: boolean,
-  onWarning?: (warning: SerializeWarning) => void
+  onWarning?: (warning: SerializeWarning) => void,
+  rasterizeSvg?: SvgRasterizer
 ): Promise<Blob> {
   // Prefer the caller-supplied source (survives state cloning / localStorage
   // rehydrate); fall back to the non-enumerable attachment from parsePptx
@@ -1001,7 +1037,7 @@ async function preserveUnknowns(
     // PowerPoint refuses to open the file when declared parts are missing
     // (Keynote is lenient and just warns). Always sanitise.
     const outZip = await JSZip.loadAsync(generated);
-    await fixSvgRasterFallbacks(outZip);
+    await fixSvgRasterFallbacks(outZip, rasterizeSvg);
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
@@ -1017,7 +1053,7 @@ async function preserveUnknowns(
     await applySynth(outZip, deck);
     await applySynthSlideBackgrounds(outZip, deck);
     await applyEmbeddedFontsFromJson(outZip, deck);
-    await fixSvgRasterFallbacks(outZip);
+    await fixSvgRasterFallbacks(outZip, rasterizeSvg);
     await pruneDanglingContentTypes(outZip);
     await sanitisePresentationXml(outZip);
     await sanitiseSlideXml(outZip);
@@ -1039,6 +1075,11 @@ async function preserveUnknowns(
   // the per-slide non-enumerable attachment has been stripped by state
   // cloning — we then map deck.slides[i] back to source slides[i].
   const sourceSlidePaths = await readSourceSlidePaths(srcZip);
+
+  // One registry for the whole serialize: media/parts shared across slides
+  // (icons, logos, backgrounds, chart workbooks) are copied once and reused,
+  // instead of duplicating per reference.
+  const reg = createPreservedPartRegistry();
 
   const slideIndices = new Set<number>([
     ...unknownsBySlide.keys(),
@@ -1079,7 +1120,8 @@ async function preserveUnknowns(
       generatedSlidePath,
       generatedRelsPath,
       pristineGroup?.fragments ?? [],
-      unknownFragments
+      unknownFragments,
+      reg
     );
   }
 
@@ -1096,7 +1138,7 @@ async function preserveUnknowns(
   // backgrounds collapse to a flat hex through the model path. Replace
   // each output slide's `<p:bg>` with the source's verbatim XML when
   // available so gradients survive intact.
-  await preserveSlideBackgrounds(outZip, srcZip, deck, sourceSlidePaths);
+  await preserveSlideBackgrounds(outZip, srcZip, deck, sourceSlidePaths, reg);
 
   // Synthesised content (custGeom shapes, gradient fills, in-app charts,
   // groups, effect splices) — applied after source preservation so we never
@@ -1110,7 +1152,7 @@ async function preserveUnknowns(
   // are set.
   await applyEmbeddedFontsFromJson(outZip, deck);
   // Replace pptxgenjs's SVG-bytes-in-.png raster fallbacks with valid PNGs.
-  await fixSvgRasterFallbacks(outZip);
+  await fixSvgRasterFallbacks(outZip, rasterizeSvg);
   // Strip Content_Types overrides for parts that don't exist. preserveDeckChrome
   // rewrites most, but pptxgenjs's stale slideMaster1..N / notesSlide overrides
   // can survive (and all of them survive when chrome preservation bails on an
@@ -1279,7 +1321,8 @@ async function injectIntoSlide(
   generatedSlidePath: string,
   generatedRelsPath: string,
   pristineFragments: PristineFragment[],
-  unknownFragments: PristineFragment[]
+  unknownFragments: PristineFragment[],
+  reg: PreservedPartRegistry
 ): Promise<void> {
   const slideXml = await outZip.file(generatedSlidePath)!.async("string");
   const closeIdx = slideXml.lastIndexOf("</p:spTree>");
@@ -1349,18 +1392,26 @@ async function injectIntoSlide(
         const isInternalPart = !isExternal && !target.startsWith("/");
         if (isInternalPart) {
           const srcFullTarget = normalisePath(target, sourceDir);
-          const srcFile = srcZip.file(srcFullTarget);
-          if (srcFile) {
-            const newTarget = uniqueTarget(target, outZip, outDir);
-            const newFullTarget = normalisePath(newTarget, outDir);
-            outZip.file(newFullTarget, srcFile.async("uint8array"), {
-              binary: true,
-            });
-            target = newTarget;
-            deepCopyJobs.push({
-              srcFull: srcFullTarget,
-              outFull: newFullTarget,
-            });
+          const copy = preserveSourcePart(
+            reg,
+            outZip,
+            srcZip,
+            srcFullTarget,
+            target,
+            outDir
+          );
+          if (copy) {
+            target = copy.relTarget;
+            // Walk the dependency tree only the first time this part is
+            // copied — later references reuse the same output part, whose
+            // deps (chart workbook, colors/style, nested media) were already
+            // brought along on that first copy.
+            if (copy.firstCopy) {
+              deepCopyJobs.push({
+                srcFull: srcFullTarget,
+                outFull: copy.outFull,
+              });
+            }
           }
         }
         newRelLines.push(buildRelXml(newRid, srcRel.type, target));
@@ -1379,15 +1430,16 @@ async function injectIntoSlide(
   // Deep-copy each referenced part's dependency tree so e.g. a preserved
   // chart's embedded Excel workbook + colors/style parts (and the content
   // types declaring them) come along. Sequential so the shared
-  // `[Content_Types].xml` read/modify/write doesn't race.
-  const copied = new Set<string>();
+  // `[Content_Types].xml` read/modify/write doesn't race. The registry's
+  // `depsWalked` set spans the whole serialize, so a part shared across
+  // slides has its tree copied exactly once.
   for (const job of deepCopyJobs) {
     await copyPartDependencies(
       srcZip,
       outZip,
       job.srcFull,
       job.outFull,
-      copied
+      reg
     );
   }
 
@@ -1453,11 +1505,13 @@ async function copyPartDependencies(
   outZip: JSZip,
   srcPartPath: string,
   outPartPath: string,
-  copied: Set<string>
+  reg: PreservedPartRegistry
 ): Promise<void> {
-  // Guard against cycles and redundant work (two charts sharing one workbook).
-  if (copied.has(srcPartPath)) return;
-  copied.add(srcPartPath);
+  // Guard against cycles and redundant work (two charts sharing one workbook,
+  // or the same part referenced from several slides). The set spans the whole
+  // serialize, so each source part's tree is walked exactly once.
+  if (reg.depsWalked.has(srcPartPath)) return;
+  reg.depsWalked.add(srcPartPath);
 
   await ensureContentType(srcZip, outZip, srcPartPath, outPartPath);
 
@@ -1467,7 +1521,6 @@ async function copyPartDependencies(
   const rels = parseRels(srcRelsXml);
   if (!rels.size) return;
 
-  const srcDir = dirOf(srcPartPath);
   const outDir = dirOf(outPartPath);
   const newRelLines: string[] = [];
   for (const [id, rel] of rels) {
@@ -1478,26 +1531,32 @@ async function copyPartDependencies(
       newRelLines.push(buildRelXml(id, rel.type, rel.target));
       continue;
     }
-    const childSrcFull = normalisePath(rel.target, srcDir);
-    const childSrcFile = srcZip.file(childSrcFull);
-    if (!childSrcFile) {
+    const childSrcFull = normalisePath(rel.target, dirOf(srcPartPath));
+    const child = preserveSourcePart(
+      reg,
+      outZip,
+      srcZip,
+      childSrcFull,
+      rel.target,
+      outDir
+    );
+    if (!child) {
       // Dangling in the source too — keep the rel verbatim rather than drop it.
       newRelLines.push(buildRelXml(id, rel.type, rel.target));
       continue;
     }
-    const childOutTarget = uniqueTarget(rel.target, outZip, outDir);
-    const childOutFull = normalisePath(childOutTarget, outDir);
-    outZip.file(childOutFull, childSrcFile.async("uint8array"), {
-      binary: true,
-    });
-    await copyPartDependencies(
-      srcZip,
-      outZip,
-      childSrcFull,
-      childOutFull,
-      copied
-    );
-    newRelLines.push(buildRelXml(id, rel.type, childOutTarget));
+    // Recurse only on the first copy; a child shared with another part already
+    // had its own tree brought along when it was first preserved.
+    if (child.firstCopy) {
+      await copyPartDependencies(
+        srcZip,
+        outZip,
+        childSrcFull,
+        child.outFull,
+        reg
+      );
+    }
+    newRelLines.push(buildRelXml(id, rel.type, child.relTarget));
   }
 
   const outRelsPath = relsPathFor(outPartPath);
@@ -1766,6 +1825,67 @@ function uniqueTarget(originalTarget: string, outZip: JSZip, baseDir: string): s
   return candidate;
 }
 
+/**
+ * Per-serialize ledger of source parts already copied into the output package,
+ * keyed by the part's immutable source path.
+ *
+ * The same media is routinely shared — one icon/logo/background is referenced
+ * from many slides, and a single slide's fragments can each reference it. The
+ * naive path keeps a *separate* copy per reference (`uniqueTarget` only avoids
+ * path collisions; it has no idea the bytes were already written), so a 1.5 MB
+ * deck ballooned to ~6 MB with one image written nine times as
+ * `slidewise_preserved_0..8_imageN`. Keying the copy on the source path
+ * collapses those back to a single shared part — exactly as the source authored
+ * it — and lets every referencing rel point at that one copy.
+ */
+interface PreservedPartRegistry {
+  /** source full path → output full path of the single copy we made for it. */
+  readonly bySource: Map<string, string>;
+  /** source full paths whose dependency tree has already been deep-copied. */
+  readonly depsWalked: Set<string>;
+}
+
+function createPreservedPartRegistry(): PreservedPartRegistry {
+  return { bySource: new Map(), depsWalked: new Set() };
+}
+
+/**
+ * Copy a source part into the output zip at most once per serialize.
+ *
+ * Returns the rel `Target` the owner should reference (relative to
+ * `ownerOutDir`), the part's full output path, and whether THIS call performed
+ * the copy — so callers can run the dependency walk only on the first copy.
+ * Returns `null` when the source part is missing (caller leaves the rel as-is).
+ *
+ * On the first sighting we mint a collision-free `slidewise_preserved_N_` name
+ * and record it; every later reference — from any slide, layout, or sibling
+ * part — resolves the recorded copy and points at it instead of duplicating.
+ */
+function preserveSourcePart(
+  reg: PreservedPartRegistry,
+  outZip: JSZip,
+  srcZip: JSZip,
+  srcFullTarget: string,
+  preferredRelTarget: string,
+  ownerOutDir: string
+): { relTarget: string; outFull: string; firstCopy: boolean } | null {
+  const srcFile = srcZip.file(srcFullTarget);
+  if (!srcFile) return null;
+  const existing = reg.bySource.get(srcFullTarget);
+  if (existing) {
+    return {
+      relTarget: relativeTarget(ownerOutDir, existing),
+      outFull: existing,
+      firstCopy: false,
+    };
+  }
+  const newTarget = uniqueTarget(preferredRelTarget, outZip, ownerOutDir);
+  const outFull = normalisePath(newTarget, ownerOutDir);
+  outZip.file(outFull, srcFile.async("uint8array"), { binary: true });
+  reg.bySource.set(srcFullTarget, outFull);
+  return { relTarget: newTarget, outFull, firstCopy: true };
+}
+
 function dirOf(path: string): string {
   const i = path.lastIndexOf("/");
   return i >= 0 ? path.slice(0, i) : "";
@@ -1927,7 +2047,8 @@ async function preserveSlideBackgrounds(
   outZip: JSZip,
   srcZip: JSZip,
   deck: Deck,
-  sourceSlidePaths: string[]
+  sourceSlidePaths: string[],
+  reg: PreservedPartRegistry
 ): Promise<void> {
   for (let i = 0; i < deck.slides.length; i++) {
     const slide = deck.slides[i];
@@ -1952,7 +2073,7 @@ async function preserveSlideBackgrounds(
       await stripOutputBg(outZip, i);
       continue;
     }
-    await injectSlideBg(outZip, srcZip, i, sourceSlidePath, bgFragment);
+    await injectSlideBg(outZip, srcZip, i, sourceSlidePath, bgFragment, reg);
   }
 }
 
@@ -1987,7 +2108,8 @@ async function injectSlideBg(
   srcZip: JSZip,
   slideIndex: number,
   sourceSlidePath: string,
-  bgFragment: string
+  bgFragment: string,
+  reg: PreservedPartRegistry
 ): Promise<void> {
   const outSlidePath = `ppt/slides/slide${slideIndex + 1}.xml`;
   const outRelsPath = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
@@ -2034,15 +2156,15 @@ async function injectSlideBg(
         const isInternalPart = !isExternal && !target.startsWith("/");
         if (isInternalPart) {
           const srcFullTarget = normalisePath(target, sourceDir);
-          const srcFile = srcZip.file(srcFullTarget);
-          if (srcFile) {
-            const newTarget = uniqueTarget(target, outZip, outDir);
-            const newFullTarget = normalisePath(newTarget, outDir);
-            outZip.file(newFullTarget, srcFile.async("uint8array"), {
-              binary: true,
-            });
-            target = newTarget;
-          }
+          const copy = preserveSourcePart(
+            reg,
+            outZip,
+            srcZip,
+            srcFullTarget,
+            target,
+            outDir
+          );
+          if (copy) target = copy.relTarget;
         }
         newRelLines.push(buildRelXml(newRid, srcRel.type, target));
         return `${attr}="${newRid}"`;
@@ -2562,6 +2684,21 @@ async function isTemplateArchive(zip: JSZip): Promise<boolean> {
 }
 
 /**
+ * DEFLATE the package on write. JSZip defaults to `STORE` (no compression), so
+ * without this every part — including the slide XML, which routinely runs into
+ * the megabytes and compresses ~90% — ships uncompressed. That alone inflated a
+ * 1.5 MB source deck to ~6 MB on save. DEFLATE matches what PowerPoint itself
+ * (and the original archive) does. Level 6 is the standard speed/ratio balance;
+ * already-compressed media (PNG/JPEG) simply doesn't shrink further, at
+ * negligible CPU cost.
+ */
+const ZIP_OUTPUT_OPTIONS = {
+  type: "blob",
+  compression: "DEFLATE",
+  compressionOptions: { level: 6 },
+} as const;
+
+/**
  * Generate the final Blob, flipping the main-part content type to the template
  * variant first when emitting a `.potx`. pptxgenjs always writes the
  * presentation content type, so the template path rewrites it in place.
@@ -2571,7 +2708,7 @@ async function finalizeOutput(
   asTemplate: boolean
 ): Promise<Blob> {
   if (!asTemplate) {
-    return outZip.generateAsync({ type: "blob", mimeType: PPTX_MIME });
+    return outZip.generateAsync({ ...ZIP_OUTPUT_OPTIONS, mimeType: PPTX_MIME });
   }
   const file = outZip.file("[Content_Types].xml");
   if (file) {
@@ -2583,7 +2720,7 @@ async function finalizeOutput(
       );
     }
   }
-  return outZip.generateAsync({ type: "blob", mimeType: POTX_MIME });
+  return outZip.generateAsync({ ...ZIP_OUTPUT_OPTIONS, mimeType: POTX_MIME });
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -3365,9 +3502,14 @@ const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47] as const;
  * when no rasterizer is available (SSR / Node) — a degraded-but-VALID image
  * beats SVG-bytes-in-a-.png, which corrupts the whole package for strict
  * consumers (Google Slides, LibreOffice, thumbnail renderers, OOXML
- * validators). PowerPoint itself renders from the `<asvg:svgBlip>` regardless. */
+ * validators). PowerPoint itself renders from the `<asvg:svgBlip>` regardless.
+ *
+ * Every chunk's CRC-32 must be correct: the previous constant had a bad IDAT
+ * CRC, which decodes in lenient readers but is rejected by the strict PNG/OOXML
+ * validators this fallback exists to satisfy. Regenerate with a real encoder
+ * (and re-verify chunk CRCs) if you ever change it. */
 const TRANSPARENT_PNG_BASE64 =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=";
 
 function decodeBase64ToBytes(b64: string): Uint8Array {
   if (typeof atob === "function") {
@@ -3488,7 +3630,10 @@ async function rasterizeSvgToPng(svgBytes: Uint8Array): Promise<Uint8Array | nul
  * Replace those bytes with a real rasterized PNG when a canvas is available,
  * else a valid transparent PNG. The `<asvg:svgBlip>` .svg part is left intact.
  */
-async function fixSvgRasterFallbacks(outZip: JSZip): Promise<void> {
+async function fixSvgRasterFallbacks(
+  outZip: JSZip,
+  rasterizeSvg?: SvgRasterizer
+): Promise<void> {
   const pngPaths: string[] = [];
   outZip.forEach((path, entry) => {
     if (!entry.dir && /^ppt\/media\/.+\.png$/i.test(path)) pngPaths.push(path);
@@ -3499,9 +3644,33 @@ async function fixSvgRasterFallbacks(outZip: JSZip): Promise<void> {
     if (!file) continue;
     const bytes = await file.async("uint8array");
     if (isPngBytes(bytes) || !looksLikeSvgBytes(bytes)) continue;
+    // Faithful first: a host-provided rasterizer (the only option on Node/SSR,
+    // where there's no canvas), then the browser canvas pipeline. Only if both
+    // decline do we degrade to a valid transparent PNG — never leave the part
+    // holding SVG bytes.
     const raster =
+      (await tryHostRasterizer(rasterizeSvg, bytes)) ??
       (await rasterizeSvgToPng(bytes)) ??
       (placeholder ??= decodeBase64ToBytes(TRANSPARENT_PNG_BASE64));
     outZip.file(p, raster, { binary: true });
+  }
+}
+
+/**
+ * Invoke a host {@link SvgRasterizer}, returning its bytes only when it
+ * actually produced a valid PNG. Swallows throws and non-PNG output so a flaky
+ * host engine can never corrupt the part — the caller then falls through to the
+ * canvas pipeline or the transparent placeholder.
+ */
+async function tryHostRasterizer(
+  rasterizeSvg: SvgRasterizer | undefined,
+  svgBytes: Uint8Array
+): Promise<Uint8Array | null> {
+  if (!rasterizeSvg) return null;
+  try {
+    const out = await rasterizeSvg(svgBytes);
+    return out && isPngBytes(out) ? out : null;
+  } catch {
+    return null;
   }
 }
