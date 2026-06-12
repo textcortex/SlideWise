@@ -88,7 +88,13 @@ export {
   type SlideRailItemContextValue,
 } from "./compound";
 
-export { parsePptx, isPptxTemplate, serializeDeck, applyEdits } from "./lib/pptx";
+export {
+  parsePptx,
+  isPptxTemplate,
+  serializeDeck,
+  applyEdits,
+  layoutSlotElementId,
+} from "./lib/pptx";
 export type {
   SerializeOptions,
   SerializeWarning,

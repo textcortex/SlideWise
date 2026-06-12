@@ -165,6 +165,46 @@ automatically. `serializeDeck` remains the path for the live editor and
 from-scratch decks; `applyEdits` is the lossless path for template-derived
 output.
 
+**Scaling a deck with the template's own layouts.** A `PlannedSlide` can clone
+a source slide (`{ slideIndex }`) **or** instantiate a fresh slide from one of
+the template's layouts (`{ layoutId, fills? }`). Because the layout is already a
+part of `source`, instantiation is still a lossless patch — the new slide binds
+to `ppt/slideLayouts/<layoutId>.xml` and inherits its theme / master /
+background chrome, while every other part stays byte-identical. This is how you
+build a 35-slide deck from a 16-slide template without it looking repetitive:
+clone where you want the exact slide, instantiate from layouts where you want
+variety.
+
+```ts
+import { applyEdits, layoutSlotElementId, summarizeLayouts } from "@textcortex/slidewise";
+
+const layouts = summarizeLayouts(deck); // pick a layout id + its fillable slot keys
+const layoutId = layouts[0].id;
+
+await applyEdits(source, {
+  slides: [
+    { source: { slideIndex: 1 }, edits: [] }, // cloned, byte-identical
+    {
+      // Instantiate from a layout; `fills` populates text placeholders by key.
+      source: { layoutId, fills: { title: "Pipeline", "body:1": "Q3 → Q4" } },
+      edits: [
+        // Non-text slots are addressable by a deterministic id so edits can
+        // target them: fill the picture slot, draw a chart into the chart slot.
+        { op: "setImage", elementId: layoutSlotElementId(layoutId, "pic:2"), data: photoBytes },
+        { op: "addChart", bounds: chartSlotBounds, kind: "column", categories, series },
+      ],
+    },
+  ],
+});
+```
+
+Each instantiated placeholder (text **and** non-text — picture / chart / table)
+is materialised as a positioned element with the stable id
+`layoutSlotElementId(layoutId, key)`, where `key` is the `placeholderKey` /
+`summarizeLayouts` slot key (`"title"`, `"body:1"`, `"pic:2"`, …). An
+unresolvable `layoutId` is reported via `onWarning` and the slide is skipped
+(never shipped wrong).
+
 ### Generating slides from the template's layouts
 
 `parsePptx` exposes the source template's master layouts on `deck.layouts`.
