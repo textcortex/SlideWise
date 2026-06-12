@@ -88,11 +88,18 @@ export {
   type SlideRailItemContextValue,
 } from "./compound";
 
-export { parsePptx, isPptxTemplate, serializeDeck } from "./lib/pptx";
+export { parsePptx, isPptxTemplate, serializeDeck, applyEdits } from "./lib/pptx";
 export type {
   SerializeOptions,
   SerializeWarning,
   SvgRasterizer,
+  EditPlan,
+  PlannedSlide,
+  Edit,
+  Run,
+  Series,
+  Rect,
+  ApplyEditsOptions,
 } from "./lib/pptx";
 export type { ParseDiagnostics, ParseResult } from "./lib/pptx/types";
 

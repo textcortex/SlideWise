@@ -429,6 +429,45 @@ export function getElementSource(elementId: string): ElementSource | undefined {
   return elementSourceRegistry.get(elementId);
 }
 
+/**
+ * Verbatim source location of an imported element. Unlike `ElementSource`
+ * (above), which the lossy serialize path uses and therefore *skips* for
+ * placeholder shapes with no explicit `<a:xfrm>`, this is recorded for
+ * EVERY top-level element and group child with no filtering.
+ */
+export interface ElementLocation {
+  /** Source slide part path, e.g. `ppt/slides/slide2.xml`. */
+  slidePath: string;
+  /** Verbatim `<p:sp>`/`<p:pic>`/`<p:cxnSp>`/`<p:graphicFrame>`/`<p:grpSp>`
+   *  block, exactly as it appears in the source slide XML. */
+  xml: string;
+}
+
+/**
+ * Complete element-id → source-location index. The surgical-edit API
+ * (`applyEdits`) uses it to find and patch an element inside its source
+ * slide XML by the same stable id `parsePptx` returns. Module-global /
+ * in-memory, populated by the most recent `parsePptx`; the host calls
+ * `parsePptx(source)` then `applyEdits(source, plan)` in the same process,
+ * so it is warm. (Mirrors `elementSourceRegistry`'s lifetime.)
+ */
+const elementLocationRegistry = new Map<string, ElementLocation>();
+
+export function getElementLocation(
+  elementId: string
+): ElementLocation | undefined {
+  return elementLocationRegistry.get(elementId);
+}
+
+function registerElementLocation(
+  element: SlideElement,
+  rawXml: string | undefined,
+  slidePath: string
+): void {
+  if (!rawXml) return;
+  elementLocationRegistry.set(element.id, { slidePath, xml: rawXml });
+}
+
 export function snapshotElement(element: SlideElement): string {
   return JSON.stringify(snapshotFields(element));
 }
@@ -1036,24 +1075,28 @@ async function parseSpTree(
       const el = await parseSpOrText(node, ctx, outer);
       if (el) {
         registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
+        registerElementLocation(el, rawSrc, ctx.slidePath);
         out.push(el);
       }
     } else if (tag === "p:pic") {
       const el = await parsePic(node, ctx, outer);
       if (el) {
         registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
+        registerElementLocation(el, rawSrc, ctx.slidePath);
         out.push(el);
       }
     } else if (tag === "p:cxnSp") {
       const el = parseCxn(node, ctx, outer);
       if (el) {
         registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
+        registerElementLocation(el, rawSrc, ctx.slidePath);
         out.push(el);
       }
     } else if (tag === "p:graphicFrame") {
       const el = await parseGraphicFrame(node, ctx, outer);
       if (el) {
         registerElementSource(el, rawSrc, ctx.slidePath, ctx.theme);
+        registerElementLocation(el, rawSrc, ctx.slidePath);
         out.push(el);
       }
     } else if (tag === "p:grpSp") {
@@ -1073,6 +1116,7 @@ async function parseSpTree(
       // descendant is edited the snapshot diverges (see snapshotElement)
       // and the synth path re-emits the group instead.
       registerElementSource(group, rawSrc, ctx.slidePath, ctx.theme);
+      registerElementLocation(group, rawSrc, ctx.slidePath);
       out.push(group);
     }
   }
