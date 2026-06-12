@@ -165,6 +165,97 @@ automatically. `serializeDeck` remains the path for the live editor and
 from-scratch decks; `applyEdits` is the lossless path for template-derived
 output.
 
+**Scaling a deck with the template's own layouts.** A `PlannedSlide` can clone
+a source slide (`{ slideIndex }`) **or** instantiate a fresh slide from one of
+the template's layouts (`{ layoutId, fills? }`). Because the layout is already a
+part of `source`, instantiation is still a lossless patch — the new slide binds
+to `ppt/slideLayouts/<layoutId>.xml` and inherits its theme / master /
+background chrome, while every other part stays byte-identical. This is how you
+build a 35-slide deck from a 16-slide template without it looking repetitive:
+clone where you want the exact slide, instantiate from layouts where you want
+variety.
+
+```ts
+import { applyEdits, layoutSlotElementId, summarizeLayouts } from "@textcortex/slidewise";
+
+const layouts = summarizeLayouts(deck); // pick a layout id + its fillable slot keys
+const layoutId = layouts[0].id;
+
+await applyEdits(source, {
+  slides: [
+    { source: { slideIndex: 1 }, edits: [] }, // cloned, byte-identical
+    {
+      // Instantiate from a layout; `fills` populates text placeholders by key.
+      source: { layoutId, fills: { title: "Pipeline", "body:1": "Q3 → Q4" } },
+      edits: [
+        // Non-text slots are addressable by a deterministic id so edits can
+        // target them: fill the picture slot, draw a chart into the chart slot.
+        { op: "setImage", elementId: layoutSlotElementId(layoutId, "pic:2"), data: photoBytes },
+        { op: "addChart", bounds: chartSlotBounds, kind: "column", categories, series },
+      ],
+    },
+  ],
+});
+```
+
+Each instantiated placeholder (text **and** non-text — picture / chart / table)
+is materialised as a positioned element with the stable id
+`layoutSlotElementId(layoutId, key)`, where `key` is the `placeholderKey` /
+`summarizeLayouts` slot key (`"title"`, `"body:1"`, `"pic:2"`, …). An
+unresolvable `layoutId` is reported via `onWarning` and the slide is skipped
+(never shipped wrong).
+
+### Headless render-to-image (visual QA)
+
+`renderDeckToImages` renders a deck to one image per slide **server-side, with
+no browser** — drawing what the editor draws (native charts via ECharts SSR,
+diagrams, text, shapes, images), not the OOXML raster fallbacks. It's built for
+a render → inspect → fix → re-render QA loop, e.g. rendering a final `applyEdits`
+output and having a model flag overflow / overlap / leftover text.
+
+```ts
+import {
+  renderDeckToSvg,
+  renderDeckToImages,
+  renderPptxToImages,
+} from "@textcortex/slidewise";
+
+// SVGs only (no rasteriser needed) — rasterise yourself if you prefer.
+const svgs: string[] = await renderDeckToSvg(deck, { slides: [1, 2] });
+
+// Raster bytes. Rasterisation is an injected hook so there's no hard native dep
+// — pass a @resvg/resvg-js wrapper (the default tries to import it on demand).
+import { Resvg } from "@resvg/resvg-js";
+const pngs: Uint8Array[] = await renderDeckToImages(deck, {
+  dpi: 150,
+  rasterizeSvg: (svg, width) => new Resvg(svg, { fitTo: { mode: "width", value: width } }).render().asPng(),
+});
+
+// Render a final applyEdits output directly:
+const shots = await renderPptxToImages(await applyEdits(source, plan));
+```
+
+`opts`: `slides` (1-based subset), `dpi` (the 1920×1080 canvas scales by
+`dpi/96`), `format`, `maxWidth` (thumbnail cap). Output is deterministic (no
+animation). The renderer is browser-free and ECharts is loaded on demand, so it
+never bloats the editor bundle.
+
+### Font transparency (missing-font warnings)
+
+`parsePptx` stamps `deck.fontUsage: { family, embedded }[]` — every font family
+the deck's text uses, flagged whether the source PPTX actually **embeds** it
+(`<p:embeddedFontLst>` → a real `ppt/fonts/*` part) or only **references** it (so
+it falls back to a system font on viewers that don't ship the brand font). Use it
+to warn at generation time:
+
+```ts
+const missing = (deck.fontUsage ?? []).filter((f) => !f.embedded);
+if (missing.length) warnHost(`not embedded: ${missing.map((f) => f.family).join(", ")}`);
+```
+
+This is a read-only diagnostic, distinct from `deck.fonts` (the embeddable
+payloads the serializer writes back).
+
 ### Generating slides from the template's layouts
 
 `parsePptx` exposes the source template's master layouts on `deck.layouts`.

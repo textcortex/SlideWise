@@ -803,6 +803,24 @@ export interface Deck {
    * licensed copies of the brand font in a web-friendly format.
    */
   webFonts?: WebFontAsset[];
+  /**
+   * Font-transparency report stamped by `parsePptx`: every font family used
+   * by the deck's text, with whether the source PPTX actually **embeds** it
+   * (a `ppt/fonts/*` part in `<p:embeddedFontLst>`) or merely **references** it
+   * (so it falls back to a system font on viewers that don't ship it). Hosts
+   * use this to warn at generation time when a template's brand font isn't
+   * embedded. Distinct from `fonts` (the embeddable payloads) — this is a
+   * read-only diagnostic.
+   */
+  fontUsage?: FontUsage[];
+}
+
+/** One entry of {@link Deck.fontUsage}. */
+export interface FontUsage {
+  /** Family name as it appears on `TextElement.fontFamily` / run fonts. */
+  family: string;
+  /** True when the source PPTX embeds this family; false if only referenced. */
+  embedded: boolean;
 }
 
 export type ElementDraft<T extends SlideElement = SlideElement> = T extends SlideElement

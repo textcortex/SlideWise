@@ -6,7 +6,7 @@ export type {
   SvgRasterizer,
 } from "./deckToPptx";
 export type { ParseDiagnostics, ParseResult } from "./types";
-export { applyEdits } from "./applyEdits";
+export { applyEdits, layoutSlotElementId } from "./applyEdits";
 export type {
   EditPlan,
   PlannedSlide,
