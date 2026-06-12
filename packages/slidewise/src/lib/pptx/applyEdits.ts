@@ -34,6 +34,7 @@ import {
   synthesiseDiagram,
   RID_MARKER_RE,
   hexBare,
+  freshNvId,
 } from "./pptxWriters";
 // ----------------------------------------------------------------------------
 // Public types
@@ -233,19 +234,22 @@ async function buildOutputSlide(
   used: Set<string>,
   warn: (w: SerializeWarning) => void
 ): Promise<string | null> {
+  // Instantiate from one of the source's own layouts. The layout is already a
+  // part of `source`, so binding a fresh slide to it is still a lossless patch
+  // (no chrome rewrite) — it inherits theme/master/background and its
+  // placeholders become addressable, fillable elements.
   if (!("slideIndex" in planned.source)) {
-    // Layout instantiation isn't part of the lossless patch path — that's the
-    // from-scratch `serializeDeck` flow's job. Surface it instead of silently
-    // emitting a wrong slide.
-    warn({
-      code: "layout-unresolved",
-      message:
-        `slide ${outIndex + 1}: instantiating from layout "${planned.source.layoutId}" ` +
-        "is not supported by applyEdits; use serializeDeck for layout-from-scratch slides",
-      layoutId: planned.source.layoutId,
-      slideIndex: outIndex,
-    });
-    return null;
+    const built = await instantiateLayoutSlide(
+      zip,
+      pristine,
+      planned.source.layoutId,
+      planned.source.fills,
+      outIndex,
+      warn
+    );
+    if (!built) return null; // unresolved layout — warned, skip (don't ship wrong slide)
+    await applySlideEdits(zip, built.partPath, planned, outIndex, warn, built.instantiated);
+    return built.partPath;
   }
 
   const idx1 = planned.source.slideIndex;
@@ -265,7 +269,7 @@ async function buildOutputSlide(
   }
   used.add(srcPath);
 
-  await applySlideEdits(zip, partPath, planned, outIndex, warn);
+  await applySlideEdits(zip, partPath, planned, outIndex, warn, new Map());
   return partPath;
 }
 
@@ -355,6 +359,225 @@ async function copyPartTree(
 }
 
 // ----------------------------------------------------------------------------
+// Layout instantiation (source: { layoutId, fills })
+// ----------------------------------------------------------------------------
+
+/**
+ * Deterministic element id for a placeholder slot of a layout-instantiated
+ * slide. The host computes the same id (from `summarizeLayouts(deck)` keys) to
+ * target the slot with `setText` / `setImage` / `removeElement` edits.
+ */
+export function layoutSlotElementId(layoutId: string, placeholderKey: string): string {
+  return `${layoutId}::${placeholderKey}`;
+}
+
+interface LayoutPh {
+  /** Raw `<p:ph type>` (undefined => OOXML "body" default). */
+  rawType: string | undefined;
+  idx: number | undefined;
+  /** `placeholderKey`-style: `type:idx` | `type` | `idx` | "". */
+  key: string;
+  xEmu: number;
+  yEmu: number;
+  wEmu: number;
+  hEmu: number;
+  category: "text" | "picture" | "chart" | "table" | "other";
+}
+
+const TEXT_PH = new Set(["", "title", "ctrTitle", "subTitle", "body", "obj"]);
+const SKIP_PH = new Set(["dt", "ftr", "sldNum"]); // auto chrome fields — inherit, don't instantiate
+
+function phCategory(rawType: string | undefined): LayoutPh["category"] {
+  const t = rawType ?? "";
+  if (TEXT_PH.has(t)) return "text";
+  if (t === "pic" || t === "clipArt") return "picture";
+  if (t === "chart") return "chart";
+  if (t === "tbl") return "table";
+  return "other";
+}
+
+function phKey(rawType: string | undefined, idx: number | undefined): string {
+  const t = rawType ?? "";
+  if (t && idx != null) return `${t}:${idx}`;
+  if (t) return t;
+  if (idx != null) return String(idx);
+  return "";
+}
+
+/** Resolve a `fills` entry for a placeholder, matching `placeholderKey` order. */
+function fillFor(rawType: string | undefined, idx: number | undefined, fills?: Record<string, string>): string {
+  if (!fills) return "";
+  const t = rawType ?? "";
+  const byTypeIdx = t && idx != null ? fills[`${t}:${idx}`] : undefined;
+  const byType = t ? fills[t] : undefined;
+  const byIdx = idx != null ? fills[String(idx)] : undefined;
+  return byTypeIdx ?? byType ?? byIdx ?? "";
+}
+
+/**
+ * Read a layout's placeholders with EMU geometry, resolving the geometry from
+ * the layout's own `<a:xfrm>` and falling back to the matching master slot.
+ * EMU-native (no canvas-px fit round-trip), self-contained for the patch path.
+ */
+async function readLayoutPlaceholders(pristine: JSZip, layoutPath: string): Promise<LayoutPh[]> {
+  const layoutXml = await readText(pristine, layoutPath);
+  if (!layoutXml) return [];
+
+  // Master fallback geometry, keyed by `type:idx` and `type`.
+  const masterGeo = new Map<string, { x: number; y: number; w: number; h: number }>();
+  const layoutRels = parseRels((await readText(pristine, relsPathFor(layoutPath))) ?? EMPTY_RELS);
+  const masterRel = layoutRels.find((r) => relTypeSuffix(r.type) === "slideMaster");
+  if (masterRel) {
+    const masterPath = normalisePath(masterRel.target, dirOf(layoutPath));
+    const masterXml = await readText(pristine, masterPath);
+    if (masterXml) {
+      for (const sp of masterXml.match(/<p:sp>[\s\S]*?<\/p:sp>/g) ?? []) {
+        const ph = /<p:ph\b[^>]*>/.exec(sp) ?? /<p:ph\b[^>]*\/>/.exec(sp);
+        if (!ph) continue;
+        const type = /\btype="([^"]+)"/.exec(ph[0])?.[1] ?? "";
+        const idx = /\bidx="(\d+)"/.exec(ph[0])?.[1];
+        const geo = readXfrmEmu(sp);
+        if (!geo) continue;
+        if (type && idx != null) masterGeo.set(`${type}:${idx}`, geo);
+        if (type) masterGeo.set(type, geo);
+        if (idx != null) masterGeo.set(idx, geo);
+      }
+    }
+  }
+
+  const out: LayoutPh[] = [];
+  for (const sp of layoutXml.match(/<p:sp>[\s\S]*?<\/p:sp>/g) ?? []) {
+    const ph = /<p:ph\b[^>]*\/?>/.exec(sp);
+    if (!ph) continue;
+    const rawType = /\btype="([^"]+)"/.exec(ph[0])?.[1];
+    if (rawType && SKIP_PH.has(rawType)) continue;
+    const idxStr = /\bidx="(\d+)"/.exec(ph[0])?.[1];
+    const idx = idxStr != null ? Number(idxStr) : undefined;
+
+    const geo =
+      readXfrmEmu(sp) ??
+      (rawType && idx != null ? masterGeo.get(`${rawType}:${idx}`) : undefined) ??
+      (rawType ? masterGeo.get(rawType) : undefined) ??
+      (idx != null ? masterGeo.get(String(idx)) : undefined);
+    if (!geo) continue; // no resolvable geometry → not instantiable
+
+    out.push({
+      rawType,
+      idx,
+      key: phKey(rawType, idx),
+      xEmu: geo.x,
+      yEmu: geo.y,
+      wEmu: geo.w,
+      hEmu: geo.h,
+      category: phCategory(rawType),
+    });
+  }
+  return out;
+}
+
+function readXfrmEmu(sp: string): { x: number; y: number; w: number; h: number } | null {
+  const off = /<a:off\b[^>]*\bx="(-?\d+)"[^>]*\by="(-?\d+)"[^>]*\/>/.exec(sp);
+  const ext = /<a:ext\b[^>]*\bcx="(\d+)"[^>]*\bcy="(\d+)"[^>]*\/>/.exec(sp);
+  if (!off || !ext) return null;
+  return { x: Number(off[1]), y: Number(off[2]), w: Number(ext[1]), h: Number(ext[2]) };
+}
+
+/**
+ * Build a fresh slide bound to a source layout. The new slide's `.rels` points
+ * at the existing `ppt/slideLayouts/<layoutId>.xml` (so it inherits theme /
+ * master / background chrome verbatim), and each layout placeholder becomes an
+ * addressable element keyed by `layoutSlotElementId(layoutId, key)`:
+ * text/`obj` → an `<p:sp>` with a `<p:txBody>` (populated from `fills`),
+ * picture → a `<p:pic>` with a transparent placeholder blip (so `setImage` can
+ * repoint it), and chart/table/other → a positioned `<p:sp>` that exposes the
+ * slot geometry (the host fills it with `addChart`/`addDiagram`).
+ */
+async function instantiateLayoutSlide(
+  zip: JSZip,
+  pristine: JSZip,
+  layoutId: string,
+  fills: Record<string, string> | undefined,
+  outIndex: number,
+  warn: (w: SerializeWarning) => void
+): Promise<{ partPath: string; instantiated: Map<string, string> } | null> {
+  const layoutPath = `ppt/slideLayouts/${layoutId}.xml`;
+  if (!pristine.file(layoutPath)) {
+    warn({
+      code: "layout-unresolved",
+      message: `slide ${outIndex + 1}: layout "${layoutId}" not found at ${layoutPath}`,
+      layoutId,
+      slideIndex: outIndex,
+    });
+    return null;
+  }
+
+  const placeholders = await readLayoutPlaceholders(pristine, layoutPath);
+  const slidePath = freshPartPath(zip, "ppt/slides", "slide", "xml");
+  const instantiated = new Map<string, string>();
+
+  const rels: Rel[] = [
+    { id: "rId1", type: SLIDE_LAYOUT_REL_TYPE, target: `../slideLayouts/${layoutId}.xml`, mode: undefined },
+  ];
+  let needsPlaceholderMedia = false;
+  const placeholderBlipRid = "rId2";
+
+  const children = placeholders.map((ph) => {
+    const elementId = layoutSlotElementId(layoutId, ph.key);
+    const xfrm =
+      `<a:xfrm><a:off x="${ph.xEmu}" y="${ph.yEmu}"/>` +
+      `<a:ext cx="${Math.max(1, ph.wEmu)}" cy="${Math.max(1, ph.hEmu)}"/></a:xfrm>`;
+    const phTag =
+      `<p:ph${ph.rawType ? ` type="${ph.rawType}"` : ""}${ph.idx != null ? ` idx="${ph.idx}"` : ""}/>`;
+    const name = `${ph.rawType ?? "Body"} ${ph.idx ?? ""}`.trim();
+    let block: string;
+    if (ph.category === "picture") {
+      needsPlaceholderMedia = true;
+      block =
+        `<p:pic>` +
+        `<p:nvPicPr><p:cNvPr id="${freshNvId()}" name="${escapeAttr(name)}"/>` +
+        `<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr>${phTag}</p:nvPr></p:nvPicPr>` +
+        `<p:blipFill><a:blip r:embed="${placeholderBlipRid}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>` +
+        `<p:spPr>${xfrm}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>` +
+        `</p:pic>`;
+    } else {
+      const fill = ph.category === "text" ? fillFor(ph.rawType, ph.idx, fills) : "";
+      const para = fill
+        ? `<a:p><a:r><a:rPr lang="en-US"/><a:t>${escapeText(fill)}</a:t></a:r></a:p>`
+        : `<a:p/>`;
+      block =
+        `<p:sp>` +
+        `<p:nvSpPr><p:cNvPr id="${freshNvId()}" name="${escapeAttr(name)}"/>` +
+        `<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr>${phTag}</p:nvPr></p:nvSpPr>` +
+        `<p:spPr>${xfrm}</p:spPr>` +
+        `<p:txBody><a:bodyPr/><a:lstStyle/>${para}</p:txBody>` +
+        `</p:sp>`;
+    }
+    instantiated.set(elementId, block);
+    return block;
+  });
+
+  const slideXml =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<p:sld xmlns:p="${NS_P}" xmlns:a="${NS_A}" xmlns:r="${NS_R}"><p:cSld><p:spTree>` +
+    `<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>` +
+    children.join("") +
+    `</p:spTree></p:cSld></p:sld>`;
+
+  if (needsPlaceholderMedia) {
+    const mediaPath = baseOf(freshPartPath(zip, "ppt/media", "imageSWph", "png"));
+    const full = `ppt/media/${mediaPath}`;
+    zip.file(full, TRANSPARENT_PNG.slice());
+    await ensureDefault(zip, "png", "image/png");
+    rels.push({ id: placeholderBlipRid, type: IMAGE_REL_TYPE, target: `../media/${mediaPath}`, mode: undefined });
+  }
+
+  zip.file(slidePath, slideXml);
+  zip.file(relsPathFor(slidePath), serializeRels(rels));
+  await ensureOverride(zip, "/" + slidePath, SLIDE_CONTENT_TYPE);
+  return { partPath: slidePath, instantiated };
+}
+
+// ----------------------------------------------------------------------------
 // Edit application
 // ----------------------------------------------------------------------------
 
@@ -363,7 +586,8 @@ async function applySlideEdits(
   slidePath: string,
   planned: PlannedSlide,
   outIndex: number,
-  warn: (w: SerializeWarning) => void
+  warn: (w: SerializeWarning) => void,
+  instantiated: Map<string, string>
 ): Promise<void> {
   let slideXml = (await readText(zip, slidePath)) ?? "";
   const relsPath = relsPathFor(slidePath);
@@ -380,26 +604,26 @@ async function applySlideEdits(
     try {
       switch (edit.op) {
         case "setText":
-          slideXml = editSetText(slideXml, edit.elementId, edit.text, edit.runs, slidePath, outIndex, warn);
+          slideXml = editSetText(slideXml, edit.elementId, edit.text, edit.runs, slidePath, outIndex, warn, instantiated);
           break;
         case "clearText":
-          slideXml = editSetText(slideXml, edit.elementId, "", undefined, slidePath, outIndex, warn);
+          slideXml = editSetText(slideXml, edit.elementId, "", undefined, slidePath, outIndex, warn, instantiated);
           break;
         case "removeElement": {
-          const r = editRemoveElement(slideXml, edit.elementId, rels, slidePath, outIndex, warn);
+          const r = editRemoveElement(slideXml, edit.elementId, rels, slidePath, outIndex, warn, instantiated);
           slideXml = r.slideXml;
           if (r.relsChanged) relsDirty = true;
           break;
         }
         case "setTableData":
-          slideXml = editSetTableData(slideXml, edit.elementId, edit.rows, slidePath, outIndex, warn);
+          slideXml = editSetTableData(slideXml, edit.elementId, edit.rows, slidePath, outIndex, warn, instantiated);
           break;
         case "setChartData":
-          await editSetChartData(zip, slideXml, edit, rels, slideDir, slidePath, outIndex, warn);
+          await editSetChartData(zip, slideXml, edit, rels, slideDir, slidePath, outIndex, warn, instantiated);
           break;
         case "setImage": {
           const rid = nextRid();
-          const r = editSetImage(slideXml, edit, rid, slidePath, outIndex, warn);
+          const r = editSetImage(slideXml, edit, rid, slidePath, outIndex, warn, instantiated);
           if (r) {
             slideXml = r.slideXml;
             zip.file(r.media.fullPath, r.media.data);
@@ -448,9 +672,10 @@ function editSetText(
   runs: Run[] | undefined,
   slidePath: string,
   outIndex: number,
-  warn: (w: SerializeWarning) => void
+  warn: (w: SerializeWarning) => void,
+  instantiated: Map<string, string>
 ): string {
-  const block = locateBlock(slideXml, elementId, slidePath, outIndex, warn);
+  const block = locateBlock(slideXml, elementId, slidePath, outIndex, warn, instantiated);
   if (!block) return slideXml;
   const next = rewriteTextBody(block, text, runs);
   return slideXml.replace(block, next);
@@ -519,9 +744,10 @@ function editRemoveElement(
   rels: Rel[],
   slidePath: string,
   outIndex: number,
-  warn: (w: SerializeWarning) => void
+  warn: (w: SerializeWarning) => void,
+  instantiated: Map<string, string>
 ): { slideXml: string; relsChanged: boolean } {
-  const block = locateBlock(slideXml, elementId, slidePath, outIndex, warn);
+  const block = locateBlock(slideXml, elementId, slidePath, outIndex, warn, instantiated);
   if (!block) return { slideXml, relsChanged: false };
   const without = slideXml.replace(block, "");
 
@@ -549,9 +775,10 @@ function editSetTableData(
   rows: string[][],
   slidePath: string,
   outIndex: number,
-  warn: (w: SerializeWarning) => void
+  warn: (w: SerializeWarning) => void,
+  instantiated: Map<string, string>
 ): string {
-  const block = locateBlock(slideXml, elementId, slidePath, outIndex, warn);
+  const block = locateBlock(slideXml, elementId, slidePath, outIndex, warn, instantiated);
   if (!block) return slideXml;
   const tblMatch = /<a:tbl>[\s\S]*<\/a:tbl>/.exec(block);
   if (!tblMatch) {
@@ -603,9 +830,10 @@ async function editSetChartData(
   slideDir: string,
   slidePath: string,
   outIndex: number,
-  warn: (w: SerializeWarning) => void
+  warn: (w: SerializeWarning) => void,
+  instantiated: Map<string, string>
 ): Promise<void> {
-  const block = locateBlock(slideXml, edit.elementId, slidePath, outIndex, warn);
+  const block = locateBlock(slideXml, edit.elementId, slidePath, outIndex, warn, instantiated);
   if (!block) return;
   const chartRid = /<c:chart\b[^>]*\br:id="([^"]+)"/.exec(block)?.[1];
   const rel = chartRid ? slideRels.find((r) => r.id === chartRid) : undefined;
@@ -720,9 +948,10 @@ function editSetImage(
   newRid: string,
   slidePath: string,
   outIndex: number,
-  warn: (w: SerializeWarning) => void
+  warn: (w: SerializeWarning) => void,
+  instantiated: Map<string, string>
 ): { slideXml: string; media: DecodedMedia } | null {
-  const block = locateBlock(slideXml, edit.elementId, slidePath, outIndex, warn);
+  const block = locateBlock(slideXml, edit.elementId, slidePath, outIndex, warn, instantiated);
   if (!block) return null;
   const blipMatch = /<a:blip\b[^>]*\br:embed="([^"]+)"/.exec(block);
   if (!blipMatch) {
@@ -960,8 +1189,14 @@ function locateBlock(
   elementId: string,
   slidePath: string,
   outIndex: number,
-  warn: (w: SerializeWarning) => void
+  warn: (w: SerializeWarning) => void,
+  instantiated: Map<string, string>
 ): string | null {
+  // Instantiated placeholders (layout-from-source slides) aren't in the parse
+  // registry — their block lives only in the freshly-built slide XML.
+  const fresh = instantiated.get(elementId);
+  if (fresh && slideXml.includes(fresh)) return fresh;
+
   const loc = getElementLocation(elementId);
   if (!loc) {
     warn({
@@ -1285,6 +1520,11 @@ function hashString(s: string): number {
   return h;
 }
 
+// OOXML namespaces (for synthesised slide parts).
+const NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main";
+const NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
 // Rel-type + content-type constants.
 const IMAGE_REL_TYPE =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
@@ -1292,7 +1532,22 @@ const CHART_REL_TYPE =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
 const PACKAGE_REL_TYPE =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package";
+const SLIDE_LAYOUT_REL_TYPE =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout";
 const CHART_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
 const XLSX_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const SLIDE_CONTENT_TYPE =
+  "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+
+/** A CRC-correct 1×1 fully-transparent PNG, used as the placeholder blip for an
+ *  instantiated picture slot until the host fills it via `setImage`. */
+const TRANSPARENT_PNG = Uint8Array.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49,
+  0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+  0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44,
+  0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d,
+  0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+  0x60, 0x82,
+]);
