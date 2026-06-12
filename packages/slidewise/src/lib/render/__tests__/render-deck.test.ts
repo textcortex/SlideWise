@@ -198,6 +198,29 @@ describe("renderDeckToSvg / renderDeckToImages", () => {
     }
   });
 
+  it("rasterises an image-background slide through real @resvg/resvg-js (the actual consumer)", async () => {
+    // The XMLValidator lock-in proves well-formedness; this proves the slide
+    // actually *renders* through resvg — the real point of the valid-SVG fix.
+    // No `rasterizeSvg` hook, so this drives the package's own default
+    // dynamic-`@resvg/resvg-js` path end-to-end. resvg threw on the old
+    // `fill="…url(data:…)…"` output ("expected space not 'd'").
+    const deck = {
+      version: 1,
+      title: "ImageBgResvg",
+      slides: [{ id: "s1", background: `center / cover no-repeat url("${IMG_SRC}")`, elements: [] }],
+    } as Deck;
+
+    const [png] = await renderDeckToImages(deck, { maxWidth: 320 });
+    expect(png).toBeInstanceOf(Uint8Array);
+    expect(Array.from(png.subarray(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]); // ‰PNG
+    // Decode the IHDR (bytes 16–23) and assert resvg produced a correctly
+    // *sized* raster of the 16:9 canvas — proof of a real render, not an empty
+    // buffer. 1920×1080 capped at width 320 → 320×180.
+    const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
+    expect(view.getUint32(16)).toBe(320); // width
+    expect(view.getUint32(20)).toBe(180); // height
+  });
+
   it("stays browser-free (no Playwright/Puppeteer/jsdom in the source)", () => {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const src = readFileSync(path.resolve(__dirname, "../renderDeck.ts"), "utf8");
