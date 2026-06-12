@@ -21,6 +21,7 @@ import type {
   GroupElement,
   UnknownElement,
   FontAsset,
+  FontUsage,
   WebFontAsset,
   DeckLayout,
   LayoutPlaceholder,
@@ -360,6 +361,9 @@ export async function parsePptx(
   );
   // Master layouts exposed as instantiable templates (see addSlideFromLayout).
   const layouts = await parseLayouts(zip, fit);
+  // Font-transparency report: every family the text uses, flagged embedded
+  // (a real `ppt/fonts/*` part) vs only referenced (system-fallback risk).
+  const fontUsage = buildFontUsage(slides, fonts);
   const deck: Deck = {
     version: CURRENT_DECK_VERSION,
     title,
@@ -368,6 +372,7 @@ export async function parsePptx(
     ...(layouts.length ? { layouts } : {}),
     ...(fonts.length ? { fonts } : {}),
     ...(webFonts.length ? { webFonts } : {}),
+    ...(fontUsage.length ? { fontUsage } : {}),
   };
   Object.defineProperty(deck, SOURCE_PPTX, {
     value: sourceBuffer,
@@ -378,6 +383,42 @@ export async function parsePptx(
     console.info("[slidewise/pptx] parse diagnostics:", diagnostics);
   }
   return deck;
+}
+
+/**
+ * Build the font-transparency report: collect every family the deck's text
+ * uses (element + run + paragraph + table-cell + diagram fonts, recursing into
+ * groups), then flag each as embedded when the source's `<p:embeddedFontLst>`
+ * (→ `fonts`) carries it. Family matching is case-insensitive on a trimmed name
+ * since OOXML typeface casing isn't normalised.
+ */
+function buildFontUsage(slides: Slide[], fonts: FontAsset[]): FontUsage[] {
+  const used = new Map<string, string>(); // lowercased -> first-seen display name
+  const note = (fam: string | undefined) => {
+    const name = (fam ?? "").trim();
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (!used.has(key)) used.set(key, name);
+  };
+  const noteRuns = (runs: TextRun[] | undefined) => runs?.forEach((r) => note(r.fontFamily));
+  const walk = (el: SlideElement) => {
+    const e = el as Record<string, unknown> & SlideElement;
+    note((e as { fontFamily?: string }).fontFamily);
+    noteRuns((e as { runs?: TextRun[] }).runs);
+    (e as { paragraphs?: Array<{ runs?: TextRun[] }> }).paragraphs?.forEach((p) =>
+      noteRuns(p.runs)
+    );
+    (e as { cellRuns?: (TextRun[] | null)[][] }).cellRuns?.forEach((row) =>
+      row?.forEach((cell) => noteRuns(cell ?? undefined))
+    );
+    if (e.type === "group") e.children.forEach(walk);
+  };
+  for (const slide of slides) slide.elements.forEach(walk);
+
+  const embedded = new Set(fonts.map((f) => f.family.trim().toLowerCase()));
+  return [...used.values()]
+    .sort((a, b) => a.localeCompare(b))
+    .map((family) => ({ family, embedded: embedded.has(family.toLowerCase()) }));
 }
 
 /** Non-enumerable property keys used to ferry the original archive

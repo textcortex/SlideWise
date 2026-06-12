@@ -154,6 +154,21 @@ export {
   type DiagramArrowPrimitive,
 } from "./lib/diagram/layout";
 
+/**
+ * Headless deck → image rendering for a server-side visual-QA loop. Browser-free
+ * (no Playwright/DOM): composes a deterministic SVG per slide that draws what
+ * the editor draws — native charts, diagrams, text, shapes, images — then
+ * rasterises via an injected `rasterizeSvg` hook (e.g. `@resvg/resvg-js`).
+ * `renderDeckToSvg` returns the SVGs directly if you'd rather rasterise yourself.
+ */
+export {
+  renderDeckToSvg,
+  renderDeckToImages,
+  renderSlideToImage,
+  renderPptxToImages,
+  type RenderOptions,
+} from "./lib/render/renderDeck";
+
 export type {
   Deck,
   Slide,
@@ -190,6 +205,7 @@ export type {
   GlowSpec,
   DashType,
   FontAsset,
+  FontUsage,
   WebFontAsset,
 } from "./lib/types";
 export { SLIDE_W, SLIDE_H } from "./lib/types";
