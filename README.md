@@ -114,6 +114,57 @@ editor only sees current-shape decks. It throws if the input was written by a
 newer Slidewise than the host has installed — pin the version range you can
 support.
 
+### Lossless surgical edits with `applyEdits`
+
+When you start from a branded template and only need to change a few things
+(swap some text, fill a chart, drop a sample element), a full
+`serializeDeck` round-trip is overkill — and re-rendering unedited elements is
+where fidelity bugs come from. `applyEdits(source, plan)` instead **patches the
+original bytes**: everything not named by an edit comes out byte-identical to
+the source (masters, layouts, theme, embedded fonts, `ppt/tags/*`, notes,
+embeddings, and any untouched element), and the result opens in PowerPoint with
+no repair.
+
+```ts
+import { parsePptx, applyEdits, type EditPlan } from "@textcortex/slidewise";
+
+const deck = await parsePptx(source); // address elements by deck ids
+const plan: EditPlan = {
+  title: "Q3 Results",
+  // Output order = this list. Slides are the source's 1-based template index;
+  // a source slide may repeat for controlled reuse.
+  slides: [
+    {
+      source: { slideIndex: 1 },
+      edits: [{ op: "setText", elementId: titleId, text: "Q3 Results" }],
+    },
+    {
+      source: { slideIndex: 3 },
+      edits: [
+        // Repopulate a native chart in place — type/colours and the embedded
+        // workbook are preserved, so PowerPoint's Edit-Data still works.
+        { op: "setChartData", elementId: chartId, categories: ["Jan", "Feb", "Mar"], series: [{ name: "Revenue", values: [10, 20, 30] }] },
+        { op: "removeElement", elementId: sampleChartId },
+      ],
+    },
+    { source: { slideIndex: 4 }, edits: [] }, // kept byte-identical
+  ],
+};
+
+const out: Uint8Array = await applyEdits(source, plan, {
+  onWarning: (w) => notifyHost(w.message), // unresolved id / unsupported op
+});
+```
+
+Ops: `setText` / `clearText`, `setChartData`, `setTableData`, `setImage`,
+`removeElement`, `addChart`, `addDiagram`, plus per-slide `background` and the
+deck `title`. Elements are addressed by the same stable ids `parsePptx` returns,
+so call `applyEdits` in the same process as the `parsePptx` that produced the
+plan. Removed slides and any parts exclusive to them are reclaimed
+automatically. `serializeDeck` remains the path for the live editor and
+from-scratch decks; `applyEdits` is the lossless path for template-derived
+output.
+
 ### Generating slides from the template's layouts
 
 `parsePptx` exposes the source template's master layouts on `deck.layouts`.
