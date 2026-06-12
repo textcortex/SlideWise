@@ -92,6 +92,7 @@ export { parsePptx, isPptxTemplate, serializeDeck, applyEdits } from "./lib/pptx
 export type {
   SerializeOptions,
   SerializeWarning,
+  SvgRasterizer,
   EditPlan,
   PlannedSlide,
   Edit,
