@@ -92,6 +92,7 @@ export { parsePptx, isPptxTemplate, serializeDeck } from "./lib/pptx";
 export type {
   SerializeOptions,
   SerializeWarning,
+  SvgRasterizer,
 } from "./lib/pptx";
 export type { ParseDiagnostics, ParseResult } from "./lib/pptx/types";
 
