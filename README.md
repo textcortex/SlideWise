@@ -205,6 +205,57 @@ is materialised as a positioned element with the stable id
 unresolvable `layoutId` is reported via `onWarning` and the slide is skipped
 (never shipped wrong).
 
+### Headless render-to-image (visual QA)
+
+`renderDeckToImages` renders a deck to one image per slide **server-side, with
+no browser** — drawing what the editor draws (native charts via ECharts SSR,
+diagrams, text, shapes, images), not the OOXML raster fallbacks. It's built for
+a render → inspect → fix → re-render QA loop, e.g. rendering a final `applyEdits`
+output and having a model flag overflow / overlap / leftover text.
+
+```ts
+import {
+  renderDeckToSvg,
+  renderDeckToImages,
+  renderPptxToImages,
+} from "@textcortex/slidewise";
+
+// SVGs only (no rasteriser needed) — rasterise yourself if you prefer.
+const svgs: string[] = await renderDeckToSvg(deck, { slides: [1, 2] });
+
+// Raster bytes. Rasterisation is an injected hook so there's no hard native dep
+// — pass a @resvg/resvg-js wrapper (the default tries to import it on demand).
+import { Resvg } from "@resvg/resvg-js";
+const pngs: Uint8Array[] = await renderDeckToImages(deck, {
+  dpi: 150,
+  rasterizeSvg: (svg, width) => new Resvg(svg, { fitTo: { mode: "width", value: width } }).render().asPng(),
+});
+
+// Render a final applyEdits output directly:
+const shots = await renderPptxToImages(await applyEdits(source, plan));
+```
+
+`opts`: `slides` (1-based subset), `dpi` (the 1920×1080 canvas scales by
+`dpi/96`), `format`, `maxWidth` (thumbnail cap). Output is deterministic (no
+animation). The renderer is browser-free and ECharts is loaded on demand, so it
+never bloats the editor bundle.
+
+### Font transparency (missing-font warnings)
+
+`parsePptx` stamps `deck.fontUsage: { family, embedded }[]` — every font family
+the deck's text uses, flagged whether the source PPTX actually **embeds** it
+(`<p:embeddedFontLst>` → a real `ppt/fonts/*` part) or only **references** it (so
+it falls back to a system font on viewers that don't ship the brand font). Use it
+to warn at generation time:
+
+```ts
+const missing = (deck.fontUsage ?? []).filter((f) => !f.embedded);
+if (missing.length) warnHost(`not embedded: ${missing.map((f) => f.family).join(", ")}`);
+```
+
+This is a read-only diagnostic, distinct from `deck.fonts` (the embeddable
+payloads the serializer writes back).
+
 ### Generating slides from the template's layouts
 
 `parsePptx` exposes the source template's master layouts on `deck.layouts`.
