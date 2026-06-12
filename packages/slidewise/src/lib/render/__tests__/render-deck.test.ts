@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { XMLValidator } from "fast-xml-parser";
 import {
   renderDeckToSvg,
   renderDeckToImages,
@@ -144,6 +145,57 @@ describe("renderDeckToSvg / renderDeckToImages", () => {
       },
     });
     expect(w).toBe(480);
+  });
+
+  it("emits a real <image> for an image-fill background, not a CSS-shorthand fill", async () => {
+    // The pptx importer stores image backgrounds as a CSS `background`
+    // shorthand: `center / cover no-repeat url("data:image…")`. The renderer
+    // must turn that into a valid SVG <image>, never `fill="…url(data:…)…"`
+    // (nested quotes + a non-paint value that strict rasterisers reject).
+    const bg = `center / cover no-repeat url("${IMG_SRC}")`;
+    const deck = {
+      version: 1,
+      title: "ImageBg",
+      slides: [{ id: "s1", background: bg, elements: [] }],
+    } as Deck;
+
+    const [svg] = await renderDeckToSvg(deck);
+    expect(svg).toContain(`<image`);
+    expect(svg).toContain(`xlink:href="${IMG_SRC}"`);
+    expect(svg).toContain(`preserveAspectRatio="xMidYMid slice"`); // cover
+    // The malformed shorthand-as-fill must NOT appear.
+    expect(svg).not.toContain("no-repeat");
+    expect(svg).not.toMatch(/fill="[^"]*url\(/);
+  });
+
+  it("renders `contain` image backgrounds with preserveAspectRatio=meet", async () => {
+    const bg = `center / contain no-repeat url("${IMG_SRC}")`;
+    const deck = {
+      version: 1,
+      title: "ContainBg",
+      slides: [{ id: "s1", background: bg, elements: [] }],
+    } as Deck;
+    const [svg] = await renderDeckToSvg(deck);
+    expect(svg).toContain(`preserveAspectRatio="xMidYMid meet"`);
+  });
+
+  it("every rendered slide is valid SVG a strict XML parser accepts", async () => {
+    // Lock-in for the resvg/librsvg path: a strict (non-browser) parser must
+    // accept every slide. An image-background slide is the regression case.
+    const deck = {
+      version: 1,
+      title: "Strict",
+      slides: [
+        { id: "s1", background: `center / cover no-repeat url("${IMG_SRC}")`, elements: [] },
+        ...buildDeck().slides,
+      ],
+    } as Deck;
+    const svgs = await renderDeckToSvg(deck);
+    for (const svg of svgs) {
+      const result = XMLValidator.validate(svg);
+      expect(result, typeof result === "object" ? JSON.stringify(result.err) : "")
+        .toBe(true);
+    }
   });
 
   it("stays browser-free (no Playwright/Puppeteer/jsdom in the source)", () => {

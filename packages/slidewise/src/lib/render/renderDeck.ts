@@ -163,9 +163,10 @@ function renderBackground(background: string | undefined): string {
   const fill = background ? solidFrom(background) : "#FFFFFF";
   if (isImageRef(background)) {
     const href = imageHref(background!);
+    const preserve = imageFitPreserve(background);
     return (
       `<rect x="0" y="0" width="${SLIDE_W}" height="${SLIDE_H}" fill="#FFFFFF"/>` +
-      `<image x="0" y="0" width="${SLIDE_W}" height="${SLIDE_H}" preserveAspectRatio="xMidYMid slice" xlink:href="${escAttr(href)}"/>`
+      `<image x="0" y="0" width="${SLIDE_W}" height="${SLIDE_H}" preserveAspectRatio="${preserve}" xlink:href="${escAttr(href)}"/>`
     );
   }
   return `<rect x="0" y="0" width="${SLIDE_W}" height="${SLIDE_H}" fill="${fill ?? "#FFFFFF"}"/>`;
@@ -499,12 +500,24 @@ async function defaultRasterize(
 // -- colour / string helpers -------------------------------------------------
 
 function isImageRef(s: string | undefined): boolean {
-  return !!s && (s.startsWith("data:image") || /^url\(/i.test(s) || /^https?:\/\//i.test(s));
+  if (!s) return false;
+  const v = s.trim();
+  // A bare data/http URL, OR a CSS `background` shorthand that embeds a
+  // `url(...)` anywhere (e.g. `center / cover no-repeat url("data:image…")`,
+  // as produced by the pptx importer for image-fill backgrounds).
+  return v.startsWith("data:image") || /url\(/i.test(v) || /^https?:\/\//i.test(v);
 }
 
 function imageHref(s: string): string {
-  const m = /^url\(["']?(.*?)["']?\)$/i.exec(s);
-  return m ? m[1] : s;
+  // Pull the URL out of a `url(...)` wherever it appears in the value; data
+  // URLs use a `)`-free base64 alphabet, so non-greedy-to-first-`)` is safe.
+  const m = /url\(\s*["']?(.*?)["']?\s*\)/i.exec(s);
+  return m ? m[1] : s.trim();
+}
+
+/** `cover` → `slice`, `contain` → `meet`, for an image-fill shorthand. */
+function imageFitPreserve(s: string | undefined): string {
+  return s && /\bcontain\b/i.test(s) ? "xMidYMid meet" : "xMidYMid slice";
 }
 
 /** Best-effort single colour for SVG: pass hex through, pull the first hex out
