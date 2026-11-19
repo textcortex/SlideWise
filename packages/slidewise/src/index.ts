@@ -190,6 +190,9 @@ export type {
   ChartKind,
   ChartGrouping,
   ChartSeries,
+  ChartSeriesKind,
+  ChartValueAxis,
+  ChartCategoryAxis,
   ConnectorElement,
   ConnectorKind,
   ArrowheadKind,
@@ -209,3 +212,10 @@ export type {
   WebFontAsset,
 } from "./lib/types";
 export { SLIDE_W, SLIDE_H } from "./lib/types";
+
+/**
+ * Read-only slide drawing (thumbnails, a presenting stage) without the editor chrome,
+ * plus the web-font helpers a host needs so those views use the same fonts as the editor.
+ */
+export { SlideView } from "./components/editor/SlideView";
+export { ensureWebFontsLoaded, resolveWebFonts } from "./lib/fonts";

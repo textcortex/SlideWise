@@ -18,6 +18,9 @@ import type {
   CellSpan,
   ChartElement,
   ChartSeries,
+  ChartSeriesKind,
+  ChartValueAxis,
+  ChartCategoryAxis,
   GroupElement,
   UnknownElement,
   FontAsset,
@@ -188,6 +191,48 @@ interface ClrMap {
 
 const DEFAULT_CLR_MAP: ClrMap = { bg1: "lt1", bg2: "lt2", tx1: "dk1", tx2: "dk2" };
 
+const XML_REFERENCE_RE = /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g;
+const XML_PREDEFINED_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+};
+
+/**
+ * Decode XML character references (`&#8226;`, `&#x2022;`) and the five
+ * predefined entities in a single pass, so an escaped reference such as
+ * `&amp;#x2022;` stays the literal text `&#x2022;`. References to code points
+ * XML cannot carry are left as written.
+ *
+ * fast-xml-parser only decodes numeric references when `htmlEntities` is on
+ * (which also enables HTML-only names, and whose behaviour changed across 5.x
+ * releases), so the parser runs with `processEntities: false` and every
+ * attribute value and text node goes through this instead. pptxgenjs writes
+ * every bullet as `<a:buChar char="&#x2022;"/>`, so without it bullets render
+ * as the literal text "&#x2022;".
+ */
+function decodeXmlEntities(value: string): string {
+  if (!value.includes("&")) return value;
+  return value.replace(
+    XML_REFERENCE_RE,
+    (match, dec: string | undefined, hex: string | undefined, name: string | undefined) => {
+      if (name) return XML_PREDEFINED_ENTITIES[name];
+      const codePoint = dec !== undefined ? Number.parseInt(dec, 10) : Number.parseInt(hex ?? "", 16);
+      if (
+        !Number.isFinite(codePoint) ||
+        codePoint <= 0 ||
+        codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff)
+      ) {
+        return match;
+      }
+      return String.fromCodePoint(codePoint);
+    }
+  );
+}
+
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
@@ -196,6 +241,10 @@ const xmlParser = new XMLParser({
   trimValues: false,
   preserveOrder: false,
   isArray: (name) => ARRAY_TAGS.has(name),
+  // Entities are decoded by `decodeXmlEntities` (see there for why).
+  processEntities: false,
+  attributeValueProcessor: (_name: string, value: string) => decodeXmlEntities(value),
+  tagValueProcessor: (_name: string, value: string) => decodeXmlEntities(value),
 });
 
 const xmlBuilder = new XMLBuilder({
@@ -2628,25 +2677,27 @@ async function parseLiveChart(
   const plotArea = chartXml?.["c:chartSpace"]?.["c:chart"]?.["c:plotArea"];
   if (!plotArea) return null;
 
-  // Find the first recognised plot tag. PowerPoint allows multiple charts
-  // co-plotted (e.g. combo bar+line) but the first plot usually dominates;
-  // we render that and fall through to UnknownElement if nothing fits.
-  let plotNode: any | undefined;
-  let kindTag: string | undefined;
-  for (const tag of Object.keys(CHART_TAG_TO_KIND)) {
-    if (plotArea[tag]) {
-      plotNode = plotArea[tag];
-      kindTag = tag;
-      break;
+  // Collect every recognised plot in document order. Combo charts carry
+  // several (e.g. <c:barChart> + <c:lineChart>), each with its own series
+  // and axis ids; the first plot sets the chart's kind and grouping. We fall
+  // through to UnknownElement if nothing fits.
+  const plots: { kind: ChartElement["kind"]; node: any }[] = [];
+  for (const tag of Object.keys(plotArea)) {
+    if (!Object.prototype.hasOwnProperty.call(CHART_TAG_TO_KIND, tag)) continue;
+    for (const node of asArray(plotArea[tag])) {
+      // <c:barChart><c:barDir val="bar"/> means horizontal bars; "col" is the
+      // vertical default. We distinguish so the renderer can pick orientation.
+      const barDir = node?.["c:barDir"]?.["@_val"];
+      const plotKind =
+        tag.startsWith("c:bar") && barDir === "col" ? "column" : CHART_TAG_TO_KIND[tag];
+      plots.push({ kind: plotKind, node });
     }
   }
-  if (!plotNode || !kindTag) return null;
-
-  let kind = CHART_TAG_TO_KIND[kindTag];
-  // <c:barChart><c:barDir val="bar"/> means horizontal bars; "col" is the
-  // vertical default. We distinguish so the renderer can pick orientation.
-  const barDir = plotNode?.["c:barDir"]?.["@_val"];
-  if (kindTag.startsWith("c:bar") && barDir === "col") kind = "column";
+  if (!plots.length) return null;
+  const primary = plots[0];
+  const kind = primary.kind;
+  const isPieChart = kind === "pie" || kind === "doughnut";
+  const plotNode = primary.node;
 
   const groupingVal = plotNode?.["c:grouping"]?.["@_val"];
   const grouping: ChartElement["grouping"] | undefined =
@@ -2665,33 +2716,86 @@ async function parseLiveChart(
   // series to share the same category axis so this is safe.
   const categories: string[] = extractCategories(sers[0]);
 
+  // Axes by id. Each plot lists its axes in <c:axId> (category axis, value
+  // axis); a plot whose value axis differs from the first plot's is drawn
+  // against the secondary value axis.
+  const valAxes = axesById(plotArea["c:valAx"]);
+  const catAxes = axesById([
+    ...asArray(plotArea["c:catAx"]),
+    ...asArray(plotArea["c:dateAx"]),
+  ]);
+  const plotAxisId = (plot: any, axes: Map<string, any>): string | undefined =>
+    asArray(plot?.["c:axId"])
+      .map((a: any) => String(a?.["@_val"]))
+      .find((id: string) => axes.has(id));
+  const primaryValAxisId = plotAxisId(plotNode, valAxes);
+  let secondaryValAxisId: string | undefined;
+
   const series: ChartSeries[] = [];
   let valueFormat: string | undefined;
   let showDataLabels = false;
-  for (const ser of sers) {
-    const name = extractSeriesName(ser);
-    const values = extractSeriesValues(ser, categories.length);
-    if (!values.length && !name) continue;
-    // PPTX series colours: explicit `<c:spPr><a:solidFill>` wins; otherwise
-    // PowerPoint uses the theme accent palette indexed by `<c:idx>` modulo
-    // 6, cycling accent1..accent6. (Order is the visual position; idx is
-    // the colour-picker key — they often differ, e.g. the second-drawn
-    // series can have idx=0 to inherit accent1.)
-    const explicitFill = ser?.["c:spPr"]?.["a:solidFill"];
-    const idx = Number(ser?.["c:idx"]?.["@_val"] ?? 0);
-    const color =
-      resolveColor(explicitFill, ctx.theme) ?? seriesAccentColor(idx, ctx.theme);
-    series.push({ name, values, ...(color ? { color } : {}) });
-    if (!valueFormat) {
-      const num = ser?.["c:val"]?.["c:numRef"]?.["c:numCache"]?.["c:formatCode"];
-      const code = typeof num === "string" ? num : num?.["#text"];
-      if (typeof code === "string" && code !== "General") valueFormat = code;
-    }
-    if (!showDataLabels && ser?.["c:dLbls"]?.["c:showVal"]?.["@_val"] === "1") {
-      showDataLabels = true;
+  for (const plot of plots) {
+    // Pie / doughnut plots draw alone; any other plot in a combo must be an
+    // axis plot (bar / column / line / area).
+    const plotIsPie = plot.kind === "pie" || plot.kind === "doughnut";
+    if (plot !== primary && (isPieChart || plotIsPie)) continue;
+    const plotSers = asArray(plot.node["c:ser"]);
+    const valAxisId = plotAxisId(plot.node, valAxes);
+    const secondary =
+      plot !== primary && valAxisId !== undefined && valAxisId !== primaryValAxisId;
+    if (secondary && secondaryValAxisId === undefined) secondaryValAxisId = valAxisId;
+    // <c:varyColors> = one colour per data point. A present element without
+    // @val means true (CT_Boolean). When absent, pies still vary by slice (as
+    // PowerPoint and LibreOffice draw them); other plots vary only with a
+    // single series, the only case PowerPoint applies it to.
+    const varyNode = plot.node["c:varyColors"];
+    const varyColors =
+      (varyNode === undefined ? plotIsPie : boolVal(varyNode)) &&
+      (plotIsPie || plotSers.length === 1);
+
+    for (const ser of plotSers) {
+      const name = extractSeriesName(ser);
+      const values = extractSeriesValues(ser, categories.length);
+      if (!values.length && !name) continue;
+      const color = extractSeriesColor(ser, plot.kind, ctx.theme);
+      // Pie slices always get a resolved colour each (the series colour
+      // when the slices don't vary); other plots only carry overrides.
+      const pointColors = extractPointColors(
+        ser,
+        values.length,
+        varyColors,
+        plotIsPie ? color : undefined,
+        ctx.theme
+      );
+      series.push({
+        name,
+        values,
+        ...(color ? { color } : {}),
+        ...(plot.kind !== kind ? { kind: plot.kind as ChartSeriesKind } : {}),
+        ...(secondary ? { secondaryAxis: true } : {}),
+        ...(pointColors ? { pointColors } : {}),
+      });
+      if (!valueFormat) {
+        const num = ser?.["c:val"]?.["c:numRef"]?.["c:numCache"]?.["c:formatCode"];
+        const code = typeof num === "string" ? num : num?.["#text"];
+        if (typeof code === "string" && code !== "General") valueFormat = code;
+      }
+      if (!showDataLabels && ser?.["c:dLbls"]?.["c:showVal"]?.["@_val"] === "1") {
+        showDataLabels = true;
+      }
     }
   }
   if (!series.length) return null;
+
+  const catAxisId = isPieChart ? undefined : plotAxisId(plotNode, catAxes);
+  const categoryAxis = catAxisId ? readCategoryAxis(catAxes.get(catAxisId)) : undefined;
+  const valueAxis =
+    !isPieChart && primaryValAxisId
+      ? readValueAxis(valAxes.get(primaryValAxisId))
+      : undefined;
+  const secondaryValueAxis = secondaryValAxisId
+    ? readValueAxis(valAxes.get(secondaryValAxisId))
+    : undefined;
 
   const title = extractChartTitle(chartXml?.["c:chartSpace"]?.["c:chart"]?.["c:title"]);
   const ooxmlXml = xmlBuilder.build({ "p:graphicFrame": gf });
@@ -2708,6 +2812,9 @@ async function parseLiveChart(
     ...(showDataLabels ? { showDataLabels: true } : {}),
     ...(title ? { title } : {}),
     ...(valueFormat ? { valueFormat } : {}),
+    ...(categoryAxis ? { categoryAxis } : {}),
+    ...(valueAxis ? { valueAxis } : {}),
+    ...(secondaryValueAxis ? { secondaryValueAxis } : {}),
     ooxmlXml,
   };
   return element;
@@ -2716,12 +2823,23 @@ async function parseLiveChart(
 function extractCategories(ser: any): string[] {
   const cat = ser?.["c:cat"] ?? ser?.["c:xVal"];
   if (!cat) return [];
-  const strCache = cat?.["c:strRef"]?.["c:strCache"] ?? cat?.["c:strCache"];
-  const numCache = cat?.["c:numRef"]?.["c:numCache"] ?? cat?.["c:numCache"];
-  const cache = strCache ?? numCache;
+  // Multi-level categories: the first <c:lvl> is the level next to the axis.
+  // pptxgenjs writes every category axis this way, even with one level.
+  const multi = cat?.["c:multiLvlStrRef"]?.["c:multiLvlStrCache"];
+  const multiCache = multi
+    ? { "c:ptCount": multi["c:ptCount"], "c:pt": asArray(multi["c:lvl"])[0]?.["c:pt"] }
+    : undefined;
+  const strCache =
+    cat?.["c:strRef"]?.["c:strCache"] ?? cat?.["c:strLit"] ?? cat?.["c:strCache"];
+  const numCache =
+    cat?.["c:numRef"]?.["c:numCache"] ?? cat?.["c:numLit"] ?? cat?.["c:numCache"];
+  const cache = strCache ?? numCache ?? multiCache;
   if (!cache) return [];
-  const ptCount = Number(cache?.["c:ptCount"]?.["@_val"] ?? 0);
   const pts = asArray(cache?.["c:pt"]);
+  const declared = Number(cache?.["c:ptCount"]?.["@_val"]);
+  const ptCount = Number.isInteger(declared) && declared >= 0
+    ? declared
+    : pts.reduce((n: number, p: any) => Math.max(n, Number(p?.["@_idx"] ?? -1) + 1), 0);
   const arr = new Array<string>(ptCount).fill("");
   for (const p of pts) {
     const idx = Number(p?.["@_idx"] ?? -1);
@@ -2748,7 +2866,8 @@ function extractSeriesName(ser: any): string {
 function extractSeriesValues(ser: any, expected: number): (number | null)[] {
   const val = ser?.["c:val"] ?? ser?.["c:yVal"];
   if (!val) return [];
-  const cache = val?.["c:numRef"]?.["c:numCache"] ?? val?.["c:numCache"];
+  const cache =
+    val?.["c:numRef"]?.["c:numCache"] ?? val?.["c:numLit"] ?? val?.["c:numCache"];
   if (!cache) return [];
   const ptCount = Number(cache?.["c:ptCount"]?.["@_val"] ?? expected);
   const length = Math.max(ptCount, expected);
@@ -2774,6 +2893,94 @@ function seriesAccentColor(idx: number, theme: ThemeColors): string {
   const slot = ((idx % 6) + 6) % 6; // safe modulo for negatives
   const key = (`accent${slot + 1}`) as keyof ThemeColors;
   return theme[key];
+}
+
+/**
+ * PPTX series colours: explicit `<c:spPr><a:solidFill>` wins (line plots
+ * often only carry the line's `<a:ln><a:solidFill>`); otherwise PowerPoint
+ * uses the theme accent palette indexed by `<c:idx>` modulo 6, cycling
+ * accent1..accent6. (Order is the visual position; idx is the colour-picker
+ * key — they often differ, e.g. the second-drawn series can have idx=0 to
+ * inherit accent1.)
+ */
+function extractSeriesColor(
+  ser: any,
+  kind: ChartElement["kind"],
+  theme: ThemeColors
+): string | undefined {
+  const spPr = ser?.["c:spPr"];
+  const explicitFill =
+    spPr?.["a:solidFill"] ?? (kind === "line" ? spPr?.["a:ln"]?.["a:solidFill"] : undefined);
+  const idx = Number(ser?.["c:idx"]?.["@_val"] ?? 0);
+  return resolveColor(explicitFill, theme) ?? seriesAccentColor(idx, theme);
+}
+
+/**
+ * Per-point colours for a series: `<c:dPt>` fills override; the remaining
+ * points take the theme accents in point order when the plot varies colours
+ * by point (`accent{(i % 6) + 1}`), else `fallback` (or `null`, meaning the
+ * series colour). Returns undefined when nothing differs from the series.
+ */
+function extractPointColors(
+  ser: any,
+  count: number,
+  varyColors: boolean,
+  fallback: string | undefined,
+  theme: ThemeColors
+): (string | null)[] | undefined {
+  if (count <= 0) return undefined;
+  const out: (string | null)[] = [];
+  for (let i = 0; i < count; i++) {
+    out.push(varyColors ? seriesAccentColor(i, theme) : (fallback ?? null));
+  }
+  let any = varyColors || fallback !== undefined;
+  for (const dPt of asArray(ser?.["c:dPt"])) {
+    const idx = Number(dPt?.["c:idx"]?.["@_val"]);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= count) continue;
+    const color = resolveColor(dPt?.["c:spPr"]?.["a:solidFill"], theme);
+    if (!color) continue;
+    out[idx] = color;
+    any = true;
+  }
+  return any ? out : undefined;
+}
+
+/** CT_Boolean: `val` defaults to true when the element is present. */
+function boolVal(node: any): boolean {
+  if (node === undefined || node === null) return false;
+  const v = typeof node === "object" ? node["@_val"] : undefined;
+  return v === undefined || v === "1" || v === "true";
+}
+
+function axesById(axes: any): Map<string, any> {
+  const out = new Map<string, any>();
+  for (const ax of asArray(axes)) {
+    const id = ax?.["c:axId"]?.["@_val"];
+    if (id !== undefined) out.set(String(id), ax);
+  }
+  return out;
+}
+
+function readValueAxis(ax: any): ChartValueAxis | undefined {
+  if (!ax) return undefined;
+  const scaling = ax["c:scaling"];
+  const min = Number(scaling?.["c:min"]?.["@_val"]);
+  const max = Number(scaling?.["c:max"]?.["@_val"]);
+  const out: ChartValueAxis = {
+    ...(scaling?.["c:min"] !== undefined && Number.isFinite(min) ? { min } : {}),
+    ...(scaling?.["c:max"] !== undefined && Number.isFinite(max) ? { max } : {}),
+    ...(boolVal(ax["c:delete"]) ? { hidden: true } : {}),
+  };
+  return Object.keys(out).length ? out : undefined;
+}
+
+function readCategoryAxis(ax: any): ChartCategoryAxis | undefined {
+  if (!ax) return undefined;
+  const out: ChartCategoryAxis = {
+    ...(ax["c:scaling"]?.["c:orientation"]?.["@_val"] === "maxMin" ? { reversed: true } : {}),
+    ...(boolVal(ax["c:delete"]) ? { hidden: true } : {}),
+  };
+  return Object.keys(out).length ? out : undefined;
 }
 
 function extractChartTitle(title: any): string | undefined {
@@ -5491,7 +5698,7 @@ async function readTitle(zip: JSZip): Promise<string> {
   if (!file) return "Untitled";
   const text = await file.async("string");
   const m = text.match(/<dc:title[^>]*>([^<]*)<\/dc:title>/);
-  return (m?.[1] || "Untitled").trim() || "Untitled";
+  return decodeXmlEntities(m?.[1] || "Untitled").trim() || "Untitled";
 }
 
 function asArray<T = any>(value: T | T[] | undefined | null): T[] {

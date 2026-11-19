@@ -467,6 +467,9 @@ export type ChartKind = "bar" | "column" | "line" | "pie" | "doughnut" | "area";
 /** Bar/column grouping mode. PPTX values: standard / stacked / percentStacked. */
 export type ChartGrouping = "standard" | "stacked" | "percentStacked";
 
+/** Plot types a series can take inside a combo chart. */
+export type ChartSeriesKind = "bar" | "column" | "line" | "area";
+
 export interface ChartSeries {
   /** Display name from `<c:tx><c:strRef><c:strCache>` (or "<c:tx><c:v>"). */
   name: string;
@@ -474,6 +477,38 @@ export interface ChartSeries {
   values: (number | null)[];
   /** Per-series fill colour (CSS hex). */
   color?: string;
+  /**
+   * Plot type of this series when it differs from the chart's `kind` — combo
+   * charts whose `<c:plotArea>` holds several plots (e.g. `<c:barChart>` +
+   * `<c:lineChart>`). Absent: the series is drawn as `ChartElement.kind`.
+   */
+  kind?: ChartSeriesKind;
+  /** Plotted against the secondary value axis (combo charts). */
+  secondaryAxis?: boolean;
+  /**
+   * Per-point fills (CSS hex), parallel to `values`: `<c:dPt>` overrides, and
+   * one colour per slice for pie / doughnut charts. `null` entries use the
+   * series colour.
+   */
+  pointColors?: (string | null)[];
+}
+
+/** Value-axis settings from `<c:valAx>`. Absent bounds are automatic. */
+export interface ChartValueAxis {
+  /** `<c:scaling><c:min>`. */
+  min?: number;
+  /** `<c:scaling><c:max>`. */
+  max?: number;
+  /** Axis deleted in the source (`<c:delete val="1"/>`). */
+  hidden?: boolean;
+}
+
+/** Category-axis settings from `<c:catAx>` / `<c:dateAx>`. */
+export interface ChartCategoryAxis {
+  /** Categories run in reverse order (`<c:orientation val="maxMin"/>`). */
+  reversed?: boolean;
+  /** Axis deleted in the source (`<c:delete val="1"/>`). */
+  hidden?: boolean;
 }
 
 /**
@@ -496,6 +531,12 @@ export interface ChartElement extends BaseElement {
   title?: string;
   /** Optional axis number-format string (PPTX `formatCode`, e.g. "$#,##0.0"). */
   valueFormat?: string;
+  /** Category axis of bar / column / line / area charts. */
+  categoryAxis?: ChartCategoryAxis;
+  /** Primary value axis of bar / column / line / area charts. */
+  valueAxis?: ChartValueAxis;
+  /** Secondary value axis, used by series with `secondaryAxis` (combo charts). */
+  secondaryValueAxis?: ChartValueAxis;
   /**
    * Preserved source OOXML for the wrapping `<p:graphicFrame>`. The
    * serializer re-emits it verbatim on save so the chart's binary embedded
