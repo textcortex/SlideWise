@@ -24,6 +24,9 @@ import type {
   ShapeElement,
   GroupElement,
   ChartElement,
+  ChartSeries,
+  ChartSeriesKind,
+  ChartValueAxis,
   ConnectorElement,
   ImageElement,
   DiagramElement,
@@ -1105,21 +1108,38 @@ export function synthesiseChart(el: ChartElement): SynthChartResult {
 
   const catCount = el.categories.length;
   const grouping = el.grouping ?? "standard";
-  const seriesXml = el.series.map((s, idx) => seriesXmlFor(el, s, idx)).join("");
+  const hasSecondary = el.series.some((s) => s.secondaryAxis);
 
   let plotXml = "";
-  if (el.kind === "bar") {
-    plotXml = `<c:barChart><c:barDir val="bar"/><c:grouping val="${grouping}"/>${seriesXml}${catAxisRef()}${valAxisRef()}</c:barChart>${axesXml(true)}`;
-  } else if (el.kind === "column") {
-    plotXml = `<c:barChart><c:barDir val="col"/><c:grouping val="${grouping}"/>${seriesXml}${catAxisRef()}${valAxisRef()}</c:barChart>${axesXml(false)}`;
-  } else if (el.kind === "line") {
-    plotXml = `<c:lineChart><c:grouping val="${grouping === "stacked" || grouping === "percentStacked" ? grouping : "standard"}"/>${seriesXml}${catAxisRef()}${valAxisRef()}</c:lineChart>${axesXml(false)}`;
-  } else if (el.kind === "area") {
-    plotXml = `<c:areaChart><c:grouping val="${grouping === "stacked" || grouping === "percentStacked" ? grouping : "standard"}"/>${seriesXml}${catAxisRef()}${valAxisRef()}</c:areaChart>${axesXml(false)}`;
-  } else if (el.kind === "pie") {
-    plotXml = `<c:pieChart><c:varyColors val="1"/>${seriesXml}</c:pieChart>`;
-  } else if (el.kind === "doughnut") {
-    plotXml = `<c:doughnutChart><c:varyColors val="1"/>${seriesXml}<c:holeSize val="50"/></c:doughnutChart>`;
+  if (el.kind === "pie" || el.kind === "doughnut") {
+    const seriesXml = el.series.map((s, idx) => seriesXmlFor(el, s, idx)).join("");
+    plotXml =
+      el.kind === "pie"
+        ? `<c:pieChart><c:varyColors val="1"/>${seriesXml}</c:pieChart>`
+        : `<c:doughnutChart><c:varyColors val="1"/>${seriesXml}<c:holeSize val="50"/></c:doughnutChart>`;
+  } else {
+    // One plot per (kind, value axis) pair — several for combo charts. The
+    // chart's own kind on the primary axis comes first, so a re-import reads
+    // the same `kind`; the grouping applies to the series of that kind.
+    const plots: { kind: ChartSeriesKind; secondary: boolean; xml: string[] }[] = [];
+    el.series.forEach((s, idx) => {
+      const kind = (s.kind ?? el.kind) as ChartSeriesKind;
+      const secondary = !!s.secondaryAxis;
+      let plot = plots.find((p) => p.kind === kind && p.secondary === secondary);
+      if (!plot) {
+        plot = { kind, secondary, xml: [] };
+        plots.push(plot);
+      }
+      plot.xml.push(seriesXmlFor(el, s, idx));
+    });
+    if (!plots.length) {
+      plots.push({ kind: el.kind as ChartSeriesKind, secondary: false, xml: [] });
+    }
+    plots.sort(
+      (a, b) =>
+        Number(b.kind === el.kind && !b.secondary) - Number(a.kind === el.kind && !a.secondary)
+    );
+    plotXml = plots.map(plotXmlFor).join("") + axesXml();
   }
 
   const title = el.title
@@ -1147,11 +1167,7 @@ export function synthesiseChart(el: ChartElement): SynthChartResult {
 
   return { graphicFrameXml, chartXml, chartRelsXml, partPath, partRelsPath };
 
-  function seriesXmlFor(
-    chart: ChartElement,
-    s: { name: string; values: (number | null)[]; color?: string },
-    idx: number
-  ): string {
+  function seriesXmlFor(chart: ChartElement, s: ChartSeries, idx: number): string {
     const ptValsXml = s.values
       .map((v, i) =>
         v == null ? `` : `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`
@@ -1163,30 +1179,73 @@ export function synthesiseChart(el: ChartElement): SynthChartResult {
           `<c:pt idx="${i}"><c:v>${escapeText(String(c))}</c:v></c:pt>`
       )
       .join("");
+    const fillXml = (color: string) =>
+      `<a:solidFill><a:srgbClr val="${hexBare(color)}"/></a:solidFill>`;
+    // PowerPoint draws a line series in its `<a:ln>` colour.
     const colorXml = s.color
-      ? `<c:spPr><a:solidFill><a:srgbClr val="${hexBare(s.color)}"/></a:solidFill></c:spPr>`
+      ? `<c:spPr>${fillXml(s.color)}${
+          (s.kind ?? chart.kind) === "line" ? `<a:ln>${fillXml(s.color)}</a:ln>` : ``
+        }</c:spPr>`
       : ``;
+    const dPtXml = (s.pointColors ?? [])
+      .map((c, i) =>
+        c ? `<c:dPt><c:idx val="${i}"/><c:spPr>${fillXml(c)}</c:spPr></c:dPt>` : ``
+      )
+      .join("");
     return (
       `<c:ser>` +
       `<c:idx val="${idx}"/><c:order val="${idx}"/>` +
       `<c:tx><c:v>${escapeText(s.name || `Series ${idx + 1}`)}</c:v></c:tx>` +
       colorXml +
+      dPtXml +
       `<c:cat><c:strRef><c:f>cat</c:f><c:strCache><c:ptCount val="${catCount}"/>${ptCatsXml}</c:strCache></c:strRef></c:cat>` +
       `<c:val><c:numRef><c:f>val${idx}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="${s.values.length}"/>${ptValsXml}</c:numCache></c:numRef></c:val>` +
       `</c:ser>`
     );
   }
-  function catAxisRef(): string {
-    return `<c:axId val="111111111"/><c:axId val="222222222"/>`;
+  function plotXmlFor(plot: { kind: ChartSeriesKind; secondary: boolean; xml: string[] }): string {
+    const seriesXml = plot.xml.join("");
+    const axIds = plot.secondary
+      ? `<c:axId val="333333333"/><c:axId val="444444444"/>`
+      : `<c:axId val="111111111"/><c:axId val="222222222"/>`;
+    const plotGrouping = plot.kind === el.kind ? grouping : "standard";
+    const stacked = plotGrouping === "stacked" || plotGrouping === "percentStacked";
+    if (plot.kind === "bar" || plot.kind === "column") {
+      // Stacked bars need a full overlap, or PowerPoint staggers the segments.
+      return `<c:barChart><c:barDir val="${plot.kind === "bar" ? "bar" : "col"}"/><c:grouping val="${plotGrouping}"/>${seriesXml}${stacked ? `<c:overlap val="100"/>` : ``}${axIds}</c:barChart>`;
+    }
+    const tag = plot.kind === "line" ? "c:lineChart" : "c:areaChart";
+    return `<${tag}><c:grouping val="${stacked ? plotGrouping : "standard"}"/>${seriesXml}${axIds}</${tag}>`;
   }
-  function valAxisRef(): string {
-    return ``;
-  }
-  function axesXml(barIsHoriz: boolean): string {
-    const catAxOrient = barIsHoriz ? "minMax" : "minMax";
+  function axesXml(): string {
+    const barIsHoriz = el.kind === "bar";
+    const catPos = barIsHoriz ? "l" : "b";
+    const valPos = barIsHoriz ? "b" : "l";
+    const catAx = (id: string, cross: string, reversed: boolean, hidden: boolean) =>
+      `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${reversed ? "maxMin" : "minMax"}"/></c:scaling><c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${catPos}"/><c:crossAx val="${cross}"/></c:catAx>`;
+    const valAx = (
+      id: string,
+      cross: string,
+      pos: string,
+      axis: ChartValueAxis | undefined,
+      secondary: boolean
+    ) =>
+      `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${
+        axis?.max !== undefined ? `<c:max val="${axis.max}"/>` : ``
+      }${
+        axis?.min !== undefined ? `<c:min val="${axis.min}"/>` : ``
+      }</c:scaling><c:delete val="${axis?.hidden ? 1 : 0}"/><c:axPos val="${pos}"/><c:crossAx val="${cross}"/>${
+        secondary ? `<c:crosses val="max"/>` : ``
+      }</c:valAx>`;
     return (
-      `<c:catAx><c:axId val="111111111"/><c:scaling><c:orientation val="${catAxOrient}"/></c:scaling><c:delete val="0"/><c:axPos val="${barIsHoriz ? "l" : "b"}"/><c:crossAx val="222222222"/></c:catAx>` +
-      `<c:valAx><c:axId val="222222222"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="${barIsHoriz ? "b" : "l"}"/><c:crossAx val="111111111"/></c:valAx>`
+      catAx("111111111", "222222222", !!el.categoryAxis?.reversed, !!el.categoryAxis?.hidden) +
+      valAx("222222222", "111111111", valPos, el.valueAxis, false) +
+      (hasSecondary
+        ? // The secondary category axis only anchors the secondary value
+          // axis; it stays hidden, as PowerPoint writes it.
+          catAx("333333333", "444444444", false, true) +
+          valAx("444444444", "333333333", barIsHoriz ? "t" : "r", el.secondaryValueAxis, true)
+        : ``)
     );
   }
 }
